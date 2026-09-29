@@ -1,0 +1,1794 @@
+#include "Core/Runtime.h"
+
+#include "Core/HiZ.h"
+#include "Core/Occlusion.h"
+#include "Core/ShadowLights.h"
+#include "Hooks/CullGroups.h"
+#include "Hooks/RenderStages.h"
+#include "Settings.h"
+#include "Util/D3D.h"
+
+namespace CBRO::Core::Runtime
+{
+	namespace
+	{
+		using Stage = Hooks::RenderStages::Stage;
+
+		// ---- previs (BSPreCulledObjects) through the engine's own switch --------------------
+		// Same path as the console command `tpc`; ids verified in Phase 0 run 3.
+
+		bool PrevisEnabled()
+		{
+			using func_t = bool (*)();
+			static REL::Relocation<func_t> func{ CBRO::Engine::OG(652211) };
+			return func();
+		}
+
+		void SetPrevisEnabled(bool a_enabled)
+		{
+			using func_t = void (*)(bool);
+			static REL::Relocation<func_t> func{ CBRO::Engine::OG(1090712) };
+			func(a_enabled);
+		}
+
+		// ---- projection convention --------------------------------------------------------------
+
+		enum class Convention
+		{
+			kUnknown,
+			kNone,  // self-check failed: never cull
+			kRowRelative,
+			kRowAbsolute,
+			kColumnRelative,
+			kColumnAbsolute,
+		};
+
+		std::string_view ConventionName(Convention a_convention)
+		{
+			switch (a_convention) {
+			case Convention::kRowRelative:
+				return "row-vector, camera-relative"sv;
+			case Convention::kRowAbsolute:
+				return "row-vector, absolute"sv;
+			case Convention::kColumnRelative:
+				return "column-vector, camera-relative"sv;
+			case Convention::kColumnAbsolute:
+				return "column-vector, absolute"sv;
+			case Convention::kNone:
+				return "none (self-check failed)"sv;
+			default:
+				return "unknown"sv;
+			}
+		}
+
+		struct State
+		{
+			bool          installed{ false };  // hooks in place and the listener registered
+			Convention    convention{ Convention::kUnknown };
+			std::uint64_t renderFrame{ 0 };  // advances at every pre-pass end
+			std::uint32_t clock{ 0 };        // advances at every cull stage
+			bool          wantActive{ false };
+			bool          toggleKeyDown{ false };
+			bool          failureHandled{ false };
+			std::atomic<int> previsRequest{ -1 };  // previs to switch at the next cull begin: 0 off, 1 back to the original (-1: none)
+			int           expectedPrevis{ -1 };  // previs state CBRO last set (-1: not yet)
+			bool          previsThreadLogged{ false };
+			int           viewSpaceLogged{ -1 };
+			int           notifiedEffective{ -1 };
+			bool          statusKeyDown{ false };
+			bool          diagnosticKeyDown{ false };
+			int           diagnostic{ 0 };  // 0 normal, 1 decide-only, 2 decide-only + no depth capture
+			std::uint32_t selfCheckAttempts{ 0 };
+			bool          originalPrevisKnown{ false };
+			bool          originalPrevis{ true };
+			std::uint32_t framesSinceLog{ 0 };
+			bool          cullingThisFrame{ false };  // CBRO culls this frame: the culling-group hooks act (else pass-through)
+			bool          hooksWanted{ true };        // what SyncHooks last asked for (the hooks go in at load)
+			bool          hooksIn{ true };            // the hooks culling needs are in
+		};
+		State g_state;
+
+		struct Raw
+		{
+			float m[4][4];
+			float posAdjust[3];
+		};
+
+		// clip = (p - adjust) * M (row) or M * (p - adjust) (column)
+		void Project(const Raw& a_raw, bool a_column, bool a_relative, const float a_p[3], float a_out[4])
+		{
+			const float p[4]{
+				a_p[0] - (a_relative ? a_raw.posAdjust[0] : 0.0f),
+				a_p[1] - (a_relative ? a_raw.posAdjust[1] : 0.0f),
+				a_p[2] - (a_relative ? a_raw.posAdjust[2] : 0.0f),
+				1.0f
+			};
+			for (int i = 0; i < 4; ++i) {
+				a_out[i] = 0.0f;
+				for (int k = 0; k < 4; ++k) {
+					a_out[i] += p[k] * (a_column ? a_raw.m[i][k] : a_raw.m[k][i]);
+				}
+			}
+		}
+
+		// Picks the convention under which a point straight ahead of the camera lands at the
+		// screen centre, and points to its right/up land right/up.
+		Convention SelfCheck(const HiZ::Camera& a_camera, const Raw& a_raw, bool a_verbose)
+		{
+			const auto ahead = [&](float a_dist, const float* a_offsetDir, float a_offset, float a_out[3]) {
+				for (int i = 0; i < 3; ++i) {
+					a_out[i] = a_camera.eye[i] + a_camera.viewDir[i] * a_dist + (a_offsetDir ? a_offsetDir[i] * a_offset : 0.0f);
+				}
+			};
+			float center[3], right[3], up[3];
+			ahead(1000.0f, nullptr, 0.0f, center);
+			ahead(1000.0f, a_camera.viewRight, 200.0f, right);
+			ahead(1000.0f, a_camera.viewUp, 200.0f, up);
+
+			const std::array candidates{
+				std::tuple{ Convention::kRowRelative, false, true },
+				std::tuple{ Convention::kRowAbsolute, false, false },
+				std::tuple{ Convention::kColumnRelative, true, true },
+				std::tuple{ Convention::kColumnAbsolute, true, false },
+			};
+			Convention chosen = Convention::kNone;
+			for (const auto& [convention, column, relative] : candidates) {
+				float c[4], r[4], u[4];
+				Project(a_raw, column, relative, center, c);
+				Project(a_raw, column, relative, right, r);
+				Project(a_raw, column, relative, up, u);
+				const bool ok =
+					c[3] > 0.0f && std::abs(c[0] / c[3]) < 0.05f && std::abs(c[1] / c[3]) < 0.05f &&
+					c[2] / c[3] > 0.0f && c[2] / c[3] < 1.0f &&
+					r[3] > 0.0f && r[0] / r[3] > 0.02f && u[3] > 0.0f && u[1] / u[3] > 0.02f;
+				if (a_verbose) {
+					logger::info(
+						"self-check {}: ahead ndc=({:.3f},{:.3f},{:.4f}) w={:.1f} | right x={:.3f} | up y={:.3f} -> {}",
+						ConventionName(convention), c[0] / c[3], c[1] / c[3], c[2] / c[3], c[3], r[0] / r[3], u[1] / u[3], ok ? "PASS" : "fail");
+				}
+				if (ok && chosen == Convention::kNone) {
+					chosen = convention;
+				}
+			}
+			if (a_verbose || chosen != Convention::kNone) {
+				logger::info(
+					"self-check: eye=({:.0f},{:.0f},{:.0f}) posAdjust=({:.0f},{:.0f},{:.0f}) -> {}",
+					a_camera.eye[0], a_camera.eye[1], a_camera.eye[2], a_raw.posAdjust[0], a_raw.posAdjust[1], a_raw.posAdjust[2],
+					ConventionName(chosen));
+			}
+			return chosen;
+		}
+
+		void Normalize(float a_v[3])
+		{
+			const float length = std::sqrt(a_v[0] * a_v[0] + a_v[1] * a_v[1] + a_v[2] * a_v[2]);
+			if (length > 0.0f) {
+				a_v[0] /= length;
+				a_v[1] /= length;
+				a_v[2] /= length;
+			}
+		}
+
+		// clip = (p - posAdjust) * viewProj with the baked (row-vector) convention.
+		void ProjectBaked(const HiZ::Camera& a_camera, const float a_p[3], float a_out[4])
+		{
+			const float p[3]{ a_p[0] - a_camera.posAdjust[0], a_p[1] - a_camera.posAdjust[1], a_p[2] - a_camera.posAdjust[2] };
+			for (int i = 0; i < 4; ++i) {
+				a_out[i] = p[0] * a_camera.viewProj[0][i] + p[1] * a_camera.viewProj[1][i] + p[2] * a_camera.viewProj[2][i] + a_camera.viewProj[3][i];
+			}
+		}
+
+		// Expresses viewProj as eye + orthonormal basis + per-axis scales + depth curve, then checks
+		// that form against viewProj on an off-axis point. The occlusion test only uses it if it matches.
+		void DeriveViewSpace(HiZ::Camera& a_camera)
+		{
+			a_camera.viewSpace = false;
+			const bool relative = g_state.convention == Convention::kRowRelative || g_state.convention == Convention::kColumnRelative;
+			for (int i = 0; i < 3; ++i) {
+				a_camera.origin[i] = relative ? a_camera.posAdjust[i] : a_camera.eye[i];
+			}
+			Normalize(a_camera.viewDir);
+			Normalize(a_camera.viewRight);
+			Normalize(a_camera.viewUp);
+
+			const auto at = [&](float a_forward, float a_right, float a_up, float a_out[4]) {
+				float p[3];
+				for (int i = 0; i < 3; ++i) {
+					p[i] = a_camera.origin[i] + a_camera.viewDir[i] * a_forward + a_camera.viewRight[i] * a_right + a_camera.viewUp[i] * a_up;
+				}
+				ProjectBaked(a_camera, p, a_out);
+			};
+
+			float c[4];
+			at(1000.0f, 1000.0f, 0.0f, c);
+			a_camera.scaleX = c[0] / c[3];
+			at(1000.0f, 0.0f, 1000.0f, c);
+			a_camera.scaleY = c[1] / c[3];
+
+			constexpr float kNear = 100.0f;
+			constexpr float kFar = 10000.0f;
+			float           n[4], f[4];
+			at(kNear, 0.0f, 0.0f, n);
+			at(kFar, 0.0f, 0.0f, f);
+			const float zn = n[2] / n[3];
+			const float zf = f[2] / f[3];
+			a_camera.depthB = (zn - zf) / (1.0f / kNear - 1.0f / kFar);
+			a_camera.depthA = zn - a_camera.depthB / kNear;
+
+			// verify on an off-axis point
+			constexpr float kZ = 2345.0f, kX = 333.0f, kY = -222.0f;
+			float           t[4];
+			at(kZ, kX, kY, t);
+			const float dx = std::abs(t[0] / t[3] - a_camera.scaleX * kX / kZ);
+			const float dy = std::abs(t[1] / t[3] - a_camera.scaleY * kY / kZ);
+			const float dz = std::abs(t[2] / t[3] - (a_camera.depthA + a_camera.depthB / kZ));
+			const float dw = std::abs(t[3] - kZ);
+			a_camera.viewSpace = a_camera.scaleX > 0.0f && a_camera.scaleY > 0.0f && dx < 1.0e-3f && dy < 1.0e-3f && dz < 1.0e-5f && dw < 1.0f;
+
+			if (static_cast<int>(a_camera.viewSpace) != g_state.viewSpaceLogged) {
+				g_state.viewSpaceLogged = a_camera.viewSpace;
+				logger::info(
+					"view-space projection {}: scale=({:.4f},{:.4f}) depth=A {:.6f} + B {:.4f}/z | check dx={:.2e} dy={:.2e} dz={:.2e} dw={:.2e}",
+					a_camera.viewSpace ? "verified (exact sphere test)" : "NOT verified (box-corner fallback)",
+					a_camera.scaleX, a_camera.scaleY, a_camera.depthA, a_camera.depthB, dx, dy, dz, dw);
+			}
+		}
+
+		// Reads the camera the pre-pass just rendered with and bakes the chosen convention into it,
+		// so the per-object test is always `clip = (p - posAdjust) * viewProj`.
+		bool ReadCamera(HiZ::Camera& a_camera, Raw& a_raw)
+		{
+			const auto state = CBRO::Engine::BSGraphics::State::GetSingleton();
+			const auto root = RE::Main::WorldRootCamera();
+			if (!state || !root) {
+				return false;
+			}
+
+			// The pre-pass renders the WorldRoot camera, but other render-to-texture passes (scopes,
+			// cubemaps) overwrite cameraState, so take the world camera's own cache entry (unjittered
+			// preferred), as the Upscaling mod does. No entry: skip this capture.
+			const CBRO::Engine::BSGraphics::CameraStateData* selected = nullptr;
+			for (const auto& candidate : state->cameraDataCache) {
+				if (candidate.referenceCamera == root && (!selected || (selected->useJitter && !candidate.useJitter))) {
+					selected = std::addressof(candidate);
+				}
+			}
+			if (!selected && state->cameraState.referenceCamera == root) {
+				selected = std::addressof(state->cameraState);
+			}
+			if (!selected) {
+				return false;
+			}
+
+			const auto& view = selected->camViewData;
+			for (int i = 0; i < 4; ++i) {
+				_mm_storeu_ps(a_raw.m[i], view.viewProjUnjittered[i]);
+			}
+			a_raw.posAdjust[0] = selected->posAdjust.x;
+			a_raw.posAdjust[1] = selected->posAdjust.y;
+			a_raw.posAdjust[2] = selected->posAdjust.z;
+
+			const auto store3 = [](const __m128& a_v, float a_out[3]) {
+				alignas(16) float tmp[4];
+				_mm_store_ps(tmp, a_v);
+				a_out[0] = tmp[0];
+				a_out[1] = tmp[1];
+				a_out[2] = tmp[2];
+			};
+			store3(view.viewDir, a_camera.viewDir);
+			store3(view.viewRight, a_camera.viewRight);
+			store3(view.viewUp, a_camera.viewUp);
+
+			a_camera.eye[0] = root->world.translate.x;
+			a_camera.eye[1] = root->world.translate.y;
+			a_camera.eye[2] = root->world.translate.z;
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 3; ++c) {
+					a_camera.rotate[r][c] = root->world.rotate.entry[r].pt[c];
+				}
+			}
+
+			const bool column = g_state.convention == Convention::kColumnRelative || g_state.convention == Convention::kColumnAbsolute;
+			const bool relative = g_state.convention == Convention::kRowRelative || g_state.convention == Convention::kColumnRelative;
+			for (int r = 0; r < 4; ++r) {
+				for (int c = 0; c < 4; ++c) {
+					a_camera.viewProj[r][c] = column ? a_raw.m[c][r] : a_raw.m[r][c];
+				}
+			}
+			for (int i = 0; i < 3; ++i) {
+				a_camera.posAdjust[i] = relative ? a_raw.posAdjust[i] : 0.0f;
+			}
+			DeriveViewSpace(a_camera);
+			return true;
+		}
+
+		// Camera change since the depth frame: translation and rotation angle (radians).
+		void CameraDelta(const HiZ::Camera& a_then, float& a_move, float& a_angle)
+		{
+			a_move = 0.0f;
+			a_angle = 0.0f;
+			const auto root = RE::Main::WorldRootCamera();
+			if (!root) {
+				return;
+			}
+			const float dx = root->world.translate.x - a_then.eye[0];
+			const float dy = root->world.translate.y - a_then.eye[1];
+			const float dz = root->world.translate.z - a_then.eye[2];
+			a_move = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+			// Rotation angle between the two orientations from ||R_now - R_then|| = 2*sqrt(2)*sin(theta/2):
+			// exact 0 for an unchanged matrix and accurate for tiny turns (acos of the trace isn't).
+			float squared = 0.0f;
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 3; ++c) {
+					const float d = root->world.rotate.entry[r].pt[c] - a_then.rotate[r][c];
+					squared += d * d;
+				}
+			}
+			a_angle = 2.0f * std::asin(std::min(1.0f, std::sqrt(squared) / 2.8284271f));
+		}
+
+		// ---- verdict-cache epochs ---------------------------------------------------------------------------------
+		// Occlusion reuses an object's last verdict while the camera stays within the cache tolerance of the
+		// epoch's reference (the depth frame's camera when the epoch began: both it and the current NiCamera must
+		// stay within half the tolerance, so any two cameras of an epoch are within the whole of it, which is how
+		// far tested bounds are dilated). The sun has its own epoch (its direction and state).
+
+		struct Epochs
+		{
+			bool          viewKnown{ false };
+			float         eye[3]{};
+			float         rotate[3][3]{};
+			std::uint32_t viewEpoch{ 1 };
+			int           sunState{ -1 };
+			float         sunDir[3]{};
+			std::uint8_t  sunEpoch{ 1 };
+			std::uint32_t viewChanges{ 0 };  // this interval, for the log
+			std::uint32_t sunChanges{ 0 };
+		};
+		Epochs g_epochs;
+
+		float RotationAngle(const float a_a[3][3], const float a_b[3][3]) noexcept
+		{
+			float squared = 0.0f;
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 3; ++c) {
+					const float d = a_a[r][c] - a_b[r][c];
+					squared += d * d;
+				}
+			}
+			return 2.0f * std::asin(std::min(1.0f, std::sqrt(squared) / 2.8284271f));
+		}
+
+		float Distance3(const float a_a[3], const float a_b[3]) noexcept
+		{
+			const float dx = a_a[0] - a_b[0];
+			const float dy = a_a[1] - a_b[1];
+			const float dz = a_a[2] - a_b[2];
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		}
+
+		void UpdateViewEpoch(const HiZ::Camera& a_camera, float a_tolMove, float a_tolAngle)
+		{
+			bool  same = g_epochs.viewKnown && Distance3(a_camera.eye, g_epochs.eye) <= a_tolMove && RotationAngle(a_camera.rotate, g_epochs.rotate) <= a_tolAngle;
+			if (same) {
+				if (const auto root = RE::Main::WorldRootCamera()) {
+					const float eye[3]{ root->world.translate.x, root->world.translate.y, root->world.translate.z };
+					float       rotate[3][3];
+					for (int r = 0; r < 3; ++r) {
+						for (int c = 0; c < 3; ++c) {
+							rotate[r][c] = root->world.rotate.entry[r].pt[c];
+						}
+					}
+					same = Distance3(eye, g_epochs.eye) <= a_tolMove && RotationAngle(rotate, g_epochs.rotate) <= a_tolAngle;
+				}
+			}
+			if (!same) {
+				++g_epochs.viewEpoch;
+				++g_epochs.viewChanges;
+				std::copy_n(a_camera.eye, 3, g_epochs.eye);
+				std::memcpy(g_epochs.rotate, a_camera.rotate, sizeof(g_epochs.rotate));
+				g_epochs.viewKnown = true;
+			}
+		}
+
+		void UpdateSunEpoch(int a_state, const float a_dir[3], float a_tolAngle)
+		{
+			bool same = a_state == g_epochs.sunState;
+			if (same && a_state == static_cast<int>(Occlusion::FrameContext::Sun::State::kOn)) {
+				const float dot = std::clamp(a_dir[0] * g_epochs.sunDir[0] + a_dir[1] * g_epochs.sunDir[1] + a_dir[2] * g_epochs.sunDir[2], -1.0f, 1.0f);
+				same = std::acos(dot) <= a_tolAngle;
+			}
+			if (!same) {
+				++g_epochs.sunEpoch;
+				++g_epochs.sunChanges;
+				g_epochs.sunState = a_state;
+				std::copy_n(a_dir, 3, g_epochs.sunDir);
+			}
+		}
+
+		// Consecutive frames (at cull time) in which the NiCamera's rotation didn't change.
+		struct Stillness
+		{
+			float         rotate[3][3]{};
+			bool          known{ false };
+			std::uint32_t frames{ 0 };
+		};
+		Stillness g_stillness;
+
+		void TrackStillness()
+		{
+			const auto root = RE::Main::WorldRootCamera();
+			if (!root) {
+				g_stillness = {};
+				return;
+			}
+			float squared = 0.0f;
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 3; ++c) {
+					const float value = root->world.rotate.entry[r].pt[c];
+					const float d = value - g_stillness.rotate[r][c];
+					squared += d * d;
+					g_stillness.rotate[r][c] = value;
+				}
+			}
+			// Same threshold as the still view: ||dR|| ~ sqrt(2) * angle for small turns.
+			const bool still = g_stillness.known && squared < 2.0f * 0.0002f * 0.0002f;
+			g_stillness.frames = still ? g_stillness.frames + 1 : 0;
+			g_stillness.known = true;
+		}
+
+		// ---- the current view on the depth frame -------------------------------------------------
+		// Objects crossing the depth frame's edge can still be judged on the part the current camera
+		// sees, if that part was rendered. A camera that hasn't turned or zoomed sees exactly the depth
+		// frame. A turned camera's frustum comes from the WorldRoot NiCamera (rotation + frustum) mapped
+		// onto the render basis. At each capture CBRO checks which reading of the rotation matrix
+		// (columns or rows) reproduces the render basis. Facing along a world axis both fit, and they
+		// would turn the view in opposite directions, so then the union of both views is used. No fit
+		// leaves edge objects unjudged.
+
+		struct AxisMap
+		{
+			bool  valid{ false };
+			bool  columns{ true };
+			int   index[3]{};  // viewDir, viewRight, viewUp
+			float sign[3]{};
+		};
+
+		enum class FrustumUnits
+		{
+			kUnknown,
+			kTangents,  // left/right/top/bottom at unit distance
+			kNearPlane  // at the near plane
+		};
+
+		// Footprint outcomes per summary interval: which path placed the view, or why none could.
+		enum FootprintReason : std::size_t
+		{
+			kStill,              // used: camera still, same zoom
+			kTurned,             // used: turned camera, one reading of its rotation fits
+			kTurnedBoth,         // used: turned camera, union of both readings (facing along a world axis)
+			kAxesNoFit,          // capture: no reading of the rotation matches the render basis
+			kUnitsUnknown,       // capture: frustum values don't match the projection in any known unit
+			kTangentMismatch,    // capture: frustum and projection disagree this frame
+			kNoMapping,          // frame: turned, but the depth frame's capture had no usable mapping
+			kTurnedOff,          // frame: turned, and turned views were switched off by the self-check
+			kSideways,           // frame: turned so far the view leaves the depth frame's hemisphere
+			kImplausible,        // frame: frustum values out of range
+			kReasonCount
+		};
+
+		struct Footprint
+		{
+			FrustumUnits units{ FrustumUnits::kUnknown };
+			bool         disabled{ false };
+			bool         announced{ false };
+			float        lastView[4]{};
+			float        lastAngle{ 0.0f };
+			bool         lastValid{ false };
+			std::array<std::uint32_t, kReasonCount> reasons{};
+		};
+		Footprint g_footprint;
+
+		// NiCamera::viewFrustum (+0x160): left, right, top, bottom, near, far (floats), ortho (bool).
+		constexpr std::size_t kFrustumOffset = 0x160;
+
+		struct Frustum
+		{
+			float left, right, top, bottom, nearPlane, farPlane;
+		};
+
+		Frustum ReadFrustum(const RE::NiCamera* a_camera)
+		{
+			Frustum frustum{};
+			std::memcpy(&frustum, reinterpret_cast<const std::byte*>(a_camera) + kFrustumOffset, sizeof(frustum));
+			return frustum;
+		}
+
+		float AxisComponent(const float a_rotate[3][3], bool a_columns, int a_axis, int a_component)
+		{
+			return a_columns ? a_rotate[a_component][a_axis] : a_rotate[a_axis][a_component];
+		}
+
+		// Rotation vs render basis agreement: strict (~0.8 deg) means the NiCamera and the render camera
+		// describe the same orientation; loose (~5.7 deg) only that they are close, e.g. one of them a
+		// frame behind while turning.
+		constexpr float kStrictFit = 0.9999f;
+		constexpr float kLooseFit = 0.995f;
+
+		bool MatchAxes(const HiZ::Camera& a_camera, bool a_columns, float a_threshold, AxisMap& a_out)
+		{
+			const float* basis[3]{ a_camera.viewDir, a_camera.viewRight, a_camera.viewUp };
+			AxisMap      map{};
+			map.columns = a_columns;
+			for (int b = 0; b < 3; ++b) {
+				float best = 0.0f;
+				for (int k = 0; k < 3; ++k) {
+					float d = 0.0f;
+					for (int c = 0; c < 3; ++c) {
+						d += AxisComponent(a_camera.rotate, a_columns, k, c) * basis[b][c];
+					}
+					if (std::abs(d) > best) {
+						best = std::abs(d);
+						map.index[b] = k;
+						map.sign[b] = d < 0.0f ? -1.0f : 1.0f;
+					}
+				}
+				if (best < a_threshold) {
+					return false;
+				}
+			}
+			if (map.index[0] == map.index[1] || map.index[0] == map.index[2] || map.index[1] == map.index[2]) {
+				return false;
+			}
+			map.valid = true;
+			a_out = map;
+			return true;
+		}
+
+		void FrustumTangents(const Frustum& a_frustum, float& a_x, float& a_y)
+		{
+			a_x = std::max(std::abs(a_frustum.left), std::abs(a_frustum.right));
+			a_y = std::max(std::abs(a_frustum.top), std::abs(a_frustum.bottom));
+			if (g_footprint.units == FrustumUnits::kNearPlane && a_frustum.nearPlane > 0.0f) {
+				a_x /= a_frustum.nearPlane;
+				a_y /= a_frustum.nearPlane;
+			}
+		}
+
+		void FrustumExtents(const Frustum& a_frustum, float& a_x, float& a_y)
+		{
+			a_x = std::max(std::abs(a_frustum.left), std::abs(a_frustum.right));
+			a_y = std::max(std::abs(a_frustum.top), std::abs(a_frustum.bottom));
+		}
+
+		// At capture: record the zoom, and check whether the WorldRoot camera's rotation can be mapped
+		// onto the render camera this depth was drawn with.
+		void CheckFootprint(HiZ::Camera& a_camera)
+		{
+			a_camera.footprint = false;
+			a_camera.looseFit = false;
+			a_camera.axisReadings = 0;
+			const auto root = RE::Main::WorldRootCamera();
+			if (!root) {
+				return;
+			}
+			const auto frustum = ReadFrustum(root);
+			FrustumExtents(frustum, a_camera.frustumX, a_camera.frustumY);
+			if (!a_camera.viewSpace) {
+				return;
+			}
+			AxisMap loose{};
+			a_camera.looseFit = MatchAxes(a_camera, true, kLooseFit, loose) || MatchAxes(a_camera, false, kLooseFit, loose);
+
+			// Which readings of the rotation reproduce the render basis exactly this frame (both when
+			// facing along a world axis); each fitting one is kept with the depth frame.
+			AxisMap first{};
+			for (int reading = 0; reading < 2; ++reading) {
+				AxisMap map{};
+				if (!MatchAxes(a_camera, reading == 0, kStrictFit, map)) {
+					continue;
+				}
+				a_camera.axisReadings |= static_cast<std::uint8_t>(1u << reading);
+				for (int b = 0; b < 3; ++b) {
+					a_camera.axisIndex[reading][b] = static_cast<std::int8_t>(map.index[b]);
+					a_camera.axisSign[reading][b] = static_cast<std::int8_t>(map.sign[b]);
+				}
+				if (!first.valid) {
+					first = map;
+				}
+			}
+			if (!a_camera.axisReadings) {
+				++g_footprint.reasons[kAxesNoFit];
+				return;
+			}
+
+			const auto close = [](float a_value) { return std::abs(a_value - 1.0f) < 0.03f; };
+			if (g_footprint.units == FrustumUnits::kUnknown) {
+				if (close(a_camera.frustumX * a_camera.scaleX) && close(a_camera.frustumY * a_camera.scaleY)) {
+					g_footprint.units = FrustumUnits::kTangents;
+				} else if (frustum.nearPlane > 0.0f && close(a_camera.frustumX / frustum.nearPlane * a_camera.scaleX) &&
+						   close(a_camera.frustumY / frustum.nearPlane * a_camera.scaleY)) {
+					g_footprint.units = FrustumUnits::kNearPlane;
+				} else {
+					++g_footprint.reasons[kUnitsUnknown];
+					return;
+				}
+			}
+			float tx = 0.0f, ty = 0.0f;
+			FrustumTangents(frustum, tx, ty);
+			if (!close(tx * a_camera.scaleX) || !close(ty * a_camera.scaleY)) {
+				++g_footprint.reasons[kTangentMismatch];
+				return;
+			}
+
+			if (!g_footprint.announced) {
+				g_footprint.announced = true;
+				logger::info(
+					"view footprint: first capture fits {} (e.g. {} {}{} {}{} {}{} for dir, right, up), frustum in {} (tan {:.3f} x {:.3f} vs projection {:.3f} x {:.3f})",
+					a_camera.axisReadings == 3 ? "both readings (facing along a world axis)" : a_camera.axisReadings == 1 ? "columns" : "rows",
+					first.columns ? "columns" : "rows",
+					first.sign[0] < 0 ? "-" : "+", first.index[0],
+					first.sign[1] < 0 ? "-" : "+", first.index[1],
+					first.sign[2] < 0 ? "-" : "+", first.index[2],
+					g_footprint.units == FrustumUnits::kTangents ? "tangents" : "near-plane units",
+					tx, ty, 1.0f / a_camera.scaleX, 1.0f / a_camera.scaleY);
+			}
+			a_camera.footprint = true;
+		}
+
+		// At cull time: where the current view lands on the depth frame (NDC box), or false if unknown.
+		// a_stillFrames: consecutive frames the NiCamera hasn't turned; a_age: frames since the capture.
+		bool CurrentView(const HiZ::Camera& a_then, float a_angle, std::uint32_t a_stillFrames, std::uint64_t a_age, float a_out[4])
+		{
+			const auto root = RE::Main::WorldRootCamera();
+			if (!root) {
+				return false;
+			}
+			const auto frustum = ReadFrustum(root);
+			float      fx = 0.0f, fy = 0.0f;
+			FrustumExtents(frustum, fx, fy);
+			if (!(a_then.frustumX > 0.0f && a_then.frustumY > 0.0f && fx > 0.0f && fy > 0.0f)) {
+				++g_footprint.reasons[kImplausible];
+				return false;
+			}
+
+			// Not turned (well under a pixel) and not zoomed: the view is the depth frame itself, provided
+			// the depth frame was rendered from this orientation too. That holds if the render camera
+			// matched the NiCamera exactly at capture, or if the camera had already been still for longer
+			// than the capture is old (covers a render camera trailing the NiCamera by a frame).
+			constexpr float kStillAngle = 0.0002f;  // radians, ~0.01 degrees
+			const bool      sameZoom = std::abs(fx / a_then.frustumX - 1.0f) < 0.002f && std::abs(fy / a_then.frustumY - 1.0f) < 0.002f;
+			const bool      renderedHere = a_then.axisReadings != 0 || (a_then.looseFit && a_stillFrames >= a_age + 2);
+			if (a_angle < kStillAngle && sameZoom && renderedHere) {
+				a_out[0] = -1.0f;
+				a_out[1] = 1.0f;
+				a_out[2] = -1.0f;
+				a_out[3] = 1.0f;
+				++g_footprint.reasons[kStill];
+				return true;
+			}
+			if (g_footprint.disabled) {
+				++g_footprint.reasons[kTurnedOff];
+				return false;
+			}
+			if (!a_then.footprint || !a_then.axisReadings) {
+				++g_footprint.reasons[kNoMapping];
+				return false;
+			}
+			float rotate[3][3];
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 3; ++c) {
+					rotate[r][c] = root->world.rotate.entry[r].pt[c];
+				}
+			}
+			float tx = 0.0f, ty = 0.0f;
+			FrustumTangents(frustum, tx, ty);
+			if (!(tx > 0.0f && tx < 20.0f && ty > 0.0f && ty < 20.0f)) {
+				++g_footprint.reasons[kImplausible];
+				return false;
+			}
+
+			// The current frustum's corner rays under each reading that fit at capture, projected into
+			// the depth frame; the box covers all of them.
+			float x0 = std::numeric_limits<float>::infinity(), x1 = -x0, y0 = x0, y1 = -x0;
+			for (int reading = 0; reading < 2; ++reading) {
+				if (!(a_then.axisReadings & (1u << reading))) {
+					continue;
+				}
+				float basis[3][3];  // dir, right, up of the current camera, in the render basis' sense
+				for (int b = 0; b < 3; ++b) {
+					for (int c = 0; c < 3; ++c) {
+						basis[b][c] = a_then.axisSign[reading][b] * AxisComponent(rotate, reading == 0, a_then.axisIndex[reading][b], c);
+					}
+				}
+				for (int corner = 0; corner < 4; ++corner) {
+					const float sx = (corner & 1) ? tx : -tx;
+					const float sy = (corner & 2) ? ty : -ty;
+					float       d[3];
+					for (int c = 0; c < 3; ++c) {
+						d[c] = basis[0][c] + basis[1][c] * sx + basis[2][c] * sy;
+					}
+					const float length = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+					const float z = d[0] * a_then.viewDir[0] + d[1] * a_then.viewDir[1] + d[2] * a_then.viewDir[2];
+					if (z < 0.05f * length) {
+						++g_footprint.reasons[kSideways];
+						return false;  // the view reaches sideways past the depth frame's image plane
+					}
+					const float x = d[0] * a_then.viewRight[0] + d[1] * a_then.viewRight[1] + d[2] * a_then.viewRight[2];
+					const float y = d[0] * a_then.viewUp[0] + d[1] * a_then.viewUp[1] + d[2] * a_then.viewUp[2];
+					x0 = std::min(x0, a_then.scaleX * x / z);
+					x1 = std::max(x1, a_then.scaleX * x / z);
+					y0 = std::min(y0, a_then.scaleY * y / z);
+					y1 = std::max(y1, a_then.scaleY * y / z);
+				}
+			}
+
+			// Self-check: barely turned at the same zoom, a single-reading view must sit on the depth frame.
+			// (With both readings the box is the union of two mirrored guesses and is wide on purpose.)
+			const bool single = a_then.axisReadings == 1 || a_then.axisReadings == 2;
+			if (single && a_angle < 0.002f && sameZoom &&
+				(std::abs(x0 + 1.0f) > 0.03f || std::abs(x1 - 1.0f) > 0.03f || std::abs(y0 + 1.0f) > 0.03f || std::abs(y1 - 1.0f) > 0.03f)) {
+				g_footprint.disabled = true;
+				logger::error(
+					"view footprint: self-check failed (camera turned {:.3f} deg, view [{:.3f},{:.3f}]x[{:.3f},{:.3f}] instead of ~[-1,1]); turned views are no longer placed (a still camera still judges edge objects)",
+					a_angle * 180.0f / 3.14159265f, x0, x1, y0, y1);
+				return false;
+			}
+
+			// A small numeric margin, but never past a frame edge the view doesn't really cross (a margin
+			// there would make every object crossing that edge unjudgeable). A side within kSnap of
+			// the edge counts as on it: at most a 2-pixel sliver goes unchecked for a frame.
+			constexpr float kMargin = 0.002f;
+			constexpr float kSnap = 0.004f;
+			a_out[0] = x0 >= -1.0f - kSnap ? std::max(x0 - kMargin, -1.0f) : x0 - kMargin;
+			a_out[1] = x1 <= 1.0f + kSnap ? std::min(x1 + kMargin, 1.0f) : x1 + kMargin;
+			a_out[2] = y0 >= -1.0f - kSnap ? std::max(y0 - kMargin, -1.0f) : y0 - kMargin;
+			a_out[3] = y1 <= 1.0f + kSnap ? std::min(y1 + kMargin, 1.0f) : y1 + kMargin;
+			++g_footprint.reasons[a_then.axisReadings == 3 ? kTurnedBoth : kTurned];
+			return true;
+		}
+
+		// ---- the sun's shadow cascades --------------------------------------------------------------------
+		// With previs off they read DrawWorld group 0 (Hooks/CullGroups). An object neither the main view nor
+		// its sun shadow needs can then be left out of group 0 entirely; that needs this frame's light direction,
+		// verified against how the engine placed its shadow camera. Anything unverified keeps every shadow.
+
+		struct SunStats
+		{
+			std::uint32_t on{ 0 };
+			std::uint32_t off{ 0 };            // directional shadows off: no cascade reads group 0
+			std::uint32_t disabled{ 0 };       // bSunShadowCulling=0
+			std::uint32_t unreadable{ 0 };     // the engine's structures couldn't be read
+			std::uint32_t pathChanged{ 0 };    // a call on the active cascade path, or the light's update, isn't the engine's
+			std::uint32_t badDirection{ 0 };   // not unit length, or not pointing down (sun at the horizon)
+			std::uint32_t badPlacement{ 0 };   // the shadow camera isn't on the sun's side of the view
+			std::uint32_t batched{ 0 };        // frames with bCullingBatch set (the other path)
+			float         dir[3]{};
+			float         range{ 0.0f };
+			float         placement{ 0.0f };   // (view - shadow camera) . direction: 15000 when as the engine builds it
+		};
+		SunStats g_sun;
+
+		void ReadSunState(const HiZ::Camera& a_camera, Occlusion::FrameContext::Sun& a_out)
+		{
+			using State = Occlusion::FrameContext::Sun::State;
+			a_out = {};
+			if (!Settings::Get().sunShadowCulling) {
+				++g_sun.disabled;
+				return;
+			}
+			Hooks::CullGroups::SunSource source{};
+			if (!Hooks::CullGroups::ReadSun(source)) {
+				++g_sun.unreadable;
+				return;
+			}
+			g_sun.batched += source.groupsEnabled;
+			if (!source.pathIntact) {
+				++g_sun.pathChanged;
+				return;
+			}
+			// Both paths check this byte themselves (fixed for the frame before the cull stage): off, neither
+			// culls the cascades against group 0.
+			if (!source.dirShadows) {
+				++g_sun.off;
+				a_out.state = State::kOff;
+				return;
+			}
+			const auto  root = RE::Main::WorldRootCamera();
+			const float length = std::sqrt(source.dir[0] * source.dir[0] + source.dir[1] * source.dir[1] + source.dir[2] * source.dir[2]);
+			if (!root || !(length > 0.99f && length < 1.01f) || !(source.dir[2] < -0.02f)) {
+				++g_sun.badDirection;
+				return;
+			}
+			float dir[3];
+			for (int i = 0; i < 3; ++i) {
+				dir[i] = source.dir[i] / length;
+			}
+			const auto& eye = root->world.translate;
+			const float placement = (eye.x - source.cameraPos[0]) * dir[0] + (eye.y - source.cameraPos[1]) * dir[1] + (eye.z - source.cameraPos[2]) * dir[2];
+			g_sun.placement = placement;
+			if (!(placement > 1000.0f)) {
+				++g_sun.badPlacement;
+				return;
+			}
+			std::copy_n(dir, 3, g_sun.dir);
+			g_sun.range = source.range;
+			++g_sun.on;
+
+			// Into the depth frame's view space (right, up, forward).
+			const auto dot = [&](const float a_axis[3]) { return dir[0] * a_axis[0] + dir[1] * a_axis[1] + dir[2] * a_axis[2]; };
+			a_out.dir[0] = dot(a_camera.viewRight);
+			a_out.dir[1] = dot(a_camera.viewUp);
+			a_out.dir[2] = dot(a_camera.viewDir);
+			// Receivers end at the cascade range (padded: splits run along view depth, and the range can change);
+			// the engine eases the direction over time when the sun moves; shadow maps filter over a few texels.
+			a_out.reach = std::clamp(source.range, 100.0f, 1.0e6f) * 1.25f + 256.0f;
+			a_out.spread = 0.0175f;  // sin(1 deg)
+			a_out.margin = 64.0f;
+			a_out.state = State::kOn;
+		}
+
+		void LogSun()
+		{
+			logger::info(
+				"sun shadows per interval: on {} | off {} | not used: disabled {}, unreadable {}, path changed {}, direction {}, placement {} || batched frames {} || last direction ({:.3f},{:.3f},{:.3f}) range {:.0f} placement {:.0f}",
+				g_sun.on, g_sun.off, g_sun.disabled, g_sun.unreadable, g_sun.pathChanged, g_sun.badDirection, g_sun.badPlacement, g_sun.batched,
+				g_sun.dir[0], g_sun.dir[1], g_sun.dir[2], g_sun.range, g_sun.placement);
+			SunStats next{};
+			std::copy_n(g_sun.dir, 3, next.dir);
+			next.range = g_sun.range;
+			next.placement = g_sun.placement;
+			g_sun = next;
+		}
+
+		// ---- timing -------------------------------------------------------------------------------
+
+		double QpcMs(std::int64_t a_ticks)
+		{
+			static const double frequency = [] {
+				LARGE_INTEGER value{};
+				QueryPerformanceFrequency(&value);
+				return static_cast<double>(value.QuadPart);
+			}();
+			return static_cast<double>(a_ticks) * 1000.0 / frequency;
+		}
+
+		std::int64_t Qpc()
+		{
+			LARGE_INTEGER value{};
+			QueryPerformanceCounter(&value);
+			return value.QuadPart;
+		}
+
+		// ---- the frame in buckets, per mode ----------------------------------------------------------------------
+		// The v1.27 run showed CBRO's own cost falling (tests 0.9 ms a frame, the cull stage ~1.7 ms) while the same-
+		// session A/B gap to previs stayed at +2 ms: the gap is not in the two stages CBRO times. So every frame is
+		// split at the render-stage hooks (all on the main thread) into marks 0-8: cull begin, cull end, pre-pass
+		// begin, pre-pass end, sun-cascades begin, sun-cascades end (Render_PreUI+0x1BF: the light's update, the
+		// cascade cull over group 0 and, with previs off, the shadow-map draws of every caster in range), forward
+		// begin, forward end, and the next frame's cull begin. Buckets: the four stages, "between" (the gaps inside
+		// Render_PreUI: HBAO and whatever else runs between the stages) and "rest" (from the forward pass to the next
+		// cull: deferred composite, post, UI, present and the game's update), kept per mode so a 600-frame interval
+		// with F8 presses inside still compares like with like.
+		enum Bucket : std::size_t
+		{
+			kBucketCull,
+			kBucketPrePass,
+			kBucketSun,
+			kBucketForward,
+			kBucketBetween,
+			kBucketRest,
+			kBucketCount
+		};
+		constexpr std::array   kBucketNames{ "cull"sv, "pre-pass"sv, "sun cascades"sv, "forward"sv, "between"sv, "rest"sv };
+		constexpr std::size_t  kMarkCount = 9;
+
+		struct ModeBuckets
+		{
+			std::array<double, kBucketCount> ms{};
+			std::uint32_t                    frames{ 0 };
+
+			std::string Describe() const
+			{
+				if (!frames) {
+					return "-";
+				}
+				std::string text;
+				double      total = 0.0;
+				for (std::size_t i = 0; i < kBucketCount; ++i) {
+					text += std::format("{}{} {:.2f}", i ? " | " : "", kBucketNames[i], ms[i] / frames);
+					total += ms[i];
+				}
+				return std::format("{} = {:.2f} ({} frames)", text, total / frames, frames);
+			}
+		};
+
+		// Adds the spans between consecutive present marks (0 = absent, in ms) to the buckets: a stage's own span when
+		// both its marks are present and adjacent, "rest" for a span ending at the next cull begin, else "between".
+		void FoldMarks(const double a_marks[kMarkCount], ModeBuckets& a_out) noexcept
+		{
+			std::size_t last = 0;
+			for (std::size_t j = 1; j < kMarkCount; ++j) {
+				if (!(a_marks[j] > 0.0)) {
+					continue;
+				}
+				Bucket bucket = kBucketBetween;
+				if (j == last + 1) {
+					switch (last) {
+					case 0:
+						bucket = kBucketCull;
+						break;
+					case 2:
+						bucket = kBucketPrePass;
+						break;
+					case 4:
+						bucket = kBucketSun;
+						break;
+					case 6:
+						bucket = kBucketForward;
+						break;
+					default:
+						break;
+					}
+				}
+				if (j == kMarkCount - 1 && bucket == kBucketBetween) {
+					bucket = kBucketRest;
+				}
+				a_out.ms[bucket] += std::max(0.0, a_marks[j] - a_marks[last]);
+				last = j;
+			}
+			++a_out.frames;
+		}
+
+		struct Timing
+		{
+			std::array<std::int64_t, kMarkCount> marks{};  // this frame's QPC marks (0 = not seen)
+			int                                  mode{ -1 };  // the frame's mode once its cull begin ran (0 previs, 1 CBRO)
+			std::int64_t                         setupTicks{ 0 };
+			std::int64_t                         captureTicks{ 0 };
+			std::uint32_t                        cullFrames{ 0 };
+			std::uint32_t                        prepassFrames{ 0 };
+			std::array<ModeBuckets, 2>           cpu{};
+		};
+		Timing g_timing;
+
+		// The previous frame's buckets, closed by this frame's cull begin.
+		void CloseFrameTiming(std::int64_t a_now)
+		{
+			if (g_timing.marks[0] == 0 || g_timing.mode < 0) {
+				return;
+			}
+			double marks[kMarkCount];
+			for (std::size_t i = 0; i + 1 < kMarkCount; ++i) {
+				marks[i] = g_timing.marks[i] ? QpcMs(g_timing.marks[i]) : 0.0;
+			}
+			marks[kMarkCount - 1] = QpcMs(a_now);
+			FoldMarks(marks, g_timing.cpu[static_cast<std::size_t>(g_timing.mode)]);
+		}
+
+		// The same buckets on the GPU: D3D11 timestamp queries on the engine's immediate context, a disjoint bracket
+		// per frame from its cull begin to the next frame's cull begin, timestamps at the marks, read back without
+		// waiting once the GPU is done (4+ frames later). A span includes the GPU's idle time between its marks (the
+		// GPU waiting for the CPU), so a span that grows with a mode while its CPU bucket doesn't is GPU work, and a
+		// frame whose GPU total equals the CPU total in both modes is paced by whichever the buckets say.
+		class GpuTimeline
+		{
+		public:
+			void FrameBegin(int a_mode)
+			{
+				const auto context = Util::GetContext();
+				const auto device = Util::GetDevice();
+				if (!context || !device || m_failed) {
+					return;
+				}
+				if (!m_ready && !Create(device)) {
+					return;
+				}
+				Poll(context);
+				auto& previous = m_ring[m_current];
+				if (previous.open) {
+					context->End(previous.marks[kMarkCount - 1]);  // this cull begin closes the previous frame's "rest"
+					previous.written |= 1u << (kMarkCount - 1);
+					context->End(previous.disjoint);
+					previous.open = false;
+					previous.pending = true;
+				}
+				m_current = (m_current + 1) % kRing;
+				auto& frame = m_ring[m_current];
+				if (frame.pending) {
+					++m_dropped;  // never read: the GPU is more than a ring behind
+					frame.pending = false;
+				}
+				frame.open = true;
+				frame.mode = a_mode;
+				frame.written = 0;
+				context->Begin(frame.disjoint);
+				Mark(0);
+			}
+
+			void Mark(std::size_t a_index)
+			{
+				auto& frame = m_ring[m_current];
+				if (!frame.open || m_failed || a_index + 1 >= kMarkCount) {
+					return;
+				}
+				if (const auto context = Util::GetContext()) {
+					context->End(frame.marks[a_index]);
+					frame.written |= 1u << a_index;
+				}
+			}
+
+			std::array<ModeBuckets, 2> Take() noexcept
+			{
+				auto out = m_gpu;
+				m_gpu = {};
+				return out;
+			}
+
+			std::string Status() const
+			{
+				if (m_failed) {
+					return "unavailable (query creation failed)";
+				}
+				return std::format("read {} frames, dropped {}, disjoint {}", m_read, m_dropped, m_disjoint);
+			}
+
+		private:
+			static constexpr std::uint32_t kRing = 8;
+
+			struct Frame
+			{
+				ID3D11Query*  disjoint{ nullptr };
+				ID3D11Query*  marks[kMarkCount]{};
+				bool          open{ false };
+				bool          pending{ false };
+				int           mode{ 0 };
+				std::uint32_t written{ 0 };
+			};
+
+			bool Create(ID3D11Device* a_device)
+			{
+				for (auto& frame : m_ring) {
+					D3D11_QUERY_DESC desc{};
+					desc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+					if (FAILED(a_device->CreateQuery(&desc, &frame.disjoint))) {
+						m_failed = true;
+					}
+					desc.Query = D3D11_QUERY_TIMESTAMP;
+					for (auto& mark : frame.marks) {
+						if (FAILED(a_device->CreateQuery(&desc, &mark))) {
+							m_failed = true;
+						}
+					}
+				}
+				if (m_failed) {
+					logger::error("gpu timeline: timestamp queries couldn't be created; no GPU times this session");
+					return false;
+				}
+				m_ready = true;
+				return true;
+			}
+
+			void Poll(ID3D11DeviceContext* a_context)
+			{
+				// Oldest first; once one isn't finished, the newer ones aren't either.
+				for (std::uint32_t k = 1; k < kRing; ++k) {
+					auto& frame = m_ring[(m_current + k) % kRing];
+					if (!frame.pending) {
+						continue;
+					}
+					D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+					const auto hr = a_context->GetData(frame.disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+					if (hr == S_FALSE) {
+						break;
+					}
+					frame.pending = false;
+					if (FAILED(hr) || disjoint.Disjoint || disjoint.Frequency == 0) {
+						++m_disjoint;
+						continue;
+					}
+					double marks[kMarkCount]{};
+					bool   ok = true;
+					for (std::size_t i = 0; i < kMarkCount && ok; ++i) {
+						if (!(frame.written & (1u << i))) {
+							continue;
+						}
+						std::uint64_t stamp = 0;
+						if (a_context->GetData(frame.marks[i], &stamp, sizeof(stamp), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+							ok = false;
+							break;
+						}
+						marks[i] = static_cast<double>(stamp) * 1000.0 / static_cast<double>(disjoint.Frequency);
+					}
+					if (ok && marks[0] > 0.0) {
+						FoldMarks(marks, m_gpu[static_cast<std::size_t>(frame.mode & 1)]);
+						++m_read;
+					} else {
+						++m_disjoint;
+					}
+				}
+			}
+
+			std::array<Frame, kRing>   m_ring{};
+			std::uint32_t              m_current{ 0 };
+			bool                       m_ready{ false };
+			bool                       m_failed{ false };
+			std::array<ModeBuckets, 2> m_gpu{};
+			std::uint64_t              m_read{ 0 };
+			std::uint64_t              m_dropped{ 0 };
+			std::uint64_t              m_disjoint{ 0 };
+		};
+		GpuTimeline g_gpu;
+
+		// ---- A/B frame time -----------------------------------------------------------------------
+		// Base frame time (pre-pass to pre-pass) per mode. A switch starts a new segment; its first
+		// kSettleFrames frames (previs flush, streaks, first depth) and any hitch or menu frame are left
+		// out, so standing still and pressing the toggle gives a like-for-like comparison.
+
+		constexpr std::uint32_t kSettleFrames = 120;
+		constexpr std::uint32_t kLoadSettleFrames = 600;  // after a load: streaming, shader compiles and LOD builds belong to neither mode
+		constexpr double        kHitchMs = 250.0;
+		constexpr double        kLoadMs = 1000.0;        // a frame this long is a load or fast travel: new location
+		constexpr float         kLocationRadius = 2048.0f;  // moving farther than this starts a new comparison
+
+		struct ModeTime
+		{
+			double        sum{ 0.0 };
+			std::uint32_t count{ 0 };
+		};
+
+		struct FrameClock
+		{
+			std::int64_t        last{ 0 };
+			int                 mode{ -1 };  // 0 previs, 1 CBRO
+			std::uint32_t       sinceSwitch{ 0 };
+			std::vector<float>  segment;       // settled frame times of the current segment
+			std::int64_t        segmentStart{ 0 };
+			std::array<ModeTime, 2> session{};  // settled frames at the current location
+			std::array<ModeTime, 2> still{};    // ... of which the camera was exactly where it was the frame before
+			RE::NiPoint3        anchor{};       // where the current location's comparison started
+			bool                anchored{ false };
+			std::uint32_t       location{ 0 };
+			bool                dumpedHere{ false };  // the kept-object dump ran at this location
+			double              intervalSum{ 0.0 };
+			double              intervalMax{ 0.0 };
+			std::uint32_t       intervalCount{ 0 };
+			ModeTime            intervalStill{};  // this interval's frames with the camera still (what a standing-still overlay shows)
+			std::array<ModeTime, 2> intervalMode{};  // this interval's frames by mode (hitches and menus left out)
+			std::uint32_t       sinceLoad{ 0 };
+			RE::NiPoint3        lastPosition{};
+			float               lastRotate[3][3]{};
+			bool                lastCameraKnown{ false };
+		};
+		FrameClock g_frames;
+
+		constexpr std::array kModeNames{ "previs"sv, "CBRO"sv };
+
+		void CloseSegment(std::int64_t a_now)
+		{
+			if (g_frames.mode < 0) {
+				return;
+			}
+			auto& samples = g_frames.segment;
+			if (samples.size() >= 60) {
+				double sum = 0.0;
+				for (const auto ms : samples) {
+					sum += ms;
+				}
+				const auto middle = samples.begin() + static_cast<std::ptrdiff_t>(samples.size() / 2);
+				std::nth_element(samples.begin(), middle, samples.end());
+				const double avg = sum / static_cast<double>(samples.size());
+				logger::info(
+					"A/B segment: {} for {:.1f} s | {} settled frames | avg {:.2f} ms ({:.0f} fps) | median {:.2f} ms",
+					kModeNames[g_frames.mode], QpcMs(a_now - g_frames.segmentStart) / 1000.0, samples.size(), avg, 1000.0 / avg, *middle);
+			}
+			samples.clear();
+		}
+
+		void LogSessionAB()
+		{
+			const auto& previs = g_frames.session[0];
+			const auto& cbro = g_frames.session[1];
+			if (previs.count < 60 || cbro.count < 60) {
+				return;
+			}
+			const double previsMs = previs.sum / previs.count;
+			const double cbroMs = cbro.sum / cbro.count;
+			logger::info(
+				"A/B at location {} (settled frames): previs {:.2f} ms ({:.0f} fps, {} frames) | CBRO {:.2f} ms ({:.0f} fps, {} frames) | CBRO is {:.1f}% {}",
+				g_frames.location, previsMs, 1000.0 / previsMs, previs.count, cbroMs, 1000.0 / cbroMs, cbro.count,
+				std::abs(previsMs / cbroMs - 1.0) * 100.0, cbroMs <= previsMs ? "faster" : "slower");
+			// Standing still only: the comparison the user makes with the overlay (movement changes both modes' load).
+			const auto& previsStill = g_frames.still[0];
+			const auto& cbroStill = g_frames.still[1];
+			if (previsStill.count >= 60 && cbroStill.count >= 60) {
+				const double p = previsStill.sum / previsStill.count;
+				const double c = cbroStill.sum / cbroStill.count;
+				logger::info(
+					"A/B at location {} (camera still): previs {:.2f} ms ({:.0f} fps, {} frames) | CBRO {:.2f} ms ({:.0f} fps, {} frames) | CBRO is {:.1f}% {}",
+					g_frames.location, p, 1000.0 / p, previsStill.count, c, 1000.0 / c, cbroStill.count,
+					std::abs(p / c - 1.0) * 100.0, c <= p ? "faster" : "slower");
+			}
+		}
+
+		// A new place (load, fast travel, or walked away): close the comparison and start another.
+		void NewLocation(std::string_view a_reason, std::int64_t a_now)
+		{
+			CloseSegment(a_now);
+			LogSessionAB();
+			g_frames.session = {};
+			g_frames.still = {};
+			g_frames.sinceSwitch = 0;
+			g_frames.segmentStart = a_now;
+			g_frames.anchored = false;
+			g_frames.dumpedHere = false;
+			++g_frames.location;
+			logger::info("A/B: location {} starts ({})", g_frames.location, a_reason);
+		}
+
+		void OnFrameBoundary()
+		{
+			const auto now = Qpc();
+			const int  mode = Occlusion::Active() ? 1 : 0;
+			if (mode != g_frames.mode) {
+				CloseSegment(now);
+				g_frames.mode = mode;
+				g_frames.sinceSwitch = 0;
+				g_frames.segmentStart = now;
+			}
+			bool cameraStill = false;
+			if (const auto root = RE::Main::WorldRootCamera()) {
+				const auto& position = root->world.translate;
+				if (!g_frames.anchored) {
+					g_frames.anchor = position;
+					g_frames.anchored = true;
+				} else if ((position - g_frames.anchor).Length() > kLocationRadius) {
+					NewLocation("moved away", now);
+					g_frames.anchor = position;
+					g_frames.anchored = true;
+				}
+				// The same camera as the frame before, within the idle sway of a standing player (the v1.16 run
+				// showed the camera is never bit-identical two frames running): what "standing still" means for
+				// an overlay reading. Limits: 2 units of movement and ~0.06 degrees of turn per frame.
+				const auto& rotate = root->world.rotate.entry;
+				float       squared = 0.0f;
+				for (int r = 0; r < 3; ++r) {
+					for (int c = 0; c < 3; ++c) {
+						const float d = rotate[r].pt[c] - g_frames.lastRotate[r][c];
+						squared += d * d;
+					}
+				}
+				cameraStill = g_frames.lastCameraKnown && (position - g_frames.lastPosition).Length() <= 2.0f && squared <= 2.0f * 0.001f * 0.001f;
+				g_frames.lastPosition = position;
+				std::memcpy(g_frames.lastRotate, rotate, sizeof(g_frames.lastRotate));
+				g_frames.lastCameraKnown = true;
+			} else {
+				g_frames.lastCameraKnown = false;
+			}
+			if (g_frames.last) {
+				const double ms = QpcMs(now - g_frames.last);
+				if (ms > kLoadMs) {
+					NewLocation("loading pause", now);
+				}
+				g_frames.intervalSum += ms;
+				g_frames.intervalMax = std::max(g_frames.intervalMax, ms);
+				++g_frames.intervalCount;
+
+				const auto ui = RE::UI::GetSingleton();
+				const bool menu = ui && ui->menuMode != 0;
+				if (ms < kHitchMs && !menu) {
+					g_frames.intervalMode[mode].sum += ms;
+					++g_frames.intervalMode[mode].count;
+				}
+				if (cameraStill && ms < kHitchMs && !menu) {
+					g_frames.intervalStill.sum += ms;
+					++g_frames.intervalStill.count;
+				}
+				const bool warm = ++g_frames.sinceLoad > kLoadSettleFrames;
+				if (++g_frames.sinceSwitch > kSettleFrames && warm && ms < kHitchMs && !menu) {
+					g_frames.segment.push_back(static_cast<float>(ms));
+					g_frames.session[mode].sum += ms;
+					++g_frames.session[mode].count;
+					if (cameraStill) {
+						g_frames.still[mode].sum += ms;
+						++g_frames.still[mode].count;
+					}
+				}
+			}
+			g_frames.last = now;
+		}
+
+		void ResetAB()
+		{
+			if (g_frames.mode >= 0) {
+				NewLocation("game loaded", Qpc());
+			}
+			g_frames.segment.clear();
+			g_frames.session = {};
+			g_frames.still = {};
+			g_frames.mode = -1;
+			g_frames.last = 0;
+			g_frames.sinceLoad = 0;
+			g_frames.anchored = false;
+			g_frames.lastCameraKnown = false;
+		}
+
+		void LogTiming()
+		{
+			const double intervalFrames = std::max(1u, g_frames.intervalCount);
+			const double frameMs = g_frames.intervalSum / intervalFrames;
+			const auto&  still = g_frames.intervalStill;
+			const double stillMs = still.count ? still.sum / still.count : 0.0;
+			const auto byMode = [](const ModeTime& a_time) {
+				return a_time.count ? std::format("{:.2f} ms ({:.0f} fps) over {} frames", a_time.sum / a_time.count, 1000.0 * a_time.count / a_time.sum, a_time.count) : std::string("-");
+			};
+			logger::info(
+				"frame time (base, pre-pass to pre-pass): avg {:.2f} ms ({:.0f} fps), max {:.2f} ms over {} frames | by mode: previs {} / CBRO {} | camera still: {} | previs {}",
+				frameMs, 1000.0 / std::max(0.001, frameMs), g_frames.intervalMax, g_frames.intervalCount,
+				byMode(g_frames.intervalMode[0]), byMode(g_frames.intervalMode[1]),
+				still.count ? std::format("{:.2f} ms ({:.0f} fps) over {} frames", stillMs, 1000.0 / std::max(0.001, stillMs), still.count) : std::string("no still frames"),
+				PrevisEnabled() ? "ACTIVE" : "OFF");
+			g_frames.intervalStill = {};
+			g_frames.intervalMode = {};
+			logger::info("CPU per frame by mode (ms, main thread, between the render-stage hooks): previs: {} || CBRO: {}", g_timing.cpu[0].Describe(), g_timing.cpu[1].Describe());
+			const auto gpu = g_gpu.Take();
+			logger::info("GPU per frame by mode (ms, timestamp spans, idle between marks included): previs: {} || CBRO: {} || {}", gpu[0].Describe(), gpu[1].Describe(), g_gpu.Status());
+			const auto calls = Hooks::CullGroups::TakeHookCalls();
+			const auto flags = Hooks::CullGroups::ReadEngineFlags();
+			logger::info(
+				"hooks {} | calls per frame: Block::Add {:.0f}, Group::Add {:.0f}, ChildPush {:.0f}, registrations {:.0f} || engine: bCullingBatch {}, directional shadows {}",
+				g_state.hooksIn ? "in" : "out (the engine runs its own code; the registration hook stays in, counting only)",
+				calls.blockAdds / intervalFrames, calls.groupAdds / intervalFrames, calls.childPushes / intervalFrames, calls.registrations / intervalFrames,
+				flags.cullingBatch ? 1 : 0, flags.dirShadows ? "on" : "off");
+			logger::info(
+				"registrations per frame by accumulator (which views register how much): previs: {} || CBRO: {}",
+				Hooks::CullGroups::TakeRegistrationSites(false, std::max(1u, g_timing.cpu[0].frames)),
+				Hooks::CullGroups::TakeRegistrationSites(true, std::max(1u, g_timing.cpu[1].frames)));
+			g_frames.intervalSum = 0.0;
+			g_frames.intervalMax = 0.0;
+			g_frames.intervalCount = 0;
+			LogSessionAB();
+
+			const double cullFrames = std::max(1u, g_timing.cullFrames);
+			const double prepassFrames = std::max(1u, g_timing.prepassFrames);
+			const double cbroFrames = std::max(1u, g_timing.cpu[1].frames);  // (the tests only run in CBRO mode)
+			const auto tests = Occlusion::TakeTestMilliseconds();
+			logger::info(
+				"cost per frame (ms): CBRO setup {:.3f} | CBRO depth capture {:.3f} | CBRO object tests per CBRO-mode frame {:.3f} CPU on all threads, {:.3f} of it on the main thread: view evaluations {:.3f} (of which mesh shapes {:.3f}), sun evaluations {:.3f}, cache reuse and bookkeeping {:.3f}",
+				QpcMs(g_timing.setupTicks) / cullFrames, QpcMs(g_timing.captureTicks) / prepassFrames,
+				tests.all / cbroFrames, tests.mainThread / cbroFrames,
+				tests.evaluate / cbroFrames, tests.shape / cbroFrames, tests.sun / cbroFrames, std::max(0.0, tests.all - tests.evaluate - tests.sun) / cbroFrames);
+			logger::info(
+				"verdict cache this interval: camera epochs {} | sun epochs {} | hi-z blocks changed {:.1f} per readback",
+				g_epochs.viewChanges, g_epochs.sunChanges, static_cast<double>(HiZ::TakeBlocksChanged()) / std::max(1.0, static_cast<double>(g_timing.prepassFrames)));
+			g_epochs.viewChanges = 0;
+			g_epochs.sunChanges = 0;
+			if (g_footprint.lastValid) {
+				logger::info(
+					"view footprint (last frame): [{:.3f},{:.3f}] x [{:.3f},{:.3f}] of the depth frame, camera turned {:.2f} deg since",
+					g_footprint.lastView[0], g_footprint.lastView[1], g_footprint.lastView[2], g_footprint.lastView[3],
+					g_footprint.lastAngle * 180.0f / 3.14159265f);
+			} else if (!g_footprint.disabled) {
+				logger::info("view footprint (last frame): unavailable, objects on the screen edge stay unjudged");
+			}
+			const auto& r = g_footprint.reasons;
+			logger::info(
+				"view footprint per interval: still {} | turned {} | turned (both readings) {} || unusable: capture no exact fit {} / frustum units {} / frustum mismatch {} | frame no mapping {} / turned views off {} / sideways {} / implausible {}",
+				r[kStill], r[kTurned], r[kTurnedBoth], r[kAxesNoFit], r[kUnitsUnknown], r[kTangentMismatch], r[kNoMapping], r[kTurnedOff], r[kSideways], r[kImplausible]);
+			g_footprint.reasons = {};
+			Timing next{};
+			next.marks = g_timing.marks;
+			next.mode = g_timing.mode;
+			g_timing = next;
+		}
+
+		// On-screen message (HUD corner), queued to the main thread outside rendering.
+		void Notify(std::string a_text)
+		{
+			if (!Settings::Get().notify) {
+				return;
+			}
+			if (const auto tasks = F4SE::GetTaskInterface()) {
+				tasks->AddTask([text = std::move(a_text)]() {
+					RE::SendHUDMessage::ShowHUDMessage(text.c_str(), "", false, false);
+				});
+			}
+		}
+
+		void NotifyStatus()
+		{
+			if (!Occlusion::Active()) {
+				Notify(g_state.wantActive ? "CBRO unavailable - previs is handling visibility" : "CBRO off - previs on");
+				return;
+			}
+			const auto tested = Occlusion::TestedPerFrame();
+			const auto rejected = Occlusion::RejectedPerFrame();
+			static constexpr std::array kDiagnostic{ ""sv, " [decide-only]"sv, " [decide-only, no depth capture]"sv };
+			Notify(tested > 0.0f ?
+			           std::format(
+						   "CBRO on{} - hiding {:.0f} of {:.0f} objects, {:.0f} of {:.0f} lights per frame",
+						   kDiagnostic[g_state.diagnostic], rejected, tested, Occlusion::LightsRejectedPerFrame(), Occlusion::LightsPerFrame()) :
+			           std::string("CBRO on (previs off) - warming up"));
+		}
+
+		void ApplyMode(bool a_active, std::string_view a_reason)
+		{
+			const auto& settings = Settings::Get();
+			g_state.wantActive = a_active;
+			// Previs only goes off when CBRO can actually take over.
+			const bool effective = a_active && g_state.convention != Convention::kNone && !HiZ::Failed();
+			Occlusion::SetActive(effective);
+			Occlusion::ResetHistory();
+			logger::info(
+				"mode: {} ({})",
+				effective ? "CBRO occlusion" : a_active ? "previs (CBRO requested but unavailable)" : "previs (CBRO off)", a_reason);
+			if (static_cast<int>(effective) != g_state.notifiedEffective) {
+				g_state.notifiedEffective = effective;
+				if (settings.disablePrevis) {
+					Notify(effective ? "CBRO on - previs off" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
+				} else {
+					Notify(effective ? "CBRO on - working with previs" : a_active ? "CBRO unavailable - previs only" : "CBRO off - previs only");
+				}
+			}
+
+			if (!settings.disablePrevis) {
+				return;
+			}
+			// The switch itself runs at the next cull begin (ApplyPrevisRequest): main thread, before DrawWorld's
+			// cull. Up to v1.15 it ran from F4SE's task queue, which on OG F4SE is drained inside its hook on the
+			// engine's message-queue processing (f4se/Hooks_Threads.cpp), i.e. on worker threads: the v1.15 log
+			// shows the switch on five different thread ids. Its disable path runs the engine's flush callbacks,
+			// which must not race the main thread's cull.
+			g_state.previsRequest.store(effective ? 0 : 1);
+		}
+
+		// Switches previs where the console's `tpc` does: on the main thread, with no cull reading previs data
+		// (this runs right before DrawWorld's cull of the frame).
+		void ApplyPrevisRequest()
+		{
+			const int request = g_state.previsRequest.exchange(-1);
+			if (request < 0) {
+				return;
+			}
+			if (!g_state.previsThreadLogged) {
+				g_state.previsThreadLogged = true;
+				const auto main = RE::Main::GetSingleton();
+				const auto thread = GetCurrentThreadId();
+				logger::info("previs switch runs on thread {} ({})", thread, main && main->threadID == thread ? "the main thread" : "NOT the main thread");
+			}
+			if (!g_state.originalPrevisKnown) {
+				g_state.originalPrevis = PrevisEnabled();
+				g_state.originalPrevisKnown = true;
+			}
+			const bool want = request == 0 ? false : g_state.originalPrevis;
+			if (PrevisEnabled() != want) {
+				SetPrevisEnabled(want);
+				logger::info("previs {}", want ? "re-enabled" : "disabled (CBRO is the visibility authority)");
+			}
+			g_state.expectedPrevis = want ? 1 : 0;
+		}
+
+		// The hooks follow the mode, switched on the main thread before DrawWorld's cull: out while previs has the
+		// job (the engine then runs exactly its own code, as without CBRO), in while CBRO culls.
+		void SyncHooks()
+		{
+			const bool want = Occlusion::Active();
+			if (want == g_state.hooksWanted) {
+				return;
+			}
+			g_state.hooksWanted = want;
+			const bool groups = Hooks::CullGroups::SetHooksIn(want);
+			const bool lights = ShadowLights::SetHooksIn(want);
+			g_state.hooksIn = Hooks::CullGroups::HooksIn();
+			logger::info(
+				"hooks: {}{}", want ? "put back in (CBRO culls)" : "taken out (previs mode: the engine runs its own code)",
+				groups && lights ? "" : " - some were left as they were (see above)");
+			if (want && !g_state.hooksIn) {
+				logger::error("hooks: the culling hooks couldn't be put back; previs keeps the job");
+				ApplyMode(false, "hooks unavailable");
+			}
+		}
+
+		bool KeyPressed(std::uint32_t a_vk, bool& a_wasDown)
+		{
+			if (a_vk == 0) {
+				return false;
+			}
+			const auto main = RE::Main::GetSingleton();
+			if (!main || GetForegroundWindow() != reinterpret_cast<HWND>(main->hwnd)) {
+				a_wasDown = false;
+				return false;
+			}
+			const bool down = (GetAsyncKeyState(static_cast<int>(a_vk)) & 0x8000) != 0;
+			const bool pressed = down && !a_wasDown;
+			a_wasDown = down;
+			return pressed;
+		}
+
+		void OnCullBegin()
+		{
+			const auto& settings = Settings::Get();
+
+			if (KeyPressed(settings.toggleHotkey, g_state.toggleKeyDown)) {
+				ApplyMode(!g_state.wantActive, "hotkey");
+			}
+			if (KeyPressed(settings.statusHotkey, g_state.statusKeyDown)) {
+				NotifyStatus();
+			}
+			if (KeyPressed(settings.diagnosticHotkey, g_state.diagnosticKeyDown)) {
+				g_state.diagnostic = (g_state.diagnostic + 1) % 3;
+				Occlusion::SetObserveOnly(g_state.diagnostic != 0);
+				if (g_state.diagnostic == 2) {
+					HiZ::Reset();
+				}
+				static constexpr std::array kNames{
+					"CBRO diagnostic: normal (hiding on)"sv,
+					"CBRO diagnostic: decide-only (nothing hidden, previs still off)"sv,
+					"CBRO diagnostic: decide-only, depth capture off (no CBRO GPU work)"sv
+				};
+				logger::info("{}", kNames[g_state.diagnostic]);
+				Notify(std::string(kNames[g_state.diagnostic]));
+			}
+			ApplyPrevisRequest();
+			// Previs switched outside CBRO (console `tpc`): follow it, so the two stay inverse.
+			if (settings.disablePrevis && g_state.expectedPrevis >= 0 && g_state.previsRequest.load() < 0) {
+				const int actual = PrevisEnabled() ? 1 : 0;
+				if (actual != g_state.expectedPrevis) {
+					g_state.expectedPrevis = actual;
+					ApplyMode(actual == 0, actual ? "previs re-enabled outside CBRO (console tpc?)" : "previs disabled outside CBRO (console tpc?)");
+				}
+			}
+			if (HiZ::Failed() && !g_state.failureHandled) {
+				g_state.failureHandled = true;
+				ApplyMode(g_state.wantActive, "hi-z unavailable");
+			}
+			SyncHooks();
+
+			TrackStillness();
+			// Previs mode: no depth is captured, so there is nothing to poll or prepare (the hooks pass through).
+			const bool active = Occlusion::Active();
+			if (active) {
+				HiZ::Poll();
+			}
+			const auto snapshot = active ? HiZ::Latest() : nullptr;
+
+			Occlusion::FrameContext context{};
+			context.clock = ++g_state.clock;
+			context.snapshot = snapshot;
+			g_footprint.lastValid = false;
+
+			if (snapshot && g_state.convention != Convention::kNone && g_state.convention != Convention::kUnknown && !HiZ::Failed()) {
+				const auto age = g_state.renderFrame + 1 - snapshot->frame;
+				float      move = 0.0f;
+				float      angle = 0.0f;
+				CameraDelta(snapshot->camera, move, angle);
+				const float maxAngle = settings.maxCameraAngle * 3.14159265f / 180.0f;
+				context.cull = Occlusion::Active() && g_state.hooksIn && age <= settings.maxSnapshotAge && move <= settings.maxCameraMove && angle <= maxAngle;
+				context.dilateMove = move + snapshot->mergeMove + 1.0f;  // (older merged frames' cameras lie within mergeMove of this one)
+				if (settings.verdictCache) {
+					const float toRadians = 3.14159265f / 180.0f;
+					UpdateViewEpoch(snapshot->camera, settings.cacheMove * 0.5f, settings.cacheAngle * 0.5f * toRadians);
+					context.cacheEnabled = true;
+					context.viewEpoch = g_epochs.viewEpoch;
+					// Bounds grow by the whole tolerance (and by depth x the turn tolerance in the tests) so a verdict
+					// holds for any camera of its epoch.
+					context.dilateMove = std::max(move, settings.cacheMove) + snapshot->mergeMove + 1.0f;
+					context.angularSlack = std::sin(settings.cacheAngle * toRadians);
+					context.readback = snapshot->readbackIndex;
+					const auto blocks = HiZ::Blocks();
+					context.blockChangedAt = blocks.changedAt;
+					context.blocksW = blocks.width;
+					context.blocksH = blocks.height;
+				}
+				g_footprint.lastValid = CurrentView(snapshot->camera, angle, g_stillness.frames, age, context.view);
+				if (g_footprint.lastValid) {
+					std::copy_n(context.view, 4, g_footprint.lastView);
+					g_footprint.lastAngle = angle;
+				}
+
+				// A point far behind the depth-frame camera. The camera has turned less than 90 degrees
+				// since (maxCameraAngle is clamped below that), so it is behind the current near plane
+				// too: the engine's frustum test rejects any entry carrying this bound.
+				const auto& camera = snapshot->camera;
+				context.reject.center.x = camera.eye[0] - camera.viewDir[0] * 1.0e7f;
+				context.reject.center.y = camera.eye[1] - camera.viewDir[1] * 1.0e7f;
+				context.reject.center.z = camera.eye[2] - camera.viewDir[2] * 1.0e7f;
+				context.reject.fRadius = 1.0f;
+
+				ReadSunState(camera, context.sun);
+				if (settings.verdictCache) {
+					UpdateSunEpoch(static_cast<int>(context.sun.state), g_sun.dir, settings.cacheAngle * 0.5f * 3.14159265f / 180.0f);
+					context.sunEpoch = g_epochs.sunEpoch;
+				}
+
+				// This frame's view for point-light shadow casters: the depth frame's cone, widened by the turn
+				// since (plus half a degree) and by any zoom-out, pushed out by the movement since.
+				const auto root = RE::Main::WorldRootCamera();
+				if (settings.lampShadowCulling && camera.viewSpace && root && camera.frustumX > 0.0f && camera.frustumY > 0.0f) {
+					float fx = 0.0f, fy = 0.0f;
+					FrustumExtents(ReadFrustum(root), fx, fy);
+					const float zoom = std::max({ 1.0f, fx / camera.frustumX, fy / camera.frustumY }) * 1.01f;
+					context.cone = ShadowGeometry::MakeCone(
+						camera.eye, camera.viewDir, camera.viewRight, camera.viewUp, zoom / camera.scaleX, zoom / camera.scaleY, angle + 0.0087f);
+					context.conePush = move + 4.0f;
+					context.coneValid = true;
+				}
+			}
+			Occlusion::BeginFrame(context);
+			g_state.cullingThisFrame = context.cull;
+
+			// Once per location, after ~5 s standing still with CBRO culling: list what is still drawn.
+			Occlusion::FlushKeptDump();
+			constexpr std::uint32_t kDumpAfterStillFrames = 300;
+			if (context.cull && g_footprint.lastValid && g_stillness.frames >= kDumpAfterStillFrames && !g_frames.dumpedHere) {
+				g_frames.dumpedHere = true;
+				Occlusion::RequestKeptDump();
+			}
+
+			if (++g_state.framesSinceLog >= settings.summaryIntervalFrames) {
+				logger::info(
+					"==== CBRO: mode {} | convention {} | {} ====",
+					g_state.wantActive ? "occlusion" : "previs", ConventionName(g_state.convention), HiZ::Describe());
+				Occlusion::LogStats(g_state.framesSinceLog);
+				LogSun();
+				ShadowLights::LogStats(g_state.framesSinceLog);
+				LogTiming();
+				g_state.framesSinceLog = 0;
+			}
+		}
+
+		void OnPrePassEnd()
+		{
+			HiZ::Camera camera{};
+			Raw         raw{};
+			if (!ReadCamera(camera, raw)) {
+				return;
+			}
+
+			// The first frames after a load can have a camera that isn't placed yet: retry for a while.
+			if (g_state.convention == Convention::kUnknown) {
+				constexpr std::uint32_t kMaxAttempts = 300;
+				const auto              attempt = ++g_state.selfCheckAttempts;
+				const auto              result = SelfCheck(camera, raw, attempt == 1 || attempt == kMaxAttempts);
+				if (result != Convention::kNone) {
+					g_state.convention = result;
+				} else if (attempt >= kMaxAttempts) {
+					g_state.convention = Convention::kNone;
+					logger::error("occlusion disabled: no projection convention passed the self-check in {} frames", attempt);
+				}
+				if (g_state.convention != Convention::kUnknown) {
+					ApplyMode(g_state.wantActive, "self-check done");
+					ReadCamera(camera, raw);  // re-bake with the chosen convention
+				} else {
+					return;
+				}
+			}
+			if (g_state.convention == Convention::kNone) {
+				return;
+			}
+
+			// The frame counter always advances, so a snapshot kept from before a previs spell reads as stale.
+			++g_state.renderFrame;
+			if (g_state.diagnostic == 2 || !Occlusion::Active()) {
+				return;  // no GPU work while previs has the job
+			}
+			CheckFootprint(camera);
+			HiZ::Capture(g_state.renderFrame, camera);
+		}
+
+		class Listener final :
+			public Hooks::RenderStages::Listener
+		{
+		public:
+			void OnStageBegin(Stage a_stage) override
+			{
+				switch (a_stage) {
+				case Stage::kCull: {
+					const auto now = Qpc();
+					CloseFrameTiming(now);  // the previous frame's buckets go to its mode
+					g_timing.marks = {};
+					g_timing.marks[0] = now;
+					OnCullBegin();
+					g_timing.setupTicks += Qpc() - now;
+					++g_timing.cullFrames;
+					g_timing.mode = Occlusion::Active() ? 1 : 0;  // (OnCullBegin may have switched it)
+					Hooks::CullGroups::SetRegistrationMode(g_timing.mode == 1);
+					g_gpu.FrameBegin(g_timing.mode);
+					// DrawWorld's cull registers the main view's objects (and waits for its jobs) inside this
+					// stage: only then may the main accumulator's registrations be filtered. On a frame CBRO
+					// doesn't cull (previs mode, stale depth, camera jump) every hook stays a pass-through.
+					Hooks::CullGroups::SetMainCullActive(g_state.cullingThisFrame);
+					break;
+				}
+				case Stage::kPrePass:
+					OnFrameBoundary();
+					g_timing.marks[2] = Qpc();
+					g_gpu.Mark(2);
+					break;
+				case Stage::kSunCascades:
+					g_timing.marks[4] = Qpc();
+					g_gpu.Mark(4);
+					break;
+				case Stage::kForward:
+					g_timing.marks[6] = Qpc();
+					g_gpu.Mark(6);
+					break;
+				default:
+					break;
+				}
+			}
+
+			void OnStageEnd(Stage a_stage) override
+			{
+				switch (a_stage) {
+				case Stage::kCull:
+					Hooks::CullGroups::SetMainCullActive(false);
+					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations);
+					g_timing.marks[1] = Qpc();
+					g_gpu.Mark(1);
+					break;
+				case Stage::kPrePass: {
+					const auto end = Qpc();
+					++g_timing.prepassFrames;
+					OnPrePassEnd();
+					g_timing.captureTicks += Qpc() - end;
+					g_timing.marks[3] = end;  // (the depth capture that follows is CBRO's own, in the pre-pass bucket)
+					g_gpu.Mark(3);
+					break;
+				}
+				case Stage::kSunCascades:
+					g_timing.marks[5] = Qpc();
+					g_gpu.Mark(5);
+					break;
+				case Stage::kForward:
+					g_timing.marks[7] = Qpc();
+					g_gpu.Mark(7);
+					break;
+				default:
+					break;
+				}
+			}
+		};
+		Listener g_listener;
+	}
+
+	void Install()
+	{
+		const auto& settings = Settings::Get();
+		if (!settings.occlusion) {
+			logger::info("occlusion: disabled in CBRO.ini ([Occlusion] bEnabled=0)");
+			return;
+		}
+		if (!REL::Module::get().is_og()) {
+			logger::warn("occlusion: engine offsets are verified for 1.10.163 only; not installing");
+			return;
+		}
+		// Without the culling-group and main-view hooks CBRO can't hide anything without also cutting
+		// shadows: leave previs in charge rather than switch it off for nothing.
+		if (!Hooks::CullGroups::Install()) {
+			logger::error("occlusion: unavailable (culling-group hooks missing); previs stays in charge");
+			return;
+		}
+
+		Occlusion::Install();
+		ShadowLights::Install();
+		Hooks::RenderStages::AddListener(&g_listener);
+		g_state.installed = true;
+		g_state.wantActive = settings.startActive;
+		logger::info(
+			"occlusion: installed ({}); starts in {} mode; {} toggles CBRO <-> previs",
+			settings.observeOnly ? "observe-only" : "culling", settings.startActive ? "CBRO" : "previs (previs untouched until the toggle)",
+			std::format("VK 0x{:X}", settings.toggleHotkey));
+	}
+
+	void OnGameLoaded()
+	{
+		if (!g_state.installed) {
+			return;
+		}
+		HiZ::Reset();
+		ResetAB();
+		ApplyMode(g_state.wantActive, "game loaded");
+	}
+}

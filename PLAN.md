@@ -1,0 +1,754 @@
+claude --resume 573117a0-d862-471d-8fbf-e6ef0afb809e
+
+# Confidence-Based Runtime Occlusion (CBRO): Refined Plan
+
+Status: **v1.24** (built and installed 2026-09-29, **not yet run**: the **verdict cache**: an object's last verdict is reused while the camera stays within a tolerance, its bound is unchanged, the sun is unchanged and no Hi-Z block it read changed; see §7 "v1.23 run and v1.24"). v1.23 run (user): CBRO draws fewer calls than previs at every instance, but the deciding itself costs 20-30 FPS: "the process itself needs to be efficiently fast." **Sub-goals (user): stabilize the erratic per-frame draw count at the light spot, and match or beat previs FPS there, without breaking previs mode or the scene.** Light spot standing still (v1.22): previs 6.50 ms vs CBRO 8.5-8.7 (the cull stage 3.2 vs 0.5 ms), all of CBRO's per-object test time on the main thread.
+Date: 2026-09-29
+
+---
+
+## 0. What was downloaded (`external/`)
+
+| Folder | Source | Why |
+|---|---|---|
+| `CommonLibF4RD` | github.com/Zzyxz/CommonLibF4RD (Aug 2026) | **The library to build against since v1.26** (CMake + vcpkg). Original-CommonLibF4 layout with `REL::ID(OG, NG, AE)` resolved through the runtime database `f4rd-runtime.bin`, so one build runs on OG/NG/AE. Replaced CommonLibF4-DM (Dear-Modding-FO4/commonlibf4, deleted 2026-09-29; its DM-only layouts live in src/Engine/Compat.h). |
+| ~~`CommonLibF4-NG`~~ | github.com/alandtse/CommonLibF4 | Was a second opinion on OG/NG layouts; deleted 2026-09-29 (only build dependencies are kept in `external/`; clone upstream to a scratch location when a layout needs cross-checking). |
+| ~~`CommonLibF4`~~ | github.com/shad0wshayd3-FO4/CommonLibF4 (libxse) | AE-only; deleted 2026-09-29 (never usable for 1.10.163). |
+| ~~`CommonLibF4-original`~~ | github.com/Ryan-rsm-McKenzie/CommonLibF4 | Historical OG reference; deleted 2026-09-29 (CommonLibF4RD carries the same layout). |
+| ~~`f4se`~~ | github.com/ianpatt/f4se | Hook and loader reference; deleted 2026-09-29. |
+| ~~`fo4test`~~ | github.com/jarari/fo4test | Was the key reference (a CommonLibF4 plugin reading the main depth and hooking `DrawWorld` render stages). Deleted 2026-09-29; the facts taken from it are in FO4-ENGINE-NOTES.md with "fo4test" as their source. |
+
+## 1. Local environment findings
+
+- Game: `D:\Games\Fallout 4`, **Fallout4.exe 1.10.163.0 (OG)**, GOG build, F4SE 0.6.23. The game is managed by **MO2 2.5.3** (`D:\Softwares\Mod Organizer`), instance `D:\MO2\Fallout 4`, profile **Fallout London** (204 enabled mods, LocalSettings/LocalSaves on).
+- Graphics chain: **ENBSeries `d3d11.dll` is active** (0.501). The DXVK logs are stale because `EnableProxyLibrary=false`. xSE PluginPreloader and CKPE are also installed.
+- **Address Library 1.10.163 is installed** through the MO2 mod "Address Library for F4SE Plugins".
+- **No build toolchain is installed.** There's no Visual Studio (only the installer stub), no Windows SDK, no xmake and no CMake. You need VS 2022 Build Tools (MSVC v143 + Windows 11 SDK) and xmake ≥ 3.0.
+- GPU: RTX 5090 Laptop. It's fast enough for the GPU side, and the win we're after is on the CPU (draw calls).
+
+### 1.1 Deployment target (MO2)
+- Mod folder: `D:\MO2\Fallout 4\mods\Confidence-Based Runtime Occlusion\`
+  - `F4SE\Plugins\CBRO.dll` (+ `CBRO.pdb` for Addictol Crash Logger symbolization)
+  - `F4SE\Plugins\CBRO.ini`
+  - `F4SE\Plugins\CBRO\Shaders\*.hlsl` (dev only; release builds embed precompiled bytecode)
+  - `meta.ini` (`gameName=Fallout4`, `modid=0`, `version=…`)
+- Enable it in profile `D:\MO2\Fallout 4\profiles\Fallout London\modlist.txt` as `+Confidence-Based Runtime Occlusion`. **MO2 rewrites `modlist.txt` on exit**, so either enable it in the MO2 UI after a Refresh (F5), or edit the file only while MO2 is closed. It's a DLL-only mod, so its priority position doesn't matter.
+- The xmake `install` step copies the build output straight into that mod folder. Launch through MO2's "F4SE" executable so the USVFS virtual `Data\` is mounted.
+- Logs: `%USERPROFILE%\Documents\My Games\Fallout4\F4SE\CBRO.log` (F4SE logs go there even with MO2 local settings).
+
+### 1.2 Active mods that change the design (from `f4se.log`, `Upscaling.log`)
+| Mod | Impact |
+|---|---|
+| **Upscaling Custom v1.7 (= jarari/fo4test)** | DLSS SR at **render 1280×800 → output 2560×1600**, plus **DLSS-G frame generation through a D3D12 proxy swapchain**. Consequences: (a) **do not hook `IDXGISwapChain::Present`**, because the real present is D3D12 and frame generation inserts extra frames; hook engine render stages instead. (b) The depth buffer is at render resolution, a sub-rect of the texture. (c) Its log says `depth logical=1` under ENB. **The main depth index is not a constant 2 in this setup**, so it must be discovered at runtime. (d) It installs entry-gateway detours on `DrawWorld::Imagespace`, `DrawWorld::FrameGenerationForward`, `Renderer::Begin`, `AcquireRenderTarget` and more. We must use different call sites (`write_call` on specific callers) or chain cleanly, and never swap its SRV pointers. (e) It adds Reflex hooks on `Main` OnIdle/Swap. |
+| ENB (+ ENB Helper) | Wraps the D3D11 device and adds its own AO/SSS passes that read depth. Save and restore all state. |
+| Shadow Boost FO4 | **Its own frame-time-driven budget manager**: it changes object/actor/grass/shadow distances dynamically. Our budget manager must not also react to frame time, or the two will oscillate. We key off object counts and screen coverage only. |
+| Precombine And Previs Guardian | **Keep enabled** (see §2A). It protects precombines, which we keep. Previs is switched off by our hook, so it doesn't compete with CBRO. |
+| Full Body First Person / True Third Person / Fake Through Scope | They change what's in depth near the camera and add extra views (the scope render-to-texture). Only the main world camera pass may be culled, and near-camera geometry is exempt. |
+| Dynamic Cubemap F4, Cloud Shadows | Extra render passes, so again only the main camera pass may be culled. |
+| High FPS Physics Fix, Smooth Cell Loading, Faster Loadscreens | They affect the loading-screen loop and cell attach timing, so invalidate on cell attach/detach events rather than on timers. |
+
+## 2. Viability verdict
+
+**Viable, but not as written in the pasted spec.** The spec has five problems that would cause visual bugs or crashes:
+
+### 2.1 The two-thread premise is unverified, and probably wrong for FO4
+FO4 has no dedicated D3D11 render thread comparable to UE's RHI thread. `Main::Update` and the `DrawWorld::*` render stages (the ones fo4test hooks) most likely run on the **same main thread**, one after the other. What actually runs in parallel is **BSJobs worker threads** doing culling and accumulation.
+- Consequence: the dangerous race is not "render thread vs main thread". It's "our data vs job threads that read it during culling".
+- Plan: Phase 0 logs `GetCurrentThreadId()` in every hook and compares it with `RE::Main::GetSingleton()->threadID`. The architecture below works under either answer.
+
+### 2.2 `SetAppCulled` is the wrong culling lever
+- **Shadows:** AppCulled removes the object from *every* pass, including shadow-map, water-reflection and cubemap passes. An object hidden from the camera can still cast a visible shadow, so its shadow would pop in and out. Real engines only occlusion-cull the main view.
+- **Ownership:** the game and scripts use AppCulled too (Disable/Enable, workshop, Pip-Boy, VATS, first-person). A per-frame toggle would overwrite the game's own state.
+- **Precombines:** precombined references have no individual 3D. Their geometry lives in the cell's combined `BSMultiBoundNode`s, so AppCulled on the reference does nothing.
+- **Better lever:** hook `BSCullingProcess` (the vtable exists: `Process(NiAVObject*)` at slot 0x19, `TestBaseVisibility(const NiBound*)` at 0x1F). Reject a tracked root **only when `process->camera == main world camera`**. That's pass-specific, doesn't mutate the scene graph, and is safe from job threads if the decision table is an immutable per-frame snapshot.
+- Keep AppCulled as a fallback lever only. When used, it must be ownership-tracked: record which objects *we* culled and never un-cull one the game culled.
+
+### 2.3 Engine facts confirmed from the sources
+| Fact | Evidence |
+|---|---|
+| Main depth = `RendererData::depthStencilTargets[2]` (`kMain`) in vanilla; `srViewDepth` is the SRV. **Under ENB with Upscaling the "logical" depth is index 1**, so resolve it at runtime: find the DSV bound during the opaque pre-pass (`OMGetRenderTargets` in our pre-pass hook) and match it to an array entry. | fo4test `src/Util.h` enum; `Upscaling.log`: `depth logical=1` |
+| Engine already builds a depth mip chain: `renderTargets[39]` (`kMainDepthMips`) | fo4test `Util.h` and linear-depth override path. Its contents (min, max or linear?) must be verified before reuse. |
+| **FO4 uses standard Z (0 = near, 1 = far), not reverse Z** | fo4test `OverrideLinearDepthCS.hlsl`: `lin = f·n / (f − d·(f−n))` gives n at d=0 and f at d=1. ReShade's FO4 default is also `IS_REVERSED=0`. So Hi-Z stores the **MAX** (farthest) depth per texel, and an object is occluded when `nearest_object_depth > hiZ_max`. |
+| Camera matrices: `BSGraphics::State::cameraState.camViewData.{viewProjMat, viewProjUnjittered}` | `CommonLibF4-DM/include/RE/B/BSGraphics.h` (State singleton `VariantID{600795, 2704621}`) |
+| Use the **unjittered** view-proj for tests, because TAA jitter is sub-pixel noise we don't want in the tests | same |
+| Camera near/far globals: `REL::ID{57985, 2712882}` and `{958877, 2712883}` | fo4test `Upscaling.cpp:7111` |
+| Render-stage hook points with OG/AE offsets: `DrawWorld::Render_PreUI` `{984743, 2318321}` (+0x17F OG deferred pre-pass, +0x1C9 OG forward), `DrawWorld::Imagespace` `{587723, 2318322}` | fo4test `Upscaling::InstallHooks` |
+| Loaded refs: `TES::GetSingleton()->gridCells / interiorCell`, `TESObjectCELL::references`, `ForEachReferenceInRange` | `CommonLibF4-DM/include/RE/T/TES.h`, `TESObjectCELL.h` |
+| Bounds: `NiAVObject::worldBound` (sphere, offset 0xB0) | `NiAVObject.h` |
+| Dynamic resolution: depth is rendered at a sub-rect of the texture | fo4test handles `RenderSize` vs `ScreenSize`; we must too |
+
+### 2.4 The first-person layer and ENB need care
+- Where the depth is sampled matters. Capture it **after the opaque deferred pre-pass and before first-person/alpha/imagespace**. Otherwise the weapon and Pip-Boy would "occlude" the whole world, and lowering them would cause mass pop-in. The exact call site needs RE in Phase 0.
+- ENB wraps the device. Always use `RendererData->device/context`, never create a device, and save/restore every CS binding we touch (fo4test does the same).
+
+### 2.5 Latency is the real product risk
+A 2–3 frame readback means disocclusion pop-in when turning or when a door opens. The "confidence" mechanism is the mitigation, and it needs to be designed in, not bolted on:
+- **Asymmetric hysteresis:** cull only after K consecutive "occluded" verdicts (K≈4–8). Un-cull on the **first** "visible" verdict or any invalidation.
+- **Test with the view-proj the depth was rendered with,** stored alongside the readback. Never test old depth with the new camera.
+- **Invalidation triggers:** camera angular velocity above a threshold, translation above a threshold, cell attach/detach, loading screen, teleport, the object's own movement, and the menu/Pip-Boy/VATS/photo-mode state.
+- **Conservative dilation:** inflate bounds by camera motion over the latency window. Always-visible exemptions: player, actors within X m, anything intersecting the near plane, and big occluders themselves.
+
+## 2A. Scope: replace previs, keep precombines (decided 2026-09-28)
+
+Goal: CBRO becomes the **only** visibility system for loaded cells.
+
+### Data (measured from the archive name tables)
+| Archive | Precombined NIFs | Previs `.uvd` |
+|---|---|---|
+| `LondonWorldSpace - MeshesExtra.ba2` (Fallout London) | **135,620** | **888** |
+| `Fallout4 - MeshesExtra.ba2` (vanilla) | 124,871 | 966 |
+
+Fallout London is fully precombined and previs'd, at the same scale as vanilla. Its world is built on precombines.
+
+### Replacing precombines as well: not viable as a culling plugin
+- **Precombines are draw-call batching, not visibility.** Each precombined NIF merges many references into one draw per material. Turning them off (`[General] bUseCombinedObjects=0`, which does exist in the exe) multiplies draw calls, scene-graph nodes and cull-traversal cost for **everything visible**. Occlusion culling only removes what's hidden, so the visible set stays unbatched.
+- **Shadows get worse too.** Shadow cascades (`fDirShadowDistance=14000`) render every caster in the light frustum. Camera occlusion does nothing there, so shadow draw calls would also multiply.
+- Replacing precombines would need **runtime batching**: generating combined geometry at cell attach, or a GPU-driven renderer that writes FO4's G-buffer. That's a renderer rewrite, not this project.
+- Quick experiment you can run today: set `bUseCombinedObjects=0` in the profile's `Fallout4Custom.ini` and look at a dense London street. That's roughly the load a precombine-free CBRO would face before any culling.
+
+### Replacing previs only: viable (the chosen scope)
+- **Switching previs off:** *(corrected 2026-09-28, see §7 run 3)* the engine has a native switch. The INI setting is **`[Display] bUsePreCulledObjects`**; the console command is **`tpc`** (TogglePreCulling); and the engine's own `SetEnabled` / `SetSuspended` functions are ids 1090712 / 1263609. No hook is needed. The original leads below are kept for reference:
+  - `BSPrecomputedVisibility::BSVisDB` (the `.uvd` loader) and `MultiCellVisibilityData`
+  - `BGSObjectVisibilityManager`
+  - `BSPreCulledObjects::ObjectRecord{obj, flags}` (likely the pre-cull list that previs fills)
+  - `ExtraCellPrevisRefs` (`kCellPrevisRefs`)
+  - `TES::UpdateMultiBoundVisibility` `{1281872, 2192134}`
+
+  Target behaviour: the engine takes its **"no previs for this cell" path**. Every mod that breaks previs already exercises that path, so it's stable. Add a **runtime hotkey** that toggles between previs and CBRO for A/B measurement.
+- **Precombines stay on** (`bUseCombinedObjects=1`). CBRO culls at the granularity of each `BSCombinedTriShape` under `LOADED_CELL_DATA::combinedObjects` (offset 0x1E0) plus individual non-precombined references.
+- **Authored occluders:** `bEnableBoundingVolumeOcclusion=0` switches off occlusion planes and boxes through an INI setting. Interior room bounds and portals (`BSMultiBoundRoom`, `BSPortalGraph`) are exact authored geometry and cheap. Keep them at first, and add an option to disable them later if you want strict "one system".
+- **Precombine And Previs Guardian: keep it enabled.** Under this scope it protects the part we're keeping, by stopping the engine from dropping a cell's precombines when a mod edits a precombined reference. It doesn't compete with CBRO, because previs is switched off by our hook anyway.
+
+### Where CBRO should beat previs
+- **View direction:** previs is position-only and conservative across its whole cell cluster. Hi-Z tests the actual view.
+- **Dynamic occluders:** workshop walls, actors and moved objects. Previs can't use anything that isn't baked.
+- **Content previs doesn't cover:** mods that edit cells after previs was generated.
+
+### Where CBRO can lose, measured in Phase 0 before committing
+- **Latency:** previs has zero frame lag. Hi-Z has 2–3 frames, which risks pop-in when turning street corners in dense London. Confidence hysteresis and the invalidation triggers are the mitigation.
+- **Bound size:** precombined shapes can have large bounds (up to a cell), so each one is rarely fully occluded. If this dominates, a later phase can use the per-object bounds in `BSPackedCombinedSharedGeomDataExtra` to split or re-bound the combined shapes.
+- **Traversal cost:** previs pre-culls before scene traversal. CBRO must reject at the top combined-node level so traversal stays cheap.
+- **Pass/fail gate:** in the same London test routes, with previs off and CBRO on, draw calls and base frame time must be ≤ previs-on, with no visible pop-in at normal turn speeds. If that fails, a fallback is to use previs as the prior for the confidence state machine (one system making decisions, with previs data as one input).
+
+## 3. Recommended architecture change: test on CPU against a read-back Hi-Z
+
+The spec does per-object GPU tests: upload AABBs, run the occlusion CS, read back 1/0 results. This plan instead **reads back a small Hi-Z mip (for example 128×64 R32F = 32 KB) and tests on the CPU** in the main-thread tick:
+- **Removes the index-stability problem.** Objects stream in and out, and GPU results are indexed by frame N-2's ordering. With CPU tests there's nothing to remap.
+- **New objects can be tested immediately** against the latest available depth, instead of waiting 3 frames for their first verdict.
+- **No AABB upload** and one fewer dispatch. The GPU side becomes only Hi-Z build, copy the low mip to staging, then map.
+- **Cost:** a few thousand sphere→rect tests over a 128×64 max-pyramid take well under 0.2 ms.
+- The GPU occlusion CS stays available as an optional mode for very large object counts. The HLSL is written either way.
+
+## 4. Refined phases
+
+### Phase 0: Toolchain, scaffolding and RE verification (no occlusion yet)
+1. Install VS 2022 Build Tools (C++ workload + Win11 SDK) and xmake. Address Library is already installed through MO2.
+2. Scaffold an xmake plugin against `CommonLibF4-DM` with `COMMONLIB_RUNTIMECOUNT=3` (OG/NG/AE), spdlog logging to `My Games\Fallout4\F4SE\CBRO.log`, and an `xmake install` target into the MO2 mod folder (§1.1).
+3. **Probe plugin** (logging only):
+   - thread IDs in a `Main` tick hook, the `DrawWorld::Render_PreUI` pre-pass hook and a `BSCullingProcess::Process` vtable hook
+   - descriptors (size/format/bind flags) of `depthStencilTargets[0..12]` and `renderTargets[39]`
+   - which `BSCullingProcess` instances and cameras run per frame (main vs shadow vs reflection)
+   - the call order of first-person rendering relative to the pre-pass
+   - the actual DSV bound during the opaque pre-pass, and its size compared with the render size (1280×800) under Upscaling
+   - hook coexistence: confirm our hooks and Upscaling's entry gateways both fire. Test with Upscaling on and off, and with ENB on and off.
+4. Find the main-thread tick. Candidates: `Main::Update` (needs an ID, not in the DM `IDs.h`; RE it via the Address Library DB / F4SE `Hooks_Threads.cpp` `ProcessEventQueue` hook site), or reuse the pre-pass hook if Phase 0 proves it runs on the main thread.
+   - **Gate:** do not continue until the thread model, the depth index at this runtime and the main-camera culling pass are confirmed in the log.
+
+### Phase 1: Data model
+- `TrackedObject { NiAVObject* root (NiPointer); TESObjectREFR handle; NiBound lastBound; State {Unknown, Visible, Occluded, BudgetExcluded, Exempt}; u16 occludedStreak; u32 lastInvalidationFrame; bool weCulled; }` in a flat vector plus a handle→index map. It's owned and mutated by the main thread only.
+- GPU→CPU: `ReadbackSlot[3] { staging tex; frameId; viewProjUnjittered; rect; status }`. Single producer, single consumer, with an atomic "latest ready" index. It needs no mutex because producer and consumer run at different frame phases (or threads).
+- CPU→culler: a `DecisionSnapshot` (sorted `NiAVObject*` array or open-addressing set) published by an atomic pointer swap each frame and read lock-free by job threads. Old snapshots are retired after 2 frames (epoch reclaim).
+
+### Phase 2: Main-thread logic (per tick)
+1. Early-outs: loading screen (`LoadingMenu` open or `MenuOpenCloseEvent`), `Main::QGameSystemsShouldUpdate()==false`, menu mode, Pip-Boy, VATS, photo mode, player in a workshop-build menu. On early-out → publish an empty snapshot (cull nothing) and reset states to Unknown.
+2. Gather candidates from attached cells within `fMaxDistance` (non-precombined refs with 3D, plus optionally cell precombine `BSMultiBoundNode` chunks). Diff against the tracked set.
+3. Invalidations → Unknown (the triggers from §2.5).
+4. If a new readback exists, run tests with *its* view-proj → update the streaks and states with asymmetric hysteresis.
+5. Budget manager: rank by (screen size × distance) and cap how many objects may be culled per frame (smooth ramp). Mark the rest BudgetExcluded, which counts as visible.
+6. Publish the snapshot.
+
+### Phase 3: Render-side GPU work (hook just after the opaque pre-pass)
+1. Validate the device and targets (null checks, size-change detection → recreate resources; `GetDeviceRemovedReason` → disable the plugin for the session).
+2. Save CS state → Hi-Z CS pass (dispatch chain, or single-pass downsample) from `kMain.srViewDepth` into our own R32F mip chain, respecting the dynamic-resolution rect → `CopySubresourceRegion(low mip → staging[N%3])` → restore CS state.
+3. Poll `staging[(N-2)%3]` with `Map(READ, DO_NOT_WAIT)`. On `DXGI_ERROR_WAS_STILL_DRAWING`, skip the frame (no stall). The spec says not to use DO_NOT_WAIT, but it's the only stall-proof choice under ENB/driver queue depths above 2.
+4. Loading screens: FO4 renders the loading menu through a different path. Pause on `LoadingMenu` and invalidate all slots.
+
+### Phase 4: HLSL (cs_5_0)
+- `HiZDownsampleCS`: standard Z, so **MAX** reduction. Handle odd dimensions by sampling the extra row/column. Clamp to the dynamic-resolution rect. The first pass reads the D24S8/D32 SRV as `Texture2D<float>`.
+- `OcclusionTestCS` (optional mode): sphere → 8 AABB corners × ViewProj (from the readback's frame), conservative screen rect, `mip = ceil(log2(max(w,h)))`, 2×2 gather, occluded if `minZ_object > maxZ_hiz`. Corners behind the near plane → visible.
+
+### Phase 5: Culling lever
+- Primary: `BSCullingProcess::Process(NiAVObject*)` vtable hook. It skips the subtree only when the camera is the main world camera **and** the object is in the snapshot. The mechanism is to be validated in Phase 0 (it could be the base-class vtable or a derived one).
+- Fallback: ownership-tracked AppCulled, and only for non-shadow-casting objects.
+
+### Phase 6: Validation and safety
+- Debug overlay (F4SE Menu Framework / ImGui): tracked/culled counts, readback age, per-object tint mode.
+- Metrics: draw-call count before/after (via the ENB/ReShade stats or our own `DrawIndexed` counter).
+- Kill switch in INI; auto-disable after N consecutive D3D errors.
+- Test matrix: Fallout London profile with ENB + Upscaling (DLSS-G on and off), ENB off, Upscaling off, a no-previs London area, a large settlement (the biggest expected win), interiors, fast travel, VATS, Pip-Boy, photo mode (FO4 Photo Mode / Screen Archer Menu), scope view (Fake Through Scope).
+- With frame generation on, measure the **base** (rendered) frame time, not the presented FPS.
+
+## 5. Where this will and won't help
+- **Big wins:** mod-heavy areas with broken previs/precombines, large settlements (workshop objects are never precombined), actor-dense areas.
+- **Little or no win:** vanilla exteriors with intact previs. The engine already does precomputed visibility plus multibound/occlusion-plane culling there.
+- It reduces draw-call submission (FO4's CPU bottleneck), not GPU shading work.
+
+## 6. Open RE items
+1. `Main::Update` (or equivalent main tick) VariantID for OG/NG/AE. It isn't in the DM `IDs.h`.
+2. The exact call site in `DrawWorld::Render_PreUI` after opaque geometry and before first-person geometry.
+3. Which `BSCullingProcess` (or derived) instance performs the main-camera cull, and whether it runs on job threads.
+4. What `renderTargets[39]` (`kMainDepthMips`) contains: format, mip count, linear or raw, min or max. If it's usable, we can skip building our own Hi-Z.
+5. How to enumerate precombined chunks per cell: `LOADED_CELL_DATA::combinedObjects` (0x1E0) → `BSCombinedTriShape` children. Check their bound sizes on London cells.
+6. **The previs kill switch.** Find where `.uvd` data (`BSPrecomputedVisibility::BSVisDB`) is applied during culling (`BSPreCulledObjects` / `BGSObjectVisibilityManager`), and force the no-previs path, toggleable at runtime.
+7. Draw-call counter in the probe plugin (`ID3D11DeviceContext::Draw*` vtable, counted only on the render thread during `DrawWorld`) for the pass/fail gate in §2A.
+
+## 7. Implementation status
+
+### Phase 0 probe (built 2026-09-28)
+- Toolchain: VS 2026 Community (MSVC 14.51), Windows SDK 10.0.26100 at `D:\Windows Kits\10`, xmake 3.1.1. `xmake build CBRO` builds `releasedbg` and installs into `D:\MO2\Fallout 4\mods\Confidence-Based Runtime Occlusion\` (option `mo2_mod_dir`). The install overwrites `CBRO.ini` in that folder.
+- Source: `src/Plugin.cpp` (F4SE entry; exports `F4SEPlugin_Query` for OG F4SE 0.6.x, and creates its own trampoline because OG F4SE has no trampoline interface), `src/Settings.*` (`CBRO.ini`), `src/Util/*`, `src/Probe/*`.
+- The probe only logs. It installs, OG only:
+  - call-site wrappers on `Render_PreUI` +0x17F (pre-pass, also the frame boundary), +0x1BA (HBAO), +0x1C9 (forward), and `ForwardAlphaImpl` +0x1DC (post-resolve-depth) and +0x253 (first-person alpha). These chain with Upscaling's hooks at the same sites.
+  - vtable wrappers on slots 0x19/0x1A of `NiCullingProcess`, `BSCullingProcess`, `BSGeometryListCullingProcess` and `BSParabolicCullingProcess`, with per-camera object counts, thread split and process identity.
+  - `ID3D11DeviceContext` draw and `OMSetRenderTargets*` vtable wrappers: draws per stage, and the depth-stencil views bound per stage, matched to `RendererData::depthStencilTargets`.
+  - a render-target dump (depth targets, logical→platform mapping, `renderTargets[39]`), and a scene survey (per cell: refs, refs with 3D, precombined chunk types and radii, previs fields `visibilityData` / `rootVisibilityCellID`).
+- Verified offline against the GOG `Fallout4.exe` plus Address Library 1.10.163:
+  - all five call sites are `E8 call rel32`, so the Address Library matches this exe;
+  - every vtable ID resolves to the class MSVC RTTI names;
+  - culling-process slot 0x18 is the deleting destructor, 0x19 = `Process(NiAVObject*)` (it reads `arg+0xBC` worldBound radius and `arg+0x108` flags), and 0x1A = `Process(const NiCamera*, NiAVObject*, NiVisibleArray*)`;
+  - `BSCullingProcess` 0x1F reads `bCustomCullPlanes` (0x11F) and planes (0x3C/0xAC), which matches the header;
+  - NiObject slot 2 `GetRTTI` = `lea rax,[rip+x]; ret`, and slots 3/4 `IsNode`. The probe decodes RTTI from the bytes rather than calling it.
+  - `__MainCullingCamera` is `(anonymous)::MainCullingCamera`, a short interface vtable and a lead for the main-camera cull (§6 item 3).
+
+### How to run the probe
+1. In MO2: Refresh (F5), enable "Confidence-Based Runtime Occlusion" in the Fallout London profile, and launch F4SE through MO2.
+2. Load a save and play for about a minute: walk, turn, and enter and leave an interior.
+3. F3 captures a 3-frame ordered trace. F12 captures a render-target dump and a scene survey (both also run automatically 300 frames after each load).
+4. Collect `Documents\My Games\Fallout4\F4SE\CBRO.log`. Repeat with Upscaling off, and with ENB off (§4 Phase 0 test matrix).
+
+The Phase 0 gate (§4) is answered from that log:
+- thread model: the `prepassOnMainThread` line and the cull-camera thread split;
+- main depth target: the `dsv … [depth[i]…]` lines under the prepass stage;
+- main-camera cull pass: the camera marked `[WORLD ROOT CAMERA]` and its culling-process class.
+
+### Phase 0 results, run 1 (2026-09-28; Fallout London exterior, 5x5 grid; ENB + Upscaling DLSS 1280x800 → 2560x1600; no crash)
+| Gate item | Result |
+|---|---|
+| Thread model | **Answered.** The pre-pass, forward, depth-resolve and first-person-alpha stages all run on the **main thread** (tid == `Main::threadID`). There are 0 draws on other threads or deferred contexts, so render stages and `Main` never race. Whether culling uses job threads is still open. |
+| Main depth target | **Answered.** `depthStencilTargets[2]` (= logical 1, matching Upscaling's "depth logical=1"): 1280x800 `R24G8_TYPELESS`, DSV `D24_UNORM_S8_UINT`, SRV `R24_UNORM_X8_TYPELESS`. About 99% of pre-pass draws use `depth[2].dsView[0]`. **Caveat:** later in the frame Upscaling temporarily swaps `depth[2]`'s views for a 2560x1600 texture, so the SRV must be captured inside our pre-pass hook and not read from `RendererData` later. |
+| First-person in depth | **The first-person weapon is in the main depth buffer.** The pre-pass viewport switches between depth range `[0, 0.01]` (first person) and `[0.01, 1]` (world). The Hi-Z build must treat `d < 0.01` as "no occluder" (far), and world tests must use the `[0.01, 1]` remap. Run 2 counts first-person-range draws to confirm. |
+| Main-camera cull pass | **Not found.** There were 0 calls on `Process(obj)` / `Process(cam)` in all four hooked classes, and the exe has no direct calls to those bodies. The static trace gives a lead: DrawWorld init (id 1570173) builds two `BSGeometryListCullingProcess` objects plus an `NiCamera`, and every frame id 502840 (called from Main's render function id 408683 just before `Render_PreUI`) calls `SetFrustum` on both. Run 2 hooks slots 0x19–0x1F on all five `NiCullingProcess` classes (including `BSFadeNodeCuller`) and samples caller return addresses. |
+
+Other findings:
+- **Draw baseline:** 900–2,900 immediate draws per frame. The pre-pass accounts for 330–1,030. The shadow cascades (`depth[8]`, a 2560² 3-slice array, drawn outside the wrapped stages) account for 500–1,900, which is **~55–65% of all draws**. Main-pass occlusion can therefore only remove about a third of the draw calls. We need to check whether previs also removes shadow casters: if it does, switching previs off could *raise* shadow draws, so the §2A pass/fail gate must count shadow draws too.
+- **Precombine granularity** (25 cells, all with previs data): 5,738 precombined chunks, each a `BSFadeNode` with one shape (`BSTriShape`, `BSMergeInstancedTriShape` or `BSMeshLODTriShape`). Chunk bound radius: mean 452 units (≈6.5 m), max 2,145, and 97% under 2,048. That is object-sized, not cell-sized, so the §2A "bound size" risk is small. There are also 1,020 non-precombined refs with 3D (mean radius 229), for about 6.8k test candidates in total.
+- `renderTargets[39]` (`kMainDepthMips`) is 1280x800 `R32_FLOAT` with **11 mips** (SRV|RTV|UAV). Its contents (raw or linear, min or max) are not verified yet.
+- Dynamic resolution is off (ratio 1.0). `bUseCombinedObjects=1`, `bEnableBoundingVolumeOcclusion:General=1`, `fDirShadowDistance=14000`. HBAO is off (that stage is never called).
+- Coexistence: Upscaling wraps all five of our call sites, and the ENB context vtable was already hooked by FakeThroughScope (`DrawIndexed`) and FO4CloudShadows (`Draw*`). All chains work.
+
+### Phase 0 results, run 2 + static RE (2026-09-28)
+- **`Process()` virtuals are not the main cull.** Traffic on the culling-process vtables is:
+  - `BSParabolicCullingProcess`: about 8k objects per frame, on unnamed cameras, from the shadow/omni light code (caller id 656208);
+  - `BSFadeNodeCuller`: 11 calls per frame on the WorldRoot camera. It only tests one fade node's sphere against six planes and flips flag bit 39; it is not the scene cull;
+  - `BSCullingProcess`: about 80 calls per interval (special cases).
+- **The main-camera cull pipeline** (all IDs are OG Address Library IDs):
+  1. `DrawWorld::Render_PreUI` (984743) +0x16A calls the **DrawWorld cull** (718911), just before the pre-pass at +0x17F.
+  2. DrawWorld cull resets its two `BSGeometryListCullingProcess` objects (globals 865470 / 1084947), initializes its culling groups with the DrawWorld camera (global 81406), and calls the **scene walk** (1138818) on the scene root (global 1327069).
+  3. The scene walk descends the top levels of the graph and calls **`Group::Add(group, obj, &obj->worldBound, flags)`** (1175493) on DrawWorld's groups (1117782, 133326, 1328670, plus an array at 459440).
+  4. A **culling group** is a non-polymorphic 0x170-byte struct with no RTTI (so the class scan missed it). It holds six frustum planes at +0x00, a node block list (+0x98 / current +0xD0), a geometry block list (+0x118 / current +0x150), and an owner at +0x158.
+  5. `Group::Add` sends nodes and geometry to **`Block::Add(block, obj, bound, -1)`** (1143206). A block is 0x3A70 bytes: planes copied in, SoA bound packets of four at +0x60, objects at +0x2060, per-entry flag bytes at +0x3061, count at +0x3A68 (max 0x200), and the group's +0x158 copied to +0x3A60.
+  6. **`Group::Process`** (626862) submits the blocks as **BSJobs**. Job workers push visible children back in through 357475 → `Block::Add`.
+- **Lever candidate for Phase 5:** detour `Block::Add`. When the block's owner (+0x3A60) is the main camera's group and the object is in our occluded snapshot, don't add it. The object's whole subtree then skips main-camera testing and drawing, shadow and other passes use their own groups and are untouched, and nothing in the scene graph is mutated. It must be lock-free because it runs on job workers. Run 3 measures this path (group probe).
+- First-person draws in the first-person depth range: 6–8 per frame outside the wrapped stages, and 0–1 inside the pre-pass. The Hi-Z rule of treating `d < 0.01` as far still applies.
+- Tools: `dumpbin /disasm:nobytes /range:<va>,<va> Fallout4.exe` gives a disassembler, and `tools/re/rip_refs.ps1` finds RIP-relative data references.
+
+### Phase 0 results, run 3: gate passed (2026-09-28)
+| Gate item | Answer |
+|---|---|
+| Thread model | Render stages **and** culling run on the main thread. `Block::Add` was on the main thread for 99.99% of calls, with ≤62 per interval on other threads, so group jobs effectively run where they are submitted. The CBRO hot path must still be lock-free, because BSJobs *can* run elsewhere. |
+| Main depth | `depthStencilTargets[2]`, captured inside our pre-pass hook (Upscaling swaps it later in the frame). First-person geometry is at `d < 0.01`. |
+| Main-camera cull pass | DrawWorld groups 0/1/2 (ids 1117782 / 133326 / 1328670) share one owner, `group+0x158` (a heap object with no RTTI), which is copied into every block at `+0x3A60`. Main-pass `Block::Add` traffic: about 300–400 entries per frame (top-level adds, plus recursive adds from 357475). Group feeds: group 0 gets 1 `BSFadeNode` per frame (0x28544D7, likely the player / first person); group 1 gets the cell multibound roots from the vanilla scene walk (1138818); group 2 gets the **previs visible list** (`BSPreCulledObjects`, id 997287). Another group, stack-allocated with a null owner, gets about 1,000 adds per frame from the same previs code earlier in the frame. It is probably a shadow pass and is out of scope. |
+| Lever | Detour `Block::Add` (1143206). If `*(block+0x3A60) == *(DrawWorld group0 + 0x158)` and the object is in the published occluded snapshot, skip the add; this also skips the object's subtree. Its prologue is `48 89 5C 24 08`, which relocates cleanly. |
+| Previs switch | `[Display] bUsePreCulledObjects` (setting value id 1472203). The state bytes are enabled (493183) and suspended (718924). `IsActive()` (917969) = enabled && INI && !suspended, and is queried in 35 places. The console command is **`tpc`**. The setters `SetEnabled` (1090712) and `SetSuspended(bool, flush)` (1263609) flush through 61939. The game suspends previs itself in some modes (callers 0xE9E742, 1390075). |
+
+**Coexistence:** **Addictol 1.7's "BSPreCulledObjects" module** replaces the vanilla previs feed (it calls `Group::Add` from Addictol.dll+0xEC9F4 / +0xECA75 / +0xECE0F / +0xECE86). CBRO must not hook 997287; the `Block::Add` lever is downstream of it and does not care who feeds the group. Retest this whenever Addictol updates.
+
+**Next measurement (the §2A decision):** stand still on a dense London street and toggle `tpc`. Compare pre-pass draws, shadow (`none`) draws and main-pass `Block::Add` counts with previs on and off. This is the load CBRO must beat, and it answers whether previs also trims shadow casters.
+
+### Previs A/B (run 4, low-density exterior, `tpc`)
+| Per frame | previs ON | previs OFF |
+|---|---|---|
+| Main-pass `Block::Add` entries | 300–1,000 | 9,000–11,700 (group 0 gets ~7,100 top-level adds from the full scene walk) |
+| Pre-pass draws (avg) | ~470–1,330 | ~6,100–6,900 (steady) |
+| Shadow (`none`) draws | ~630–1,690 | ~460–1,420, no increase |
+
+**Previs trims only the main camera.** The previs-off cost lands entirely where the `Block::Add` lever sits. CBRO target here: cut the main pass from ~6.5k draws back to ~1k (~85% occlusion).
+
+### CBRO v1: Phases 1–5 implemented (2026-09-28, untested in game)
+- `src/Hooks/RenderStages`: the shared render-stage wrappers, now including the **cull stage** (`Render_PreUI`+0x16A → DrawWorld cull 718911).
+- `src/Hooks/CullGroups`: the shared `Group::Add` / `Block::Add` detours. There is one filter, which is consulted only for main-pass fresh adds with no pending group markers. A skipped add returns -1 ("done").
+- `src/Core/HiZ`: after the pre-pass (depth target found from the bound DSV), one compute dispatch builds a max-depth texel map at 1/4 resolution. First-person depth below 0.01 counts as far. The map is copied into a 3-slot staging ring and mapped with `DO_NOT_WAIT`, then the CPU mip chain is built. D3D state is saved and restored, and the DSV is unbound during the dispatch.
+- `src/Core/Occlusion`: the `Block::Add` filter.
+  - Per-object history is lock-free (clock + streak + classification).
+  - A type allow-list keeps only static scenery nodes and meshes; anything under an Actor is exempt.
+  - The test projects the eight corners of the bound's box with the **depth frame's** unjittered view-proj. Any corner nearer than 48 units counts as visible; an object not fully inside the old view counts as visible (so rotation can't uncover anything); bounds grow by the camera translation since the depth frame. Buffer depth = 0.01 + 0.99·z; the object is hidden when that is farther than the Hi-Z max.
+  - An object is dropped after **4** consecutive hidden verdicts and restored on the first visible one.
+- `src/Core/Runtime`: at cull begin it polls the readback and blocks culling if the depth is more than 6 frames old or the camera moved more than 256 units or turned more than 20°; it then publishes the frame context. At pre-pass end it captures the camera and queues the next build.
+  - A **projection self-check** (a point ahead of the camera must land at screen centre, with right/up signs correct) picks among 4 conventions. It retries for 300 frames, then disables culling.
+  - The **mode switch** calls the engine's `SetEnabled` (via the F4SE task queue). It turns previs off only when CBRO can really take over, restores it otherwise, and **F8** toggles CBRO ↔ previs.
+- `CBRO.ini [Occlusion]` holds all the tunables plus `bObserveOnly`.
+
+### CBRO v1 run (dense area) and v1.1 fixes (2026-09-28)
+Run findings:
+- Per frame, about 12k entries were tested, but **~10k counted as "offscreen" and only 3–7 were rejected**. The pre-pass stayed at 5–7k draws, the same as previs off. The FPS gains came from a few huge cell-level nodes being rejected.
+- Root causes:
+  1. Top-level entries are mostly cell or multibound roots that straddle the screen edge, so the strict fully-on-screen rule never lets them go.
+  2. Child entries were skipped because the engine's child-add path leaves group markers pending, and v1 only filtered marker-free adds.
+- **Lights broke:** rejecting a node drops the lights under it. The finish loop only appends visible entries (culler vfunc `+0x168`), so those lights stop contributing.
+
+v1.1 changes:
+- **Bound replacement instead of skipping.** The entry is still added, but with a bound 1e7 units behind the depth-frame camera, so the block's own SIMD frustum test rejects it. The finish loop at 0x1CCEBF0 reads result byte `+0x3060|i*5` OR force-visible byte `+0x3061` and never appends it. The markers and bookkeeping stay intact, so **every** main-pass entry, children included, is now judged. Continuation adds (multi-instance) still pass through. `BSMultiStreamInstanceTriShape` is no longer cullable, because its instance entries use their own bounds.
+- **The camera turn gate** is ≤60° (clamped < 90) so the rejection point stays behind the current near plane. Turning alone never reveals anything, because of the fully-on-screen rule.
+- **Exact sphere projection** (tangent-line extents in view space) replaces the 8-corner box. The view-space form (origin, basis, scale, depth curve) is derived from viewProj each capture and verified on an off-axis point; the box fallback is used if the check fails.
+- **Linear depth compare.** Hidden if nearest > occluder × (1 + 0.002) + 4 units. The old fixed buffer-depth bias was worth >1000 units at 20k range.
+- **Light-subtree exemption.** A node whose subtree (≤512 descendants scanned) contains any `*Light*` object is never rejected; its meshes are still tested one by one. Classification is redone every 600 frames, staggered per object.
+- `iConfirmFrames` 4 → 2.
+- **On-screen HUD messages** when the mode changes, and **F7** shows the status ("hiding N of M objects per frame").
+
+### v1.1 run (dense pier, night) and v1.2 (2026-09-28)
+Findings:
+- **Wrong camera.** `BSGraphics::State::cameraState` after the pre-pass is often another pass's camera (a 37° FOV / near-15 camera and other unverifiable ones appeared), because render-to-texture passes (Fake Through Scope, Dynamic Cubemaps) overwrite it. Objects were projected through the wrong camera: ~7k per frame counted "offscreen", ~0–7 visible, ~6 rejected.
+- **Lighting still broken** with only ~6 rejects per frame and light subtrees exempt, so the rejects aren't the cause. Working theory: **with previs off every light in the 25 loaded cells is live, overrunning the renderer's light budget**, so lights near the camera get dropped. Previs used to pre-cull the hidden lights. This also explains v1 and why the daytime `tpc` test looked fine. Side finding: previs keeps two callback registries (`0x1438C78F8` keyed by ref formID, `0x1438C7928`) whose callbacks the flush (61939) calls with `true`.
+- The user's overlay showed CBRO at 32.9 FPS / 13,739 vs previs at 21.1 FPS / 19,645 at the same spot.
+
+v1.2:
+- The camera comes from `cameraDataCache`: the entry whose `referenceCamera` is the WorldRoot camera, preferring the unjittered one (same as the Upscaling mod). The capture is skipped if there is no such entry.
+- **Point/spot light occlusion.** A light is rejected when its whole reach is hidden. Reach = world position with max(worldBound r, NiLight::modelBound r × world scale); lights under 16 units are never culled. The first 12 lights' radii are logged. Directional/ambient lights and lights under Actors are never touched; nodes carrying lights are still never cut as a whole.
+- **F6 diagnostic cycle**: normal → decide-only → decide-only + no depth capture. **F7** reports objects and lights hidden.
+
+### v1.2 run and v1.3 (2026-09-28)
+v1.2 run:
+- **The camera fix worked.** At the start location CBRO hid ~2,340 entries per frame, and main-pass draws went from ~7k (previs off, no culling) to ~3.3k at ~112 FPS. **Lighting is correct now**, so the earlier breakage came from the wrong camera's wrong rejections, not the light budget.
+- **With previs off, lights never pass through the main-camera cull blocks.** Light samples appeared only during the frames when previs was still on, so there is nothing to cull there. NiPointLight worldBound r = 42–4,793; modelBound is either −1 or equal to worldBound.
+- **Dense pier at night:** previs mode = ~3.5k main + **~13.6k shadow-map draws** at 23 FPS. CBRO = ~2k main + ~7.7–10k shadow at 32–35 FPS. **Shadow maps are ~80% of the draws there.**
+- The F6/F7 hotkeys clashed with another plugin that blocks movement. They now default to unbound (see memory `feedback-hotkeys`).
+
+v1.3, **point-light shadow maps**:
+- `BSShadowParabolicLight` (vtable slot 9, id 656208) culls its casters through `BSParabolicCullingProcess::Process(camera, scene, set)` (OG vtable id 845854, slot 0x1A). That function sets the camera and frustum, restarts the accumulator (vfunc +0x140), then calls `scene->Cull`. Per-object `Process` checks `cullMode` (+0x158) first, and **kAllFail (2)** returns without appending.
+- CBRO tests the light's reach sphere: shadow camera `world.translate` + `viewFrustum.far` (NiCamera +0x174). If it is hidden for `confirmFrames` frames (streak keyed by quantized position + reach), the call runs in kAllFail mode, giving an empty caster list and an empty shadow map. Lights reaching the camera, partly off-screen, or with no usable depth are untouched. The first 8 shadow cameras are logged.
+
+### v1.3 run (light daytime scene) and v1.4 (2026-09-28)
+v1.3 run (daytime, no shadow-casting point lights, so v1.3's shadow-light path never ran: 0 calls):
+- **Previs beat CBRO here.** Previs: 16.7 ms (60 FPS), ~1.5k pre-pass draws. CBRO: 18.3–18.5 ms (54–55 FPS), ~2.5k pre-pass draws. Directional shadow draws were ~0.8–1.2k in both modes.
+- CBRO per frame: tested ~9.2k | rejected ~2.0k | visible ~0.6k | **offscreen ~4.4k** | near ~1.2k | exempt ~0.8k.
+- Causes found:
+  1. **"Offscreen" meant "any part outside the depth frame"**, so every object crossing a screen edge was kept whole. Precombined chunks (mean radius ~450) at near and mid range cross the top/bottom edge all the time (vertical FOV ~50°).
+  2. **Merge-instanced meshes (BSGeometry type 0x0F, ~16–28% of precombined leaf shapes) could not be hidden.** Block::Add writes the mesh's own entry, then one entry per instance (object nullptr; bound from obj+0x1C0 [stride 0xF0, bound at +0xC0], count at obj+0x1D0), continuing in new blocks via startIndex. The finish loop (0x1CCEBF0) **ignores the mesh's own entry** and appends the whole mesh if any instance entry passed. CBRO only replaced the own-entry bound, so those "rejections" were counted but did nothing. Their parent chunk node, when rejected, still worked.
+  3. **Contended stats atomics.** Every tested object did 2+ `fetch_add`s on shared cache lines from the main thread and all BSJobs workers.
+
+v1.4:
+- **View footprint.** At cull time the current WorldRoot frustum is projected onto the depth frame's image plane: corner rays come from `NiCamera::world.rotate` mapped onto the render basis, plus `viewFrustum` tangents. The axis mapping and frustum units are learned and checked at every capture against `cameraDataCache`; a camera-still self-check disables the feature if it disagrees. An object is judged on the part of it inside that footprint when that part lies within the depth frame. Only the leading edge while turning stays unjudged (`edge`). Objects outside the footprint are left to the engine (`outside`).
+- **Hi-Z refinement.** The test is done in buffer depth (threshold = the object's nearest linear depth less tolerance, mapped through A + B/z). A texel that fails at the ≤4-texel level is re-checked over its covered part at up to 2 finer levels.
+- **Merged meshes.** The own entry is no longer tested. After Block::Add, CBRO tests the whole bound, then each instance bound (early exit at the first visible one, starting from the last visible instance); `confirmFrames` streaks are kept per mesh. When the mesh is hidden, **all its instance entries' SoA bounds are overwritten** with the reject sphere, including continuation calls in the same frame.
+- Stats are per-thread (single writer, summed at log time). History table is now 2^18.
+- **Timing line:** cull stage, CBRO setup, pre-pass stage, CBRO depth capture, and CBRO object-test CPU time (rdtsc summed over threads). Logged in both modes; in previs mode CBRO does no depth capture, for a fair A/B.
+
+### v1.4 runs and v1.5 audit build (2026-09-28)
+v1.4 runs. The user took screenshots at the load spot (same frame, standing still, overlay FPS / draws):
+- CBRO unticked: 155.8 FPS / 2,690 draws.
+- CBRO loaded in previs mode: 151.5 / 2,655, so CBRO's presence alone cost ~3% (probe hooks).
+- CBRO running: 108.3 / 4,988.
+The log for that session confirms it: previs 6.9–7.1 ms (877 pre-pass draws, cull stage 0.38 ms) vs CBRO 9.1–9.2 ms (3,190 pre-pass draws, cull stage 2.13 ms, tests 0.93 ms CPU). Shadow/other draws were the same (~1,690). The view is two building walls filling the screen, the ideal occlusion case, yet CBRO judged 4,328 objects/frame "edge" and 308 visible.
+- **Edge fix never activated ("view footprint: unavailable" in every summary).** Cause: the axis mapping of `NiCamera::world.rotate` was learned once and then required to match. Facing along a world axis (this view faces due west) both readings fit, with different indices, so every later capture "conflicted". Also, the 0.01 NDC margin put the view past the frame edge, so edge objects would have stayed unjudged even with a mapping, and the turn angle came from `acos(trace)`, which reads ~0.03° for an unchanged matrix.
+- **Merged-mesh path never runs with previs off:** 0 instance entries. `142809E30` (gating instance expansion and forceVisible in Block::Add / finish loop) is `BSPreCulledObjects::IsActive`: bytes 0x146722288 enabled && 0x1438C7890 INI && !0x146722289 suspended. With previs active, main-pass entries of blocks with +0x3A6F == 0 are force-visible and not expanded. v1.4's claim that CBRO's merged-mesh rejections were ignored was wrong.
+- Earlier "140 vs 60 FPS" confusion: across sessions at the same spot the base frame time varied 6–20 ms in both modes, so the only valid comparison is same view, same session.
+
+v1.5 (audit build):
+- Probe off by default (`[Probe] bEnabled=0`). No D3D11 context vtable hooks (inside ENB's d3d11), and only the cull + pre-pass stage sites hooked (not hbao/forward/postResolveDepth/firstPersonAlpha, which Upscaling shares).
+- Depth capture: `CopyResource(depth → private R24G8 copy)`, and the compute pass reads the copy. The output merger is never unbound or rebound (only `OMGetRenderTargets(0, …, &dsv)` to identify the depth). Only CS slot 0 state is saved and restored.
+- Footprint: a still camera (Frobenius-difference angle < 0.0002 rad, NiCamera frustum within 0.2%) gives view = the depth frame exactly, with no mapping needed. A turned camera uses every rotation reading that fits at capture (stored per snapshot); with two readings the view is the union. The margin snaps within 0.004 NDC to the frame edge. A reason counter per summary covers still / turned / both / no-fit / units / mismatch / no-mapping / sideways / implausible.
+- Per-object test order: geometry first; the history lookup and classification happen only on a hidden verdict. The streak is consecutive-frames-hidden (a visible verdict breaks it by omission). Exempt counts are now "hidden but exempt", with a sampled top-types list.
+- Built-in A/B: base frame time per mode segment (the first 120 frames after a switch, hitches > 250 ms and menu frames are excluded), logged at each switch, plus a running "since load" comparison.
+
+### v1.5 run (light + heavy locations) and v1.6 (2026-09-28)
+v1.5 run:
+- **Edge fix works**: "still 600" at the load spot, and edge dropped from 4,328 to ~0. Former edge objects are now outside ~3,150 (the engine drops them anyway) or tested.
+- **Light spot**: previs 6.51 ms (154 FPS) vs CBRO 8.03 ms (125 FPS). CBRO's cull stage is 1.85 ms vs 0.40 (tests 0.83 ms CPU) and its pre-pass 1.82 ms vs 0.85. CBRO still judges ~1,300 objects/frame visible. Kept-but-hidden by type: ~400/frame, mostly BSSubIndexTriShape.
+- **Heavy spot (night, 3–6 shadow-casting point lights)**: roughly equal to previs (median ~8 ms both; averages polluted by moving around). BSDynamicTriShape and BSSubIndexTriShape dominate the hidden-but-exempt list.
+- **Shadow-light culling never ran**: "reach 1". The paraboloid shadow camera's frustum far is 1 (normalized). The light's sphere is set on the culler by its setup `0x1429775C0(culler, camera, ?, radius xmm2, flag)`, called from BSShadowParabolicLight (id 656208) +0x190 with radius = `[light+0xB8]->+0x138` (NiLight radius): center at culler +0x1C0, radius at +0x1CC (also +0x1A0).
+- The footprint self-check fired once in the heavy scene (0.107° turn, but the view moved 0.08/0.095 NDC), so the turned path is disabled for the session; the still path keeps working. A possible cause is `cameraDataCache` basis lagging `NiCamera::world.rotate` by a frame while turning fast; unverified.
+- `block+0x3A6F` = `group+0x16A`, copied by Group::Add. With previs active and that flag at 0, Block::Add marks entries force-visible (byte +0x3061+5i) and doesn't expand instances, and the finish loop appends them regardless of the frustum result.
+
+v1.6:
+- ShadowLights reads the culler's light sphere (+0x1C0 center, +0x1CC radius), checked against the shadow camera position (≤ 8 units). A light whose reach is entirely outside the current view (`SphereVerdict::kOutOfView`) is emptied like a hidden one.
+- BSSubIndexTriShape and BSDynamicTriShape are cullable; parts under an Actor stay exempt via the actor check.
+- **Hybrid option** (`bDisablePrevis=0`): previs stays on and CBRO hides on top. For a rejected main entry, Block::Add's force-visible and result bytes are cleared unless the object has its own always-draw flag (NiAVObject::flags bit 11). Merged meshes' own entries are rejected too. Logged as "previs-forced entries hidden".
+- A/B per location: a new comparison starts after a >1 s frame (load or fast travel), after moving >2048 units, or on game load.
+
+### v1.6 run (hybrid, rejected) and v1.7 (2026-09-28)
+v1.6 run (hybrid mode, `bDisablePrevis=0`):
+- The hybrid mechanism worked ("previs-forced entries hidden" 82–961/frame), confirming that with previs active the main-pass entries are force-visible. **The user rejected hybrid anyway: previs data can wrongly hide objects, so CBRO must replace previs, never combine with it.** Back to replace mode; `bDisablePrevis=0` is documented as testing only.
+- The light spot with previs on processes ~830 objects/frame in the cull stage (0.43 ms). Replace mode processes ~9,700 (1.85 ms), so the previs-off cost is the engine filing and testing every object.
+- Shadow lights: the reach now reads correctly (742). At the heavy spot, 7–11 shadow culls/frame were mostly "visible" or "reaches camera" (the player is inside most lamps' 742 radius), and emptied ≈ 0.
+- The light radius is kept in `NiLight::spec.r` (+0x138): 742 vs worldBound 163/296. LightReach used only the bounds, so it underestimated the reach.
+
+v1.7 (replace mode):
+- **Ray-reach texel test.** The Hi-Z test skips texels no ray through the sphere can pass: the center-to-ray distance ≥ lateral offset at the center depth × cos(ray angle), a conservative bound. That drops the rectangle corners, and at coarse levels more. Plus a quarter texel of jitter slack. Refinement goes to 3 levels.
+- **Early skip at Group::Add.** For a main-pass object added with flags == 0 and no pending group markers on the target block (group+0x150 geometry / +0xD0 nodes, bytes +0x3A6C..E), CBRO decides first. Out of view (not lights) or confirmed hidden means the object is never filed. Otherwise the Block::Add filter reuses the decision (thread-local).
+- LightReach includes `spec.r × scale`.
+- Test CPU time is sampled every 8th frame (scaled ×8).
+
+### v1.7 run (wall test) and v1.8 (2026-09-28)
+v1.7 run. Until 12:57:48 the load spot was near parity: CBRO 6.72 ms vs previs 6.46 ms (+4%). Early skips removed ~2,830 hidden + ~2,680 out-of-view top-level adds out of ~7,200. Then:
+- `[E] view footprint: self-check failed (camera turned 0.074 deg, view [-1.000,1.178]x[-1.255,0.997])`. **Bug: `g_footprint.disabled` returned early in CurrentView before the still-camera path**, so the whole footprint stopped ("still 0 | turned 0" in every later summary) and edge objects were kept again (3,000–5,000/frame). User's wall test: previs 176 FPS / 375 draws vs CBRO 132 FPS / 2,618 draws, with CBRO's log showing visible 0–685 but edge 4,000–5,100.
+- The self-check misfired on a two-reading (union) box. Facing within ~5.7° of a world axis, both matrix readings fit the old 0.995 threshold, and the mirrored reading widens the union by up to ~2× the deviation. That box is conservative, not wrong.
+
+v1.8:
+- The self-check disables only the turned path; the still path always runs. Self-check applies to single-reading boxes only.
+- Axis fit at capture is strict (0.9999, ~0.8°) for the turned path and for still-path trust. A loose fit (0.995) needs the NiCamera to have been still for ≥ snapshot age + 2 frames (covers a render camera trailing the NiCamera by a frame while turning).
+- **View planes.** With a known view, a sphere entirely outside any of the view's four edge planes (through the eye), or fully behind the depth frame's eye, is `outside` wherever it is (previously beside/behind objects were "near"/"behind" and left to the engine). This feeds the Group::Add early skip. Lights are never skipped as out of view.
+- Offline check (tools/tests/geom_test.cpp, same formulas vs brute-force sampling): plane test 3,646 of 4,000 random spheres judged outside with 0 visible among them; ray-miss test 15,529 of 20,000 rectangles judged missed with 0 hit.
+
+### v1.8 run (wall + heavy) and v1.9 (2026-09-28)
+v1.8 run:
+- **Load spot: parity or better.** CBRO 6.02 ms vs previs 6.02–6.53 ms. Second spot: CBRO 164 vs previs 140 FPS.
+- **Wall (user screenshots): previs 167.4 FPS / 385 draws vs CBRO 179.9 FPS / 665 draws.** CBRO log at the wall: tested 9,042 | rejected 3,348 | **visible 0** | near 122 | outside 5,523 | bad bound 41 | exempt 9. Pre-pass stage 0.24 ms. The leftover draws are the "near" meshes: spheres reaching within 48 units of the eye plane or containing the eye (terrain quads, big chunks, nearby props), which no sphere test can prove hidden.
+- **Heavy spot (pier, night):** 22 FPS. Visible 2,531 | **hidden but exempt: actor parts 428/frame** | lights 30 | bad bound 104. Shadow lamps: 10.8/frame, visible 8.0, reaches-camera 2.8, emptied ~0 (their spheres really do contain visible surfaces or the camera).
+
+v1.9:
+- **Actors are cullable** (`[Occlusion] bCullActors=1`). The engine updates actor bounds every frame, so the test uses current bounds against static occluders; parts carrying a light stay exempt.
+- `fNearDistance` 48 → 8. Anything with z − r ≥ 8 has defined tangent extents and is depth-tested; the near-plane clip makes smaller depths visible anyway.
+- **Kept-object dump**, automatic, once per location after 300 still frames with CBRO culling. It records every kept object on one frame (verdict/reason, RTTI type, name, radius, distance). For meshes it also records skin flag, vertex count (+0x164), TriShape vertexDesc and vertex Buffer (ID3D11Buffer, CPU data ptr +8, dataSize +0x34, dataOffset +0x48, D3D ByteWidth/Usage), so tight local boxes for big "near" meshes (the wall gap) can be built from vertex data next.
+
+### v1.9 run and v1.10 (2026-09-28)
+v1.9 run:
+- **User: "Shadows are breaking."** v1.9's main change was actor culling, and no shadow issues were reported through v1.8. Likely cause: the engine stops updating pose/skinning for NPCs it doesn't draw, so their shadows use a stale pose. `bCullActors` is now 0 by default. Unconfirmed; if shadows still break, the next suspects are shadow-lamp emptying and early-skipped fade nodes.
+- No NPC pop-in was noticed.
+- **Kept-object dumps.** Load spot: 666 meshes (visible 570, near 78); the biggest are distant LOD, 'Land' r≈93k, 'obj'/'obj-at' (BSSubIndexTriShape object LOD) r≈12–24k, clouds. Heavy-scene wall: 1,986 meshes (visible 1,823), led by unnamed BSTriShape precombined chunks with r≈2,100 (cell-sized). **Nearly all meshes (1,965/1,986) keep CPU vertex data**: Buffer::dataSize == vertices × stride. vertexDesc: stride = (desc&0xF)*4, pos offset (desc>>2)&0x3C, flags desc>>44 (VF_FULLPREC 1<<10 → float xyzw; else half xyzw).
+
+v1.10:
+- **Mesh shapes (`bMeshShapes=1`).** A background thread builds, per TriShape, the local box of the vertices plus an occupancy grid (≤8/axis, ≤128 cells) of the cells touched by each triangle's box. It copies the data with SEH, verifies the first vertex didn't change, and rejects the shape unless the vertices fit the mesh's modelBound (and fill ≥ half of it). Cached lock-free by TriShape with a check hash (pointers, sizes, first vertex).
+- In Decide, a mesh with r ≥ 200 whose sphere says visible/near/edge gets a shape test: the whole box (view-space AABB of the transformed box, clipped at the near distance, plane test, rect, Hi-Z), then the occupied cells. Hidden if every cell is hidden or out of view; kept at the first visible cell. The rotation reading (rows vs columns) is learned once from a mesh whose modelBound maps onto its worldBound, and re-verified per object.
+- Offline brute-force check (tools/tests/shape_test.cpp: random blob meshes, rotations, occluder walls): 3,000 trials, 1,800 hidden/outside (591 via cells), 0 wrong.
+- The dump groups kept meshes by type+name.
+
+### v1.10 run and v1.11 (2026-09-28)
+v1.10 run (no F8 toggle, CBRO the whole time; light spot, then the wall, then a covered heavy spot):
+- **User screenshots at the wall, one second apart: a big concrete wall section missing (sky and the empty world behind it visible), 1,411 draws / 74 FPS, then the wall back, 7,139 draws / 62 FPS.** The draw count swung between "almost everything culled" and "nothing culled": the wall was hidden, the next depth frame had a hole, everything behind became visible, and so on. "confirming" jumped to ~1,370/frame at that spot (≈100 at the light spot).
+- Cause: **BSMergeInstancedTriShape** (vtable id 245837, size 0x1B0) is merge-instancing. The precombine builder (Fallout4.exe+0x28444A0, id 657056) concatenates several source meshes' vertices *in their own local spaces* into one vertex buffer, and puts each instance's NiTransform (translation relative to the group center, which becomes the node's local translate) into a GPU buffer at +0x170 (80-byte records: NiTransform at +0, grayscale-palette scale at +0x40). The CPU copy of those records is freed. MeshProxy built shapes from the raw vertex buffer and placed them with the node's transform: a blob of source meshes at the group center, nowhere near the drawn instances. `IsMergeInstanced` (type byte 0x0F) never matched these (their type isn't 0x0F; "merged meshes decided 0" in every run), so nothing excluded them. The old fit check (inside the bound's box, fills ≥ half) passes many such groups.
+- Also: a shape built from one object was used for every object sharing the TriShape, with no check of the second object's bound.
+- Heavy covered spot (location 4, loading pause): main pass tested ~3,900 | outside ~3,500 | visible ~200 | near ~55 | rejected ~19; kept dump 121 meshes. Its 3.4–3.6k draws are almost all other passes (2 shadow lamps reaching the camera, G-buffer/prepass of the kept set, post).
+
+v1.11:
+- **Shapes only for meshes whose vertex data is what is drawn**: exact vtables BSTriShape / BSSubIndexTriShape / BSMeshLODTriShape (never subclasses), with an exact BSLightingShaderProperty (+0x138, vtable id 241915) and none of the vertex-moving shader flags (+0x30: skinned bit 1, tessellate 25, billboard 45, tree anim 61), no skin instance, no skinned/instanced vertex format. Not for meshes that moved in their last update (world ≠ previousWorld; `NiAVObject::UpdateWorldData` copies world to previousWorld first) or whose parent is a BSLeafAnimNode.
+- **Fit check (ShapeFit.h, engine-free):** the vertices must be the ones the model bound was made from: all inside it (≤ 1.02 r + 2), the farthest ≥ 0.8 r − 2, the vertex box centered within 0.25 r + 2, extent ≥ 0.5 r. Vertex buffer size must equal count × stride exactly; every triangle in the index buffer is used (never fewer than numTriangles).
+- **Per use:** the object's model bound must equal the one the shape was checked against; its worldBound radius must equal model radius × scale; the rotation reading is settled only after 32 agreeing meshes with no dissent (3 conflicts → shapes off).
+- Shape verdicts ("hidden" and "out of view") both go through confirmation and the reject bound. (v1.10's "out of view" did nothing at Block::Add, where the engine's own frustum test still passed the sphere, and skipped immediately at Group::Add.)
+- Box rects get the same quarter-texel slack as spheres.
+- Diagnostics: shape rejections per reason, candidates per frame (merge-instanced / other types / shader / layout), moved/swaying/transform-unconfirmed counts, the rotation reading. The dump lists meshes a shape settled on the same frame (largest 24), and for up to 8 kept merge-instanced meshes: the +0x170 instance buffer object's words, +0x34 count, +0x38 kind, the ID3D11Buffer desc behind it (only called if its vtable is in a d3d11.dll), LOD triangle counts, local translate and model bound. That is the groundwork for judging merged meshes per instance (they were 85 of 218 kept meshes at the wall).
+- Offline (tools/tests/fit_test.cpp): real meshes with box-center bounds 0 of 20,000 rejected (Ritter bounds 8% rejected, safe). Merge-instanced groups of 2–8 still pass the fit 1.4–3% of the time, so the type check is what excludes them; the fit is the second layer.
+
+### v1.11 run and v1.12 (2026-09-28)
+v1.11 run (user screenshots 15:08 light spot, 15:10 covered pier at night):
+- **Object popping fixed** (the v1.10 wall hole is gone).
+- **"Shadows that were supposed to stay are still being culled."** Light spot, same frame: previs 95.1 FPS / 3,804 draws with a large sun shadow over the left half of the ground; CBRO 139.3 FPS / 1,889 draws with that shadow gone. Its caster stands outside the camera view.
+- **Heavy spot not culled enough:** previs 21.3 FPS / 19,316 draws vs CBRO 20.3 FPS / 16,463. About 80% of those draws are point-light shadow maps (11 shadow lamps per frame; 4-9 visible, 2-6 reaching the camera, none empty-able), which main-view culling can't touch. CBRO kept 214-451 NPC parts per frame that tested hidden (bCullActors=0).
+
+Root cause (static RE, OG 1.10.163):
+- DrawWorld's cull (718911) files the scene walk's objects by `NiAVObject::ShadowCaster()` (flags bit 40 clear): casters into **group 0** (1117782), the rest into group 1 (133326). After the walk it calls a callback (global 473367) that runs `BSShadowDirectionalLight`'s cascade cull (1390075, via 259940 / 432406). **With previs off** that function points group 0's camera and frustum at the sun's shadow culler and registers **every cascade as another view of group 0** (`0x141CCB8C0` → view manager `0x141CD0880`: 0x68-byte records {group, camera, planes, accumulator}). With previs on it builds its own stack group fed from previs data instead.
+- So an entry CBRO rejected in group 0 (bound replacement) or never filed (Group::Add early skip, hidden or **out of view**) also vanished from the sun's shadow maps. Out-of-view early skips (3,800-6,700 per frame) removed every caster outside the view: exactly the missing shadow in the screenshot. This was present since v1.1 (worse from v1.7's early skip). v1.9's "shadows are breaking" was the same bug applied to NPCs, not stale poses: v1.10/v1.11 broke shadows with actors exempt.
+- Each view registers its visible entries with its own accumulator through `BSShaderAccumulator::RegisterObject` (vtable 357329 slot 45, 0x14282CED0; the RTTI shows no subclass; every call is virtual, none direct; all four register loops ignore the result). With a camera on the accumulator (+0x10; the main one gets DrawWorld's camera) the entry is first re-tested against that camera (`0x141CC4870`). DrawWorld's main accumulator is the global 1211381.
+- Groups 1, 2 (1328670, previs list) and the group array (459440) are registered with the main accumulator only (job and non-job paths). Group 3 (731482, special always-draw objects with radius 1, own camera) uses a second accumulator (1430301), and a later render pass reprocesses it (0x142850A27).
+- `ChildPush` (357475) adds ONE object to a group (the loop over a node's children is in its callers); args (group, obj, bound, r9b flag, byte, byte, context).
+
+v1.12:
+- **Two levers, chosen per group.** Entries of group 0 and of any group not proven main-only ("shared") stay in their group untouched; CBRO records the ones the main view needn't draw in a per-frame lock-free drop set (`src/Core/DropSet.h`: one word per slot, address + 20-bit frame tag, no clearing except at tag wrap), and the main accumulator's `RegisterObject` of them is skipped while DrawWorld culls. The cascades still register them: sun shadows stay. Children of a dropped node inherit the drop (thread-local cache per parent). Main-only groups keep the old levers (reject bound, Group::Add early skip).
+- Hooks: `ChildPush` detour (to know each Block::Add's group, thread-local), `RegisterObject` vtable slot. CBRO decides only inside DrawWorld's cull stage. Occlusion stays off (previs in charge) unless Block::Add and the registration hook are both in place; a missing Group::Add/ChildPush hook only makes entries count as shared.
+- Never dropped from the main view: entries with the engine's always-draw bit (flags bit 11; Block::Add forces them visible). Never hidden as a whole: nodes carrying a light **or an NPC** (a moving NPC can leave its parent's bound stale); the NPC root is judged by its own bound.
+- **bCullActors=1 again**: NPC parts are hidden from the main camera only, so their shadows stay.
+- Audit fixes: MeshProxy's shape cache never freed anything (a new index per rebuild, keys never removed): it would fill after ~60k shapes and silently stop giving shapes; now it is cleared at a frame start when nearly full, with a generation check so the builder never commits a stale result. Hi-Z readback publishes only the newest finished capture (after a hitch it used to copy and mip-build up to three, the third into the buffer the previous frame's context pointed at). Version 1.12.0 (was 0.1.0), so logs identify the build.
+- Offline (tools/tests/dropset_test.cpp, compiles DropSet.h as is): ~13M inserts over 2,000 frames with up to 12.5k drops per frame, none lost or refused; 12 threads racing duplicate inserts and lookups, nothing lost; overfull table refuses inserts with no false positives; the tag wrap is cleared.
+- Expected: the missing sun shadows are back. The light-spot draw count and FPS will be lower than v1.11's, which was partly fewer shadow-caster draws from this bug; group 0 is traversed like vanilla previs-off again (no early skip there), so the cull stage costs more. The log line "occlusion main view only ... registrations N, left out M" must show M > 0 (the new path running).
+- Next levers, not built yet (both need unverified engine facts first): (1) point-light shadow casters: for a light inside the view pyramid, a caster entirely outside the (slightly widened) pyramid can't shadow a visible pixel (the light-to-pixel segment stays in the convex pyramid); needs the per-object hook of `BSParabolicCullingProcess` and proof that point-light shadow maps aren't reused across frames. (2) Sun-shadow-aware early skip for group 0: skip an object outside the view whose shadow (swept along the sun direction) can't reach the view; needs a verified sun direction and sign.
+
+### v1.12 run and v1.13 (2026-09-28)
+v1.12 run (user screenshots + log 16:53-16:58):
+- **Sun shadows correct** in every comparison; the new path ran ("registrations 4,502, left out 2,791" at the start).
+- **Wall: previs 175.3 FPS / 394 draws vs CBRO 136.3 FPS / 2,272.** The log at the wall: main view 3,864 registrations, 3,589 left out (pre-pass 0.36 ms). The rest of CBRO's draws are the **sun's cascades**: with previs on they draw only previs's shadow list (small at that spot); with previs off they draw every group-0 caster in their frustum, including everything behind the wall. Cull stage 2.52 ms (1.93 ms of it CBRO's own tests) vs previs 0.17 ms; A/B there: CBRO 30% slower.
+- **Light spot:** CBRO 10-24% slower than previs (cull stage 1.8-2.9 ms, tests 1.2-2.2 ms): group 0 is walked in full again, and every entry is tested (~70 ns each even when out of view).
+- **Dense pier (night): previs 21.8 FPS / 19,389 draws vs CBRO 23.0 / 17,618.** The kept dump shows ~1,500 meshes really visible; nearly all other draws are the lamps' paraboloid shadow maps (7.9 shadow culls/frame) plus the moon's cascades.
+
+RE for v1.13 (OG 1.10.163):
+- **Sun direction:** `BSShadowDirectionalLight` slot 14 (0x1428CACC0) normalizes row 0 of its NiLight's world rotation (light +0xB8, +0x70), eases changes over time (stored at +0x200/+0x210/+0x220), and builds its shadow camera (light +0x2C0) with local rotation row 0 = that direction, placed at view camera - 15000 * direction (constant 0x14309DD00). So the camera's row 0 is the light's travel direction; (view - camera) . row0 = +15000 verifies the sign at run time.
+- **Cascade range:** global 777729 (0x1467333DC) = `fDirShadowDistance` as applied (1000 when unset), written by 545406; slot 14 clamps the cascade far to min(camera far, it).
+- **Cascades active:** DrawWorld's callback (global 473367) is 259940 or 432406, which register the cascades on group 0 only when GroupsEnabled (938585) and the flag 241042 are set.
+- **Lamps:** `BSParabolicCullingProcess` slot 0x19 = Process(object) (0x1429772B0): cullMode 1/2 pass/fail all; flags bit 26 decided by bit 39, bit 11 always passes; otherwise its frustum test (0x142977950), then `OnVisible` (vtable +0x1C8), which files geometry / walks children; a failed object clears flags bit 42 when culler byte +0x11D is set. Culls run every frame per lamp (shadow culls/frame match the lamp count), so no shadow map outlives the view it was culled for.
+- `BSShaderAccumulator` layout (header): +0x560 renderMode (kShadowmap 0xF, kShadowmapDir 0x10, kShadowmapPB 0x11), +0x568 shadowLight. Not used yet.
+
+v1.13:
+- **Sun shadows (group 0).** A group-0 object the main view doesn't need (confirmed hidden, or out of view) gets its shadow tested: the capsule its bound sweeps along the light (radius + camera movement + 64 filter margin, growing by sin 1 deg per unit for the easing) is clipped to where receivers can be (in front of the eye, view depth <= 1.25 x range + 256, inside the current view's edge planes) with `ShadowGeometry::SweepClip`; the kept part's screen box and nearest depth are tested against the Hi-Z like an object. Out of reach = unneeded at once; behind surfaces = unneeded after `confirmFrames` (a per-object sun streak). Unneeded shadow + unneeded main view: never filed (Group::Add) or rejected in every view (reject bound at Block::Add), which removes the cascade draws and the engine's walk of the subtree. Otherwise the v1.12 main-view drop. Lights and always-draw objects are never rejected. Sun state per frame: verified direction (unit, pointing down, shadow camera on the sun side), cascades active, or unknown (then every shadow counts as needed); with sun shadows off (interiors) group 0 behaves as main-only.
+- **Lamp shadows.** For each lamp cull, its per-object test also drops objects entirely outside the region where they could shadow a visible pixel: the view cone (depth frame's camera, widened by the turn since + 0.5 deg and any zoom-out) with its planes pushed out by the lamp's own distance outside it + the camera movement + the filter reach (5 deg x reach + 16). The subtree goes with it; flags bit 42 is cleared as the engine does. Lamps fully hidden are still emptied as before.
+- Observe-only mode no longer skips out-of-view objects (it did since v1.7); always-draw objects are never skipped.
+- INI: `bSunShadowCulling`, `bLampShadowCulling` (both 1). Version 1.13.0.
+- Offline (tools/tests/shadow_test.cpp, compiles ShadowGeometry.h as is): sweep clipping never cuts a receiver-region point; the kept sweep projects inside the end spheres' box and no point is nearer than the nearest-depth bound; point-light casters near any light-to-visible-point segment are never dropped, with the camera turned up to 3 deg and moved up to 60 units since the cone was built.
+- Log lines: "occlusion sun shadows per frame" (tested / out of reach / behind surfaces / off / confirming / needed / never filed / rejected), "sun shadows per interval" (on / off / why not used, last direction, range, placement ~15000), "shadow light casters per frame" (lamps limited, inside the view, objects tested, left out).
+
+### v1.13 run and v1.14 (2026-09-28)
+v1.13 run (log 18:01-18:02, wall screenshots):
+- **Sun-shadow culling never switched on:** "sun shadows per interval: ... other cascade path 600" in every interval, so every group-0 caster stayed in the cascades. The check compared DrawWorld's callback slot (global 473367) with 259940 / 432406, but the game fills that slot with a no-op (`ret` at 0x1403A8020, set through 0x1428579B0 from 0x140D3DA9A). The real path: function **339369 calls 432406 at +0x185**; 432406, only with GroupsEnabled (0x141CCB850) and the directional-shadows byte (241042) set, runs the directional light's update (BSShadowDirectionalLight vtable 97945 slot 14) and then **tail-jumps to the cascade cull 1390075 with group 0** (`lea rdx, [0x1467233C0]`). 259940 is the same code with no caller. Order inside Render_PreUI (984743): +0x0 fixes the directional-shadows byte for the frame (`flag = byte 0x146721F58 ? 0 : flag`; its only setter 0x142857980 is called from the one-time render setup 0x140D3DA57, which also fills the callback slots), +0x16A DrawWorld's cull (CBRO's cull stage), +0x16F `call [0x1467232C0]`, +0x175 `call 339369` (cascades), +0x17F the pre-pass. Every other reference to the byte only reads it. GroupsEnabled 0x141CCB850 is `movzx eax, byte [0x14384E778]` (id 938585). So the flags CBRO reads when its cull stage begins are exactly what the cascade setup sees that frame.
+- **Wall:** previs 152.0 FPS / 367 draws vs CBRO 109.6 / 1,690 (the cascades still drew every group-0 caster in range).
+- **Load view, camera still:** previs 8.94 ms vs CBRO 11.29 ms. Cull stage 3.1-3.3 ms with CBRO (its own tests 2.0-2.1 ms) vs 0.19-0.5 ms with previs.
+- **"F8 doesn't disable it cleanly" (145 FPS at load, 110 in previs mode afterwards):** in previs mode the whole cull stage, engine plus CBRO's hooks, took 0.19-0.5 ms; previs-mode intervals ranged 6.8-10.0 ms with the camera turning (146 FPS at some views). But the hooks weren't idle: SetMainCullActive(true) ran every frame in every mode, so Group::Add consulted the group filter (90-580 "top-level adds considered" per frame in previs mode), and the lamp hook still tested each lamp's sphere. Also active in this setup: **ShadowBoostFO4** (FPS target 58.4; moves shadow distance 2000-4000, LOD fade and grass distances) and **FO4CloudShadows** (compute prepass each frame), so frame times right after a load aren't a stable baseline.
+
+Sources checked instead of re-deriving (external/): CommonLibF4-DM `NiCullingProcess` (slot 0x19 Process(object), 0x1A Process(camera, scene, set), +0x11D updateAccumulateFlag), `BSCullingProcess` (cullMode +0x158: kNormal 0, kAllPass 1, kAllFail 2, kIgnoreMultiBounds 3, kForceMultiBoundsNoUpdate 4), `BSShaderAccumulator` (+0x560 renderMode, +0x568 shadowLight), `BSShaderManager::etRenderMode` (kShadowmap 0xF, kShadowmapDir 0x10, kShadowmapPB 0x11); F4SE `NiObjects.h` flag names (bit 11 AlwaysDraw, 26 PreProcessedNode, 39 NotVisible, 40 ShadowCaster (CommonLib's `ShadowCaster()` tests it clear), 42 Accumulated). None of them defines ShadowSceneNode, BSShadowDirectionalLight or BSCullingGroup, so the cascade path above stays from disassembly.
+
+v1.14:
+- **The sun path is watched, not guessed.** `Util::MakeCountingStub` builds `inc qword [counter]; jmp [target]` (no register or stack touched). One replaces the `call 432406` in 339369 (only if it still targets 432406), one the directional light's update slot (only if it holds the game's own function). Once per culled frame: **on** = setup ran, GroupsEnabled, dirShadows, and the light's update ran (plus the unchanged direction and placement checks); **off** = setup ran with dirShadows clear and the light's update didn't run (no cascade was set up to read group 0); anything else (a stub missing or rerouted by another plugin since, setup didn't run, flags vs update mismatch) = unknown, every group-0 shadow needed. Log: "sun shadows per interval: on / off / not used: disabled, unreadable, path not watched, setup didn't run, flags/update mismatch, direction, placement".
+- **F8 / previs mode is a pass-through:** the culling-group hooks are armed only on frames CBRO culls (`SetMainCullActive(context.cull)`); Block::Add, Group::Add and ChildPush return straight to the engine otherwise (no owner read, no thread-local scope, no filter); no Hi-Z poll or frame setup in previs mode; the lamp hook calls the engine directly while CBRO is off.
+- The sun's receiver planes (eye, reach, view edges) are built once per frame in BeginFrame instead of per caster.
+- Version 1.14.0.
+
+### v1.14 run and v1.15 (2026-09-28)
+v1.14 run (log 18:41-18:43) and the user's no-mod screenshot (18:44, same save and view): **no CBRO 151.7 FPS / 2,675 draws**; v1.14 CBRO mode 31.8 ms (31 FPS, pre-pass stage 11.9 ms), previs mode 17.5-19.3 ms (52-57 FPS). v1.13's previs mode at that view had been 8.9 ms (112 FPS). The regression is v1.14's only always-on addition: the counting stubs, whose counters were written inside the executable trampoline page, next to the Block::Add / Group::Add / ChildPush gateways every culling thread runs (self-/cross-modifying-code machine clears); one of them sat on the sun light's vtable slot 14. **Rule: never write data into code pages.**
+The log also said "setup didn't run" every frame: that count included frames with GroupsEnabled clear, and GroupsEnabled is the INI setting **`bCullingBatch:General`** (the byte is its `Setting` value at +8; the static initializer at 0x142BFE6B0 registers it; default 0; not set in the Fallout London INIs). With it off 432406 does nothing, but **1108521** (Render_PreUI+0x1BF, after the pre-pass) runs the same two steps itself: `if (dirShadows && !bCullingBatch) { light->update(camera); 1390075(light, group 0) }` (its light from global 879298 +0x208). So both paths cull the cascades against group 0 exactly when the directional-shadows byte is set, and neither does when it's clear. Also checked: the previs switch (1090712) only sets a byte on enable (disable runs the flush callbacks), so toggling can't leave previs degraded; Addictol's BSPreCulledObjects module feeds previs through Group::Add.
+
+v1.15:
+- Stubs and the vtable slot 14 hook removed. The sun path is verified by reading call bytes each frame, for the path bCullingBatch selects (batched: +0x175 -> 339369 -> 432406; unbatched: +0x1BF -> 1108521, +0xE49 -> 1390075), plus the light's update slot holding the engine's function (1242204). On = path intact + directional shadows + the old direction/placement checks; off = directional shadows clear; path changed = unknown.
+- **F8 takes CBRO out of the engine:** Block::Add, Group::Add and ChildPush detours and the RegisterObject and two BSParabolicCullingProcess vtable slots are `Util::SwitchableHook`s, swapped with one 8-byte compare-exchange each (entries are 16-byte aligned; a hook another plugin stacked on top is never undone) at the cull stage's start, before DrawWorld's cull. In previs mode only the two once-per-frame stage hooks remain. Culling needs the hooks back in; if they can't be, previs keeps the job.
+- Log: "hooks in/out | calls per frame: Block::Add, Group::Add, ChildPush, registrations || engine: bCullingBatch, directional shadows" every interval.
+- Version 1.15.0.
+
+### v1.15 run (log 19:10-19:12) — OPEN BUG: previs mode is still slower than no CBRO
+- **User verdict: "Previs mode is still broken with your hook."** Previs mode at the load view: 7.7-8.6 ms (116-130 FPS) in settled intervals, versus **151.7 FPS (6.6 ms) with CBRO not installed** at the same save and view.
+- **Removing the hooks did not fix it.** Intervals fully in previs mode log `hooks out ... calls per frame: Block::Add 0, Group::Add 0, ChildPush 0, registrations 0`, so CBRO's three detours and three vtable hooks are provably not running, yet the frame is still ~1-2 ms slower than no-mod. Cull stage in those intervals: 0.21-0.43 ms; pre-pass stage 1.76-2.23 ms.
+- Whatever still costs time is something that stays active in previs mode after v1.15. Suspects, none verified yet:
+  1. The two once-per-frame render-stage call-site hooks (Render_PreUI 984743 +0x16A cull, +0x17F pre-pass). Upscaling wraps ours at +0x17F. Also the work in OnCullBegin / OnPrePassEnd: GetAsyncKeyState ×3, ReadCamera, DeriveViewSpace, the kept-dump check, and logging.
+  2. Mode state left over from CBRO mode. CBRO starts in CBRO mode at load, so previs is disabled at load (flush callbacks run) and re-enabled on F8. The static RE says enable is only a byte write, but an A/B that starts in previs mode and never toggles has not been done.
+  3. CBRO's GPU resources (Hi-Z compute shader, private depth copy, staging textures; no dispatch in previs mode) and the MeshProxy builder thread (condition-variable wait, should be idle).
+  4. Anything done at plugin load regardless of mode (Plugin.cpp: settings, trampoline, probe hooks when enabled).
+- **Next step:** isolate by elimination, each variant a same-view A/B against no-mod 151.7 FPS:
+  - `[Occlusion] bEnabled=0`: plugin loaded, no occlusion hooks.
+  - `[General] bEnabled=0`: DLL loaded, nothing installed.
+  - A build that starts in previs mode and never touches previs.
+  - A build without the stage call-site hooks.
+
+  Don't blame other mods; the user has shown twice that CBRO is the cause.
+- CBRO mode in this run (hooks in, sun culling active: "sun shadows per interval: on 577-600, placement 15000, range 4000, direction (-0.57,0.62,-0.54)"): 6.0-8.8 ms, roughly level with CBRO's own previs mode (A/B "CBRO 2% faster" to "7.6% slower"), still slower than no-mod. Hook calls with hooks in: Block::Add ~1-5.6k, Group::Add ~1.6-7.2k, ChildPush ~0.9-4.7k, registrations ~0.2-4.6k per frame. Cull stage 0.9-2.5 ms (CBRO tests 0.24-1.47 ms). No shadow breakage has been reported yet from the sun culling, but the user hasn't checked it specifically.
+
+### v1.15 run analysis and v1.16 (2026-09-29; built and installed, not yet run)
+From the v1.15 log (19:10-19:12) and a full read of everything that stays active in previs mode:
+- **CBRO's own per-frame work in previs mode measures ~7 µs.** The log's own timers say "CBRO setup 0.006 ms" (the cull-stage callback: hotkey poll, previs-state check, stillness tracking, `Occlusion::BeginFrame` with no snapshot) and "depth capture 0.001 ms" (the pre-pass callback: `ReadCamera` + `DeriveViewSpace`, then return). In previs mode there is no Hi-Z poll, capture or dispatch; the MeshProxy builder thread waits on a condition variable; the history table (4 MB) is cleared once per mode switch and the drop set only when its 20-bit tag wraps. So the residual is neither in CBRO's callbacks nor in the culling hooks (out, 0 calls).
+- **The previs switch was running on engine worker threads.** "previs disabled / re-enabled" appears on five different thread ids (12736, 9128, 3328, 3912, 17024) while every render stage is on 16324. CBRO used `F4SE::TaskInterface::AddTask`. On OG F4SE 0.6.23 those tasks are drained inside F4SE's hook on the engine's message-queue `ProcessTask` (`external/f4se/f4se/Hooks_Threads.cpp`, `MessageQueueProcessTask_Hook`), which the engine runs on its task-pool threads, not in `Main::Update`; only `AddUITask` (the `ProcessEventQueue` hook) is on the main thread. The console's `tpc` runs on the main thread. `SetEnabled(false)` runs the flush callbacks (61939), so up to v1.15 they could race the main thread's cull. That is suspect 2 of the v1.15 list ("mode state left over from CBRO mode"); v1.16 removes it instead of measuring it. Rule: never call engine functions from `AddTask`; use the render-stage hooks (main thread) or `AddUITask`.
+- The in-session A/B of that log was taken while moving (Block::Add per frame 955-6,142 in CBRO mode, frame time 5.85-11.13 ms), so its "previs 7.65 ms vs CBRO 7.4 ms" does not describe the standing-still comparison the user makes. One previs-mode interval in a light view ran at 6.08 ms (164 fps), above the no-mod 151.7 fps of the load view, so the residual is view-dependent, not a fixed tax.
+- Upscaling's pre-pass thunk (fo4test `DrawWorld_Render_PreUI_DeferredPrePass`) only overrides sampler states around the chained call; chaining with ours is benign. `BSGraphics::State::cameraDataCache` is a `BSTArray<CameraStateData>` (0x250 bytes each); `ReadCamera`'s scan of it is trivial.
+
+v1.16:
+- **Previs switch on the main thread.** `ApplyMode` only records a request; `ApplyPrevisRequest` applies it at the next cull-stage begin (main thread, right before DrawWorld's cull, when nothing reads previs data). The first application logs "previs switch runs on thread N (the main thread | NOT the main thread)" against `Main::threadID`. `OnGameLoaded` (on a message-handler thread in the log) no longer touches previs itself.
+- **`[Occlusion] bStartActive`** (default 1). 0 starts in previs mode and never switches previs until F8: the missing rung of the elimination ladder.
+- **Camera-still A/B.** The frame-time line adds the interval's frames whose camera is exactly where it was the frame before ("camera still: X ms (Y fps) over N frames"), and the location A/B adds a "(camera still)" pair. That is what a standing-still overlay reading corresponds to.
+- Version 1.16.0.
+
+**Next run: the elimination ladder.** Same save, same view, standing still, read the overlay FPS (and, where CBRO is loaded, the log's "camera still" line):
+1. CBRO unticked in MO2 (151.7 fps last time).
+2. `[General] bEnabled=0`: DLL loaded, nothing installed.
+3. `[Occlusion] bEnabled=0`: plus the two render-stage call-site hooks (with no listeners).
+4. `[Occlusion] bStartActive=0`: everything installed (culling hooks taken out at the first frame, builder thread idle, tables allocated), previs never switched.
+5. Default: previs switched off at load (now on the main thread), F8 back to previs.
+
+The first rung slower than the one before names the cause. Rung 5 equal to rung 4 means the worker-thread previs switch was it. Also check the "previs switch runs on thread" line says "the main thread".
+
+### v1.16 run and v1.17 (2026-09-29; built and installed, not yet run)
+v1.16 run (log 00:27-00:32, light scene, CBRO <-> previs toggled repeatedly): "previs switch runs on thread 7944 (the main thread)". The user reports previs mode now unhooks correctly (no numbers given), so the elimination ladder wasn't needed. New goal: cull correctly and faster than previs. The user also notes the draw-call count jumps a lot with CBRO active even standing still.
+- A/B (moving): CBRO 8-16% slower at location 0, ~9% at location 1. "Camera still" by exact equality happened on 1-7 frames per interval: the camera sways every frame even when standing still, so the metric needed a tolerance (2 units and ~0.06 deg per frame, v1.17).
+- Steady CBRO intervals block no frames (600/600 culling): the swings are not from stale depth.
+- **"confirming" is 17-133 objects per frame while standing still**: objects that test hidden this frame after not testing hidden the frame before, i.e. verdict flips; rejected ~3,000-3,500 per frame. The sun range stays 4000 in every interval (Shadow Boost isn't moving it) and the scene has no shadow lamps, so the flips are in the main-view tests. The likely cause is silhouette-edge Hi-Z texels flipping between the occluder's depth and the background under sub-pixel jitter and swaying geometry: each flip resets the object's streak (drawn for confirmFrames frames), and a flipping node takes its whole subtree with it.
+- Even "standing still", about a third of the frames take the turned-view path (idle sway).
+- **The whole frame-time gap is the cull stage** (2.7 ms vs previs 0.4; the pre-pass stage is 1.4 vs 1.7). Per frame: Group::Add 7,243 (the scene walk's top-level adds, every one tested on the main thread; 5,200-5,600 are out of view), Block::Add 5,937, ChildPush 4,824, registrations 5,072 (main view 1,857; the rest are the sun's cascades and later passes).
+
+RE for v1.17 (dumpbin, OG 1.10.163; none of it is in the sources): the scene walk 1138818 (0x14284DF50), called by DrawWorld's cull 718911 with (culler 865470, group 0, group 1, group 2, &group array 459440, previs active). Exterior path (byte [[culler+0x150]+0x138] set, global 0x146723208 null): the world node is the scene root's child 3; each of its children from index 1 on is a cell node (the walk sets flag bit 42 on it), and only its children 2, 3 and 9 are looked at: 2 -> its children whole into group 1 (previs off only); 3 and 9 -> for each child, `GetRTTI() == NiNode's` (NiRTTI id 191219 = 0x145C08EC0; BSMultiBoundNode's is 0x14609A070, checked) means its own children are added to group 0 one by one with flags 0, anything else goes to group 0 whole. Those exact-NiNode containers under a cell's node 3 are the precombined NIF roots (each holds ~10 BSFadeNode chunks): that loop, at +0x602..+0x633, is where the ~7,000 top-level adds per frame come from. The world node's child 0 goes whole into group 1 (previs off), and the tail adds the scene root's children 6, 7 and 10 to group 1. With previs on none of this expansion runs (the probe saw cell roots whole in group 1). The override-root path (global 0x146723208 non-null) and the portal/room path ([root+0x238], byte [[culler+0x150]+0x139]) have the same shape for interiors and are left alone.
+
+v1.17:
+- **Container pruning** (`[Occlusion] bContainerPruning=1`). The three instructions at walk+0x5F1 that fetch a child's RTTI (`mov rax,[rsi]; mov rcx,rsi; call [rax+10h]`) are replaced by a switchable jump (an 8-byte compare-exchange on the word at +0x5F0, whose first byte, the tail of the `jne` before it, is kept as it is) to a stub in the trampoline that repeats them and, when the RTTI is NiNode's, calls CBRO with the container (rsi; the loop's state is in callee-saved registers). A container entirely outside the current view whose sun shadow can't reach the view (`SunUnneeded`, as for any group-0 object; no light check beyond the object itself, the same as the top-level early skip has done since v1.7) makes the walk continue at +0x64A with the next child, so none of its chunks is ever filed, tested or walked; otherwise the walk resumes at +0x5FA. Only "outside" counts, never "hidden behind surfaces". Out in previs mode like the other hooks. Log: "occlusion containers per frame: seen | skipped whole | walked: in view, sun shadow may reach the view". Vanilla previs mode drops out-of-view cell roots whole by the same kind of bound, without the shadow condition.
+- **Temporal Hi-Z** (`iHiZTemporalFrames=4`, 1-8). The published level 0 is the farthest depth over the last N raw readbacks whose camera lies within 2 units and ~0.03 deg per step of the newest; every bound tested is dilated by the merged cameras' spread. A max over frames can only make more visible, so it is safe with the newest camera's projection; silhouette texels stop flipping. Log: "temporal: N readbacks merged with M earlier frames".
+- **Per-frame spread**, sampled at the cull stage's end: min/avg/max, sd and the average change between consecutive frames of the main-view kept registrations, the other views' registrations, rejected and confirming. That is the number for "draw calls jump".
+- Per-object cost: the thread-local stats pointers are constant-initialized (no TLS init guard on every Bump); top-level group-0 adds skip the drop-set parent lookup (their parent is never judged).
+- Camera-still A/B with tolerance. Version 1.17.0.
+
+Next run: stand still at the light spot in both modes and read: "per-frame spread" (does the "main view kept" step shrink, does "confirming" drop), "occlusion containers per frame" (how many are skipped whole, how "top-level adds considered" fell), the cull-stage cost, and the "(camera still)" A/B. Watch for a whole group of precombined pieces missing: that would be a container wrongly skipped, possible only if its worldBound doesn't cover its chunks.
+
+### v1.17 run and v1.18 (2026-09-29; built and installed, not yet run)
+v1.17 run (log 01:03-01:08, the dense pier at night, plus the light spot). User: "marginally better now; needs further improvements at the engine level".
+- **The container patch never fired**: "occlusion containers per frame: seen 0.0" in every interval although the hook installed. So under a cell's node 3 there are no exact-NiNode containers: the precombined chunks (BSFadeNodes) and static refs are its direct children, each added whole at +0x635. The NiNode expansion the walk has is for something else. The per-object early skips were unchanged (top-level adds considered 7,190).
+- **Temporal Hi-Z ran** (594 of 599 readbacks merged, 4 frames each). "confirming" at the light spot: 45-84 per frame; "main view kept" spread while standing still: sd 50-176, average step 15-46 per frame; not a same-view A/B against v1.16, so its effect on the flips isn't isolated.
+- **The pier (directional shadows off: no sun at night).** Frame time 25-37 ms in both modes. A/B at location 2: previs 21.9 ms vs CBRO 28.4 ms (CBRO 22% slower); location 6: previs 25.5 vs CBRO 33.0 (23% slower); locations 4 and 8 (short, moving): CBRO faster. Where the frame goes: main view kept ~2,800-3,450 registrations per frame, but **"other views' registrations" 17,000-20,000 per frame**: the lamps. "shadow light casters per frame: lights limited to the view 7.1 (inside it 5.0) | objects tested 3,429 | left out 1,176". With previs on, the parabolic culler skips previs-hidden objects (bit 26 -> bit 39); with previs off every object in a lamp's reach casts, and the view-cone test only removes casters far outside the view. The cull stage is not the gap there (2.3-2.7 ms vs previs 0.8-1.9); the pre-pass stage is 4-6 ms in both modes.
+- Group::Add at the pier: 3,575 per frame (fewer cells' worth than the light spot's 7,229).
+
+v1.18:
+- **Cell-node pruning** (`bCellNodePruning`, replaces v1.17's container patch). The switchable jump now sits at walk+0x5B8 (`cmp dx,word [rax+132h]`, the start of a cell child node's loop; rax = r14 = the node, r15d = its index 3 or 9, dx = ebp = 0; 8-byte compare-exchange at offset 0, the `jae` after it kept). The stub calls CBRO with (node, index); for index 3 (the cell's precombined chunks and static refs), a node entirely outside the view whose sun shadow can't reach the view (`SunUnneeded`; at night the sun state is off, so the view test alone decides) makes the walk continue at +0x681 with the cell's next child, so none of the node's objects is filed with any view; otherwise the stub restores rax and dx, repeats the compare and resumes at +0x5BF. Index 9's role is unknown: counted, never pruned. Log: "occlusion cell nodes per frame: seen | skipped whole | walked: in view, sun shadow may reach the view || node 9 seen".
+- **Nearest-depth pyramid.** The Hi-Z compute pass writes (nearest, farthest) per texel (R32G32_FLOAT); first-person texels are (0, 1): no world occluder there and a surface as near as can be, so nothing can be proven behind or in front of them. Mips: min and max; the temporal merge takes min over frames for the nearest (conservative). `Snapshot::AllFarther` mirrors `AllNearer` on the nearest pyramid.
+- **Lamp shadow volumes** (`bLampShadowVolumes=1`, on top of `bLampShadowCulling`'s view-cone test). For each caster a lamp's traversal tests, its shadow volume is the cone from the lamp through the caster's sphere, out to the lamp's reach: a sweep along (caster - lamp) with radius growing by r/dist per unit (`ShadowGeometry::SweepClip`, clipped to the receiver region: in front of the eye, inside the view). The kept part lies between two spheres; it shadows nothing visible if every visible surface over its screen box is in front of its nearest point (farthest pyramid) or behind its farthest point (nearest pyramid): no surface is inside the volume either way. Outside the view, beyond the reach, or (confirmed over `iConfirmFrames` frames, per-object lamp streak in the history table) missing every surface -> the caster and its subtree are left out (flag bit 42 cleared as the engine does). Reaching the camera, crossing the view's edge, or the lamp inside the caster -> needed. Log: "occlusion lamp shadow volumes per frame: outside the view | misses every visible surface | confirming | needed | unknown" and the casters line's "shadow volume can't reach a visible surface N".
+- Version 1.18.0.
+
+Next run: the pier again, both modes, standing still: read "other views' registrations" (did the lamp registrations fall from ~17k), "occlusion lamp shadow volumes per frame", "occlusion cell nodes per frame" (must show seen > 0 now), the "(camera still)" A/B, and the cull-stage cost. Watch lamp shadows: a shadow that vanishes while its caster is between the lamp and a visible surface would be a wrong "misses" verdict (the nearest pyramid or the volume's depth range).
+
+### v1.18 run and v1.19 (2026-09-29; built and installed, not yet run)
+v1.18 run (log 01:33-01:36, light spot then the pier). User: "It is broken again, hook is broken, FPS is way worse."
+- **Lamp shadow volumes worked.** Pier: "objects tested 2,623-2,822 | left out: outside the pushed view cone 899-949, shadow volume can't reach a visible surface 1,605-1,744" (v1.17: 1,176 left out in all). Other views' registrations 4,630-8,750 per frame (v1.17: 12-17k). All of it came from the "outside the view" verdict; "misses every visible surface" fired 0-1 per frame, so the depth-based part of the test hasn't been exercised yet.
+- **The cell-node patch never fired either** ("offered ... 0.0" everywhere), so neither of the scene walk's exterior-path loops feeds the 7,200 top-level adds in London. DrawWorld's cull has a third feeder, its own loop over the roots registered with the culling camera ([[culler+0x150]+0x10]+0x58, count +0x68; 0x14284F61C-F705): for each root that is a node (and not flag-14 special) it adds every child to group 0 or group 1 by the shadow-caster flag, which is exactly what Phase 0 run 3 described ("casters into group 0, the rest into group 1"). The walk's override-root path (global 0x146723208 non-null; loop at +0xA00) is the other candidate.
+- **Same-view A/B unchanged in kind:** light spot previs 12.07 ms vs CBRO 12.55-13.36 (4-10% slower; v1.17: 8-16%); pier previs 17.58 vs CBRO 21.1-22.7 (16-23%; v1.17: 22%). But both modes ran ~5 ms slower at the light spot than the v1.17 session (previs 12.07 vs ~7.0; CBRO 11.9-13.4 vs 6.7-8.5), and the pier ran faster in both modes (previs 17.6 vs 21.9). Previs mode has every hook out (0 calls), CBRO's callbacks measure 7 µs per frame ("CBRO setup 0.007 ms"), and the new patch sits in code that never executes in this scene. No CBRO path runs in previs mode; the pre-pass stage doubled (2.0-2.8 ms vs 0.5-1.4) with the same draw counts, and the rest of the frame grew by ~3 ms. **Pending check: `[General] bEnabled=0` at the light spot (rung 2 of the ladder).** If that is also ~12 ms, the absolute drop is outside CBRO; if it is ~7 ms, something in the loaded DLL costs 5 ms with every hook out, and the ladder continues.
+- Every previs switch ran on the main thread; blocked frames were 0-2 per interval in steady state.
+
+v1.19:
+- **Node pruning at three sites**, one switchable jump each (all verified by bytes before patching, all taken out in previs mode): the scene walk's exterior cell-node loop (+0x5B8, as v1.18), the walk's override-root cell-node loop (+0xA00: node in r15, index in r12d, resume +0xA07, skip +0xAA4 which restores rdi then steps to the next child), and DrawWorld's registered-root loop (718911 +0x309: `test rax,rax; je` replaced; rax = rsi = the root as a node or null; a non-node root jumps to +0x399 where the engine adds it whole; a skipped root continues at +0x3AE; otherwise rax is restored and the flag-14 check at +0x312 resumes). The filter gets index 3/9 for cell nodes and 0xFFFFFFFF for a root; 3 and roots are pruned by the same rule (outside the view and sun-unneeded), 9 is only counted.
+- **Group::Add caller histogram**: the return addresses of the main-pass top-level adds considered, per interval ("Group::Add callers of the main-pass top-level adds considered: Fallout4.exe+0x... N/frame | ..."). That settles which loop feeds them.
+- Log: "occlusion node pruning per frame: offered by the scene walk (cell node 3) X, by DrawWorld's root loop Y | skipped whole | walked: in view, sun shadow may reach the view || cell node 9 seen".
+- Version 1.19.0.
+
+Next run: light spot, both modes, plus the `[General] bEnabled=0` launch. Read the "Group::Add callers" line (it should name Fallout4.exe+0x284F6E0 for the root loop, +0x284E9BB / +0x284E5EF for the walk), "occlusion node pruning" (offered must be > 0 at last), the cull-stage cost and the A/B.
+
+### v1.19 run and v1.20 (2026-09-29; built and installed, not yet run)
+v1.19 run (log 01:47-01:54: light spot with several A/B toggles, then the pier with the same).
+- **Light spot** (location 0): previs 6.47 ms (154 fps, 976 frames) vs CBRO 7.56-8.56 ms (14-24% slower). Both modes are back at the v1.17 level, so the v1.18 session's ~12 ms in both modes was not CBRO (the `[General] bEnabled=0` rung is no longer needed for that). Cull stage 1.8-3.2 ms with CBRO vs 0.38 with previs; pre-pass stage 0.35-1.2 vs 0.82: the cull stage is the whole gap, as before.
+- **Pier** (location 4, night): previs 16.74 ms (60 fps, 150 frames) vs CBRO 15.5-16.1 ms: **CBRO 4-8% faster**. Lamp shadow volumes: "objects tested 4,346 | left out: outside the pushed view cone 1,746, shadow volume can't reach a visible surface 2,404"; registrations 4-18k per frame depending on the view (v1.17: 14-20k). "misses every visible surface" stays at 0-2 per frame: the depth-based part of the volume test has practically never fired; the geometric part ("outside") does the work.
+- **The prune sites still report "offered 0.0"** at all three, although the histogram proves the scene walk's exterior path runs: its 8 slots were taken by rare walk sites (+0x284E4ED 103/frame = path B, cells' child 2 into group 1; +0x284E3FC, +0x284E28F, +0x284E255, +0x284E220, +0x284E1EB, +0x284E0AB, +0x284E076 at 1/frame each), and the main feeder (~7,080 of the 7,189 adds per frame) appeared after the slots were full and was never recorded. Since path B (+0x4C0..+0x4F9) runs for each cell's child 2, path A (+0x5B8, child 3 and 9) must run too, so the stub at +0x5B8 is reached. The filter's first line then returned before any counter on the node's own always-draw bit (flags bit 11): the only exit that leaves every counter at 0. So cells' role nodes carry always-draw themselves.
+- Every previs switch on the main thread; A/B segments logged at every toggle.
+
+v1.20:
+- **Node pruning ignores the node's own always-draw bit** (the node is never an entry, so the engine never consults it here; it is counted: "nodes with their own always-draw bit"). Instead the node's subtree is scanned once per epoch (budget 8,192 objects, cached in the history entry at bits [56,59)) for lights, actors and always-draw descendants; anything found, or a subtree too big to scan, holds the node ("holds a light/actor/always-draw child"). `ScanSubtree` gained the always-draw bit and a budget parameter (the object classification keeps 512 and ignores the new bit).
+- The first 8 nodes offered are logged ("node pruning: sample index N type ... flags ... children ... r=... contents ... outside/meets the view").
+- Caller histogram: 32 slots, the 8 most frequent printed.
+- Version 1.20.0.
+
+Next run: light spot, standing still in both modes. Read "node pruning: sample" (what the role nodes are), "occlusion node pruning per frame" (offered/skipped/held), "Group::Add callers" (the main feeder's address), "top-level adds considered" (should drop by the skipped nodes' children), the cull-stage cost and the A/B.
+
+### v1.20 run and v1.21 (2026-09-29; built and installed, not yet run)
+v1.20 run (log 02:10-02:15: light spot still then moving, both modes; the same at the heavy spot).
+- **Pruning fired at last**: "offered by the scene walk (cell node 3) 26, by DrawWorld's root loop 53 | skipped whole 44 | walked: in view 1, holds a light/actor/always-draw child 34 | node 9 seen 10 | nodes with their own always-draw bit 79". But "top-level adds considered" stayed at 7,178-7,216: the 44 skipped were the small DrawWorld roots (13 adds per frame in all), and every cell node 3 was held. The samples say why: `type NiNode flags 0x80000000280e children 2-429 r=1 contents 0x5` for all of them, i.e. bit 11 (always-draw) on the node itself, and "light + always-draw child" from the subtree scan (the exact-NiNode containers under node 3 carry bit 11 too, and the 8,192 budget or a real lamp light sets the light bit).
+- **The caller histogram (32 slots) named the feeder**: `Fallout4.exe+0x284E581 5,709/frame` (the walk expanding exact-NiNode containers under node 3 into their children, at +0x631) and `+0x284E59A 1,344/frame` (node 3's other children, whole), `+0x284E4ED 104` (node 2 -> group 1), `+0x284F6E5 13` (DrawWorld's roots). So v1.17's container patch had been at the right place: its filter's first line returned on the container's own bit 11 before any counter, exactly like v1.18-v1.20's node-3 filter. Two builds of "offered 0" had the same cause.
+- Light spot: previs 6.49-6.50 ms (154 fps) vs CBRO 8.5 ms still / 7.8-8.3 moving (17-24% slower); cull stage 3.1 ms still (CBRO tests 1.77) vs previs 0.76.
+- **Heavy spot (location 6)**: previs 14.62 ms (68 fps) vs CBRO 28.2-30.4 ms: **CBRO 48-52% slower**. Registrations 14.8-20.4k per frame, "other views' registrations" 15.6-17.2k. The lamps' casters: "objects tested 4,101-7,010 | left out: outside the pushed view cone 1,324-2,749, shadow volume can't reach a visible surface 2,593-3,947 | needed 67-114", i.e. 95% of the tested casters are left out and only ~100 pass, yet 14k+ other-view registrations remain. Objects with bit 11 or 26 are never tested (the engine passes them without a test): the containers and cell nodes carry bit 11, so they pass and their children get tested (that is where the 7,010 tests come from). The 14k registrations don't add up from ~100 needed casters: another view registers them (water reflection at the Thames? a cubemap pass?), or the passing bit-11 nodes register whole subtrees. v1.21 measures it (registrations per accumulator, with the render mode).
+- "misses every visible surface" fired 0-2 per frame everywhere: the v1.18 test demanded the whole screen box be behind every surface or in front of every surface, which a volume crossing a wall's silhouette into the sky never is.
+- Location 4 (the first pier spot): previs 19.8 ms vs CBRO 6.70 ms (a different view: not comparable).
+
+v1.21:
+- **Hold rule = entries only.** `EntryScan(node, depth)` looks at the objects the engine actually files: the node's children, and for a cell's node 3 (depth 2) the children of its exact-NiNode children too. An entry with bit 11 (Block::Add forces it visible whatever the frustum says) or an actor root holds the node; the grouping nodes' own bits are ignored (the walk never files them); lights no longer hold (the top-level early skip has left out light-carrying nodes outside the view since v1.7 without lighting complaints: lights live in the scene's light list, not the groups). Cached per epoch as before.
+- **Container pruning** at both walk paths (sites 4 and 5: +0x5F1 with `cmp rax,rdi`, resume +0x5FA, skip +0x64A; +0xA31 with `cmp rax,rbx`, resume +0xA3A, skip +0xA92): the stub repeats the GetRTTI call, and for an exact NiNode asks the filter with index 0xFFFFFFFE (depth 1). So an out-of-view cell node skips ~290 adds at once, and inside an in-view cell each out-of-view container skips its ~10 chunks.
+- **Per-texel shadow-volume test** (`Snapshot::NoSurfaceBetween`): at every texel of the volume's screen box, the farthest surface is nearer than the volume or the nearest surface is farther than it (the sky counts as farther); mixed coarse texels are refined. Used for lamp casters and for the sun capsule (`TestSun`, which also gains the capsule's far limit).
+- **Registrations per accumulator** ("registrations per frame by accumulator: 0x... [mode N name] (main) count/frame | ..."), read with the accumulator's render mode (+0x560): names which views the 14k belong to.
+- Version 1.21.0.
+
+Next run: light spot and heavy spot, both modes. Read "occlusion node pruning per frame" (skipped whole should now be > 0 for cell node 3 and containers, and "top-level adds considered" should fall), "registrations per frame by accumulator" at the heavy spot, "occlusion lamp shadow volumes" (misses > 0 now?), "occlusion sun shadows per frame" (behind surfaces up?), the cull-stage cost and the A/B. Watch for a missing lamp shadow or sun shadow (a wrong per-texel "misses") and for anything missing from a whole cell (a wrongly skipped node).
+
+### v1.21 run and v1.22 (2026-09-29; built and installed, not yet run)
+v1.21 run (log 02:26-02:36, light spot and heavy spot, both modes). **User: "CBRO culling is making almost the whole scene disappear."** Confirmed by the log: "offered 79 | skipped whole 69.7" and "top-level adds considered 678" (from 7,200) at the light spot, "registrations 2,091" (from 5,000).
+- **Root cause (mine):** the node samples in both the v1.20 and v1.21 logs read `own r=1` for every cell node 3 and container. The engine does not maintain those grouping nodes' worldBound, and their always-draw bit (flags bit 11) is exactly its way of saying "never cull this by its bound". v1.20 respected the bit (and pruned nothing); v1.21 argued the bit meant nothing for nodes the walk never files, dropped the check, and judged each node by a radius-1 sphere: outside the view whenever that point was, i.e. almost always. Rule from this: **a node's own always-draw bit means its bound can't be trusted; never judge such a node by its own worldBound.** The v1.21 reasoning ("the engine never consults the bit here") was true and beside the point.
+- The previs switch and the hooks-out path worked as before ("hooks out ... 0 calls"); this session ran slow in both modes at the light spot (previs 13.6-16 ms, CBRO 15.5-17.2), another cross-session shift.
+- **User's observation: with most of the scene culled, the draw count stayed high, so the dense scene may not be visibility-bound.** The log supports the first half: with the scene gone, the heavy spot ran at 13.7 ms and the light spot at 15-17 ms, about previs mode's level in this session. Each spot has a floor (post-processing, ENB, upscaling, UI, the lamps' and cascades' fixed costs) that visibility can't lower; the overlay's draw count includes it. What visibility does control is the excess above the floor: in the v1.20 run the heavy spot was 28-30 ms in CBRO mode against 14.6 in previs mode, with 15-20k registrations per frame in views other than the main one. The per-accumulator line (v1.21) names those views; in this broken run it only showed the expected ones (main "deferred gbuffer" 24, the sun's four "shadowmap dir" 16 accumulators at the light spot, per-lamp "shadowmap PB" 17 accumulators at the heavy spot).
+- The per-texel lamp test still reported "misses 0": at the heavy spot 437 of 448 casters were "outside the view" geometrically and the 11 that reached the depth test were needed. The sun's "behind surfaces" verdicts are not comparable (the scene was pruned).
+
+v1.22:
+- **Node pruning by entries only.** `EntriesOutside` walks the node's entries (children; for a cell's node 3 the children of its exact-NiNode children too), tests each entry's own worldBound against the view's edge planes (with the usual dilation; the engine culls entries by these bounds, so they are maintained), stops at the first entry that isn't outside, and builds the sphere around all of them for the sun sweep. An entry whose bound looks unmaintained (radius <= 1, e.g. a nested container) or invalid holds the node. The node's own worldBound is never read for a decision. Cost: one plane test per entry per frame for nodes that turn out outside (~25 ns each), a few for the rest.
+- The hold rule from v1.21 stays (always-draw entries, actors, too big to scan). Log: "skipped whole N (M entries never filed)"; the samples print the node's own radius as "(unmaintained: not used)" plus the entries' sphere.
+- Version 1.22.0.
+
+Next run: same A/B. First check the scene is complete in CBRO mode (turn around at both spots). Then read "occlusion node pruning per frame" (skipped whole and entries never filed), "top-level adds considered" (should fall from 7,200 by the entries never filed, without anything missing), "registrations per frame by accumulator" at the heavy spot in CBRO mode with the full scene, the cull-stage cost and the A/B.
+
+### v1.22 run and v1.23 (2026-09-29; built and installed, not yet run)
+v1.22 run (log 02:43-02:49, light spot then heavy spot, both modes). User: "mostly as good enough state; the heavy scene is bottlenecked by some other thing"; sub-goals now: **stabilize the erratic draw count at the light spot and match or beat previs FPS there, without breaking previs mode or the scene.**
+- Scene complete again. Node pruning by entries: "offered 79-105 per frame | skipped whole 3-6 (7-10 entries never filed) | an entry meets the view 85-92". So at exteriors node pruning yields nothing: cells are big and precombined containers are cell-wide per-material batches, so almost every node has an entry in view. It stays on (a few microseconds) but is not a lever.
+- **Light spot, standing still:** previs 6.50 ms (154 fps) vs CBRO 8.5-8.7 ms (25% slower). Cull stage 3.2 ms (CBRO setup 0.38, tests 1.75-1.84 ms CPU on all threads) vs previs 0.5; pre-pass 1.0-1.2 vs 0.84-0.99; the rest of the frame is not longer with CBRO. The setup is the readback split, the temporal merge (up to 3 x 2 x 64k min/max) and two CPU mip pyramids, all on the main thread. Registrations: main 1,560-1,660, the sun's four cascade accumulators 1,436 + 1,346 + 451 + 121 (with previs on: main 1,253, cascades 2,801).
+- **Jumping, quantified:** "main view kept 1118/1315/1916 sd 156 step 63 | rejected 3357/3610/3713 sd 57 | confirming 0/42/615 sd 78 step 62" while standing still. The kept count moves by 63 objects a frame on average and spikes by ~600; "confirming" spikes to 615 on some frames: bulk verdict flips. Blocked frames are 2 per 600 and excluded from the spread, the history table is far from its clear threshold, so the likely bulk source is the temporal merge chain: its gate was 2 units and 0.03 degrees per frame, which idle sway breaks, and the published depth then alternates between a 4-frame max and a single frame, so every edge-sliver object flips at once.
+- Heavy spot per accumulator (CBRO mode, full scene): main "deferred gbuffer" plus one "shadowmap PB" accumulator per lamp; the user considers that spot bottlenecked elsewhere and it is parked.
+
+v1.23:
+- **Merge gate 16 units / 0.5 degrees per frame** (a max over frames can only make more visible, so the gate is about usefulness, not safety; the dilation by the merged cameras' spread stays). The Hi-Z line now prints how many frames each published depth spanned in the interval ("depths by frames spanned: 1:N 2:N 3:N 4:N"): steady 4s mean the chain holds.
+- **Setup cost:** the readback deinterleave, the merge (SSE min/max) and both mip pyramids (clamp-free inner loops) are vectorized.
+- **Diagnostic histograms sampled** (Group::Add callers 1 in 64, registrations 1 in 16 per thread; the log scales them back): the caller histogram alone was ~0.2 ms per frame on the main thread.
+- **Sun pre-test:** receiver planes the sweep can only move away from (n.dir + spread <= 0) are tested first without divisions; ~6,800 out-of-reach casters per frame end there instead of in SweepClip.
+- **Main-thread share** of the object tests in the cost line ("X CPU on all threads, Y of it on the main thread"), to see how much of the cull stage is CBRO's own critical-path work versus the engine's traversal.
+- Version 1.23.0.
+
+Next run: the light spot standing still, both modes. Read: "depths by frames spanned" (mostly 4?), "per-frame spread" (kept step and confirming max down?), the cost line (setup and the main-thread test share), and the A/B. If the spread is steady but the gap remains, the next levers are the GPU-side mip chain (setup to ~0.1 ms) and a leaner top-level test path.
+
+### v1.23 run and v1.24 (2026-09-29; built and installed, not yet run)
+v1.23 run (user's report; the log was not analysed): "Your method is producing lesser draw calls at every instance that I see compared to previs but that process itself is heavy, hence about 20 to 30 FPS drop. The process itself needs to be efficiently fast." So the culling is right and thorough; deciding is what costs. Until now every object the engine offered (about 7,000 top-level adds plus children at the light spot) was tested from scratch every frame, on the main thread, although standing still nothing about it changes from one frame to the next.
+
+v1.24: **the verdict cache.** Each object's last outcome is kept and reused while everything it depended on still holds.
+- **Storage:** per thread, two sequential streams of 48-byte records (top-level adds via Group::Add; children via Block::Add), last frame's and this frame's, swapped at the clock. The engine offers objects in the same order every frame, so a record is found with a cursor (look-ahead up to 512 to resync after objects left the sequence, e.g. a pruned container); no hashing. `ResetHistory` (loads, table clears) bumps a generation that empties every thread's streams.
+- **Reuse conditions (all must hold; any doubt re-evaluates):** (1) **camera epoch**: Runtime keeps a reference camera; the depth frame's camera and the current NiCamera must both be within fCacheMove/2 units and fCacheAngle/2 degrees of it (so any two cameras of an epoch are within the whole tolerance), else a new epoch; (2) **bound**: the object's NiBound unchanged (16-byte compare; swaying trees therefore re-evaluate every frame, which the "bound changed" counter shows); (3) **sun epoch**: sun state and direction unchanged (within fCacheAngle/2); (4) **depth**: for outcomes that read the depth, no change in the 8x8 Hi-Z blocks the test read since the record's readback; (5) not a never-reuse record (a light's reach test, a table-full case), and not a kept-dump frame.
+- **Why a reused verdict stays conservative:** tested bounds are dilated by max(camera move, fCacheMove) + merge move + 1 and by depth x sin(fCacheAngle) (sun sweeps by reach x sin, boxes by their far depth x sin), so a verdict holds for any camera inside its epoch. For the depth: with the cache on the tests demand `kCacheDepthSlack` = 6 units + 0.4% more room than the plain tolerance; HiZ compares each published depth against a per-block **reference** (the block's depth when it was last marked; comparing against the previous readback alone would let drifts add up) in **linear** depth and marks a block changed only when a farthest depth got farther, or a nearest depth nearer, by more than half of that (3 units + 0.2%). Only those directions can invalidate a hidden verdict; the depth's sub-pixel jitter on sloped surfaces stays under the threshold at ordinary ranges. Records note the texel rectangle each test read, widened by the coarsest Hi-Z texel the query could have touched (the level where the rectangle spans <= 4 texels), mapped to blocks.
+- **Streaks:** a hidden object reused for a frame counts that frame toward its confirmation streak (its evidence still holds), so a confirmed rejection stays rejected instead of flipping; an out-of-view object keeps its streak (the depth says nothing about it); anything seen visible, near or at the edge starts over. This also removes the outside <-> hidden flips of idle sway that made "confirming" spike. The sun part has its own streak; SkipCellNode's per-node sun streak stays in the hash table.
+- **Settings:** `bVerdictCache` (1), `fCacheMove` (4 units), `fCacheAngle` (0.1 degrees). Larger tolerances reuse longer while moving but dilate bounds more.
+- **Log:** "verdict cache per frame: reused N | evaluated: new, camera epoch, bound changed, depth changed, never-reuse" and "verdict cache this interval: camera epochs, sun epochs, hi-z blocks changed per readback". Not cached: lamp shadow volumes (their own streak table), node pruning (EntriesOutside is cheap and runs each frame).
+- Version 1.24.0.
+
+Next run: the light spot standing still, both modes, then a short walk. Read: the cache line (standing still "reused" should be nearly everything; if "new" is high the engine's order varies or block jobs move between threads and the streams need a hashed fallback; if "depth changed" is high standing still the jitter exceeds the tolerance; if "camera epoch" is high standing still the idle sway exceeds 2 units / 0.05 degrees and fCacheMove/fCacheAngle should rise), the cost line (test time and its main-thread share should fall by most of the 1.7-2.0 ms), the spread ("confirming" max and the kept step), and the same-view A/B.
+
+### v1.24 -> v1.25 (2026-09-29; built and installed 13:04, not yet run; v1.24 was never run either): the Hi-Z build moves to the GPU
+Context: a pasted spec asked for a "GPU-driven visibility pipeline" in four phases (GPU Hi-Z; spatial clustering; GPU occlusion tests writing GPU-resident visible lists through AppendStructuredBuffer; DrawIndexedInstancedIndirect replacing the engine's draws). Viability, checked against the code and FO4-ENGINE-NOTES:
+- Premises corrected: there is no stop-and-wait (the readback is a DO_NOT_WAIT staging ring, 2-3 frames of latency); the light spot offers ~7-10k objects per frame, not "hundreds of thousands"; CBRO never traverses the scene graph (the engine's scene walk offers each object to Group::Add / Block::Add and CBRO decides there); DropSet is CBRO's own table, not the engine's.
+- **Phase 1 (GPU Hi-Z): viable, done here.** **Phase 2 (clustering): not viable as specified.** CBRO does not own traversal, so a cluster verdict still costs a per-object lookup inside the hook, which the v1.24 verdict cache already is; the engine's hierarchy is the cluster structure (SkipCellNode and ParentDropped use it); intermediate node bounds are unmaintained and flagged always-draw (v1.21). **Phase 3 (GPU-resident visible lists): not viable.** The consumer of a verdict is CPU code inside engine hooks (culling groups, accumulator registration), so GPU-resident visibility saves nothing without a readback; index stability across streaming, 2-3 frames of staleness for every verdict (today only the depth is stale), and the sun sweeps, lamp volumes, mesh shapes and instance tests would all need porting to HLSL: §3's reasons stand. **Phase 4 (indirect draws): not viable.** D3D11 has no multi-draw indirect, so one indirect draw per object leaves the draw count (the CPU cost being attacked) unchanged; the engine's per-pass shader, material and constant setup is CPU-driven from precompiled shaders; ENB and Upscaling wrap the context; §2A already ruled out the renderer rewrite.
+
+v1.25 (Phase 1):
+- Everything HiZ::Poll did on the main thread at readback (deinterleave, the raw-frame ring copy, the temporal merge, both mip pyramids, the linear-depth block-change map and its reference) runs on the GPU at capture, in two dispatches (src/Core/HiZBuild.h, engine-free): `build`, one 8x8 group per Hi-Z block: reduce factor x factor depth texels, write this capture's ring slice, merge the previous captures of a still camera (the CPU still decides how many from the ring's cameras, as MergeRecent did, now over captures rather than published readbacks), level 0, the linear-depth compare against the per-texel reference, levels 1-3 through groupshared memory, mark the block with the capture index and refresh its reference; `tail`, one group for the remaining levels. Output: one raw buffer (far pyramid | near pyramid | change map), copied to a staging buffer.
+- Poll maps the newest finished staging buffer (DO_NOT_WAIT) and publishes it as is: the Snapshot points into the mapping (zero copy); the slot stays mapped until its snapshot has been superseded 4 times (kSnapshots 4; 8 slots = 4 held + 4 in flight, ~690 KB each at 320x200). The only per-readback CPU work is a 1,000-entry compare of the change map for the log counter.
+- The change map is dated by capture index (Snapshot::readbackIndex is now the capture index); the GPU's map is authoritative and only moves forward, so blocks changed by captures the CPU never published still show. The ring and reference textures are R32_FLOAT: feature level 11.0 guarantees typed UAV loads only for single-component R32.
+- Offline check (tools/tests/hiz_gpu_test.cpp, runs the shaders from HiZBuild.h on the hardware device against a CPU model of the v1.24 code): six sizes including 161x102 (partial blocks, odd mips), a 5-level one (the tail builds one level), a 3-level one (no tail), and factor 1; 11-capture sequences with resets, a no-linear frame, merges up to 7 and a wrapping ring: 6,464,337 pyramid texels bit-exact, 76,076 block decisions all agree (8 borderline blocks within float noise of the threshold, factor-1 config only, tolerated).
+- Expected in the log: "CBRO setup" in the cost line falls from 0.21-0.38 ms to well under 0.1 ms; "CBRO depth capture" may rise a little (one more dispatch, five UAV binds); the hi-z line reads "(N levels, GPU-built)"; the "hi-z: depth ... built on the GPU ... readback N KB x 8 slots" line appears once. Verdicts are unchanged: same pyramid data, same tolerances. A "hi-z: ... failed" line (raw-buffer UAV or R32 array UAV creation on the engine's device) would disable culling for the session and must be reported.
+- Version 1.25.0.
+
+Next run: as planned for v1.24 (the light spot standing still, both modes, then a short walk), plus the setup and capture costs above and the absence of any hi-z failure line.
+
+### v1.25 -> v1.26 (2026-09-29; built and installed 13:54, not yet run): CommonLibF4RD and CMake
+The user asked for the runtime-database fork (https://github.com/Zzyxz/CommonLibF4RD, cloned into external/CommonLibF4RD) so one build can run on several game versions. What changed:
+- **Library:** CommonLibF4-DM -> CommonLibF4RD. Engine ids resolve at run time through `Data/F4SE/Plugins/f4rd-runtime.bin` (the user has it installed as the MO2 mod "Runtime Database"). `REL::ID` takes (OG, NG, AE); a single argument means the AE id, so every CBRO id now goes through `CBRO::Engine::OG(id)` = `REL::ID{ id, INVALID }` (resolves on OG, fails safely elsewhere; add the NG/AE ids as the other arguments once verified). The RD `RE::VTABLE::*` arrays carry the same OG numbers CBRO used.
+- **Build:** CMake + vcpkg (manifest `vcpkg.json`: boost-stl-interfaces, fmt, rsm-mmio, spdlog, zydis; VCPKG_ROOT or the local `D:/vcpkg`; packages land in build/vcpkg_installed). Build from a VS x64 prompt: `cmake --preset release && cmake --build --preset release`; the post-build step copies the DLL, PDB, CBRO.ini and meta.ini into the MO2 mod folder (`CBRO_INSTALL_DIR`). The old `xmake.lua` and `build/windows`, `build/.gens`, `build/.objs`, `build/.deps`, `.xmake` are no longer used and can be deleted (left in place: deleting needs the user's go-ahead).
+- **Ported definitions** the RD headers lack (src/Engine/Compat.h, CommonLibF4-DM layouts verified in Phase 0): `BSGraphics::State` (camera cache at +0x140, cameraState at +0x160, singleton id 600795/2704621), `CameraStateData`/`ViewData`, `NiLightView` (spec +0x138, modelBound +0x150), `TES` (gridCells +0x18, interiorCell +0x58; singleton 1194835/2698044), `GridCellArray::Get` (1330136/2194566), `GetINISetting` on the RD's INI collections. `RendererData::GetSingleton()` (id 1235449/2704429) replaces DM's `GetRendererData()`. `NiMatrix3::entry[r][c]` became `entry[r].pt[c]`; `NiCullingProcess::camera` (+0x18) and `EXTERIOR_DATA::cellX/Y` are read by offset in the probes; the probe's render-target-manager lines (unverified OG offsets) were dropped.
+- **Plugin entry:** own `F4SEPlugin_Query` (OG loader) and `F4SEPlugin_Version` (NG/AE loaders; address independence "signatures", both structure layouts) so the DLL loads on any patch; `F4SEPlugin_Load` still installs nothing outside OG 1.10.163 (interior offsets and prologues are OG-verified only). Logging is spdlog to the same CBRO.log path and format. If the runtime database file is missing CBRO logs an error and stays inert instead of letting the library stop the game.
+- Version 1.26.0. Behaviour is otherwise v1.25's (GPU Hi-Z + verdict cache).
+
+Next run: the first log lines must show "CBRO v1.26.0 loading", "runtime family OG (1-10-163-0)", and every "hook ...: detoured Fallout4.exe+0x..." offset identical to the v1.25 log (Block::Add +0x1CCB940, Group::Add +0x1CCCC30, ChildPush +0x1CCDCC0, RegisterObject vtable +0x30968E8, stage sites +0x28575EA / +0x28575FF); an "F4RD FAIL" line or a different offset means an id resolved wrongly through the database and the build must not be used.
+
+### v1.26 run and v1.27 (2026-09-29; built and installed, not yet run)
+v1.26 run (log 15:39-15:42; an open-world spot = "location 1", standing still, several F8 A/B rounds; ENB + Upscaling). The CommonLibF4RD build is valid: "runtime family OG", every hook offset identical to v1.25's, no F4RD line. The A/B at location 1 (settled frames): **previs 10.6 ms (94 fps) vs CBRO 12.3 ms (81 fps), CBRO 13-14% slower**, with fewer draws (the user's report; main view kept 2,174 in CBRO mode).
+
+Where the time goes (cost line, per frame, both modes at the same spot):
+- cull stage **3.3 ms in CBRO mode vs 0.79 in previs mode (+2.5 ms)**; of that CBRO's per-object tests 2.2 ms, all on the main thread (the engine offers every object on the main thread: 7,211 Group::Add + 4,972 ChildPush per frame with previs off); the rest, 1.06 vs 0.79, is the engine's previs-off traversal plus the hooks' pass-through.
+- pre-pass 2.3 vs 3.4 ms (**-1.1 ms**: the draw saving). Net +1.7 ms = the FPS loss.
+
+Why the tests cost 2.2 ms although the verdict cache reused 6,901 of 10,038 objects: the 3,138 it re-evaluated were the expensive ones. "depth changed 2,725" = every depth-reading verdict (visible and hidden alike), every frame. The camera is never still while the player stands ("camera still: no still frames": the idle sway moves it more than 2 units / 0.06 degrees between consecutive frames), so every silhouette moves a pixel or two a frame and the block-change map marks 550 of the 1,000 8x8 blocks per readback; records' block rectangles are widened to the coarsest texel read, so every record that read the depth touched a marked block. Regression over the log's 25 intervals: a cache hit ~40 ns, a depth-reading sphere evaluation ~280 ns, a mesh-shape cell ~55 ns, a sun test ~60 ns. At location 1: 3,138 evaluations ~0.9 ms, 13,771 shape cells (767 shape tests; 355 settled hidden test all their cells) ~0.8 ms, 6,901 hits ~0.3 ms, the rest ~0.2 ms. The camera epoch also changed 13 times per 600 frames (everything re-evaluates on such a frame), a spike every ~46 frames but small on average. The design fault: invalidating by "any texel in a block moved" is far too sensitive for a swaying camera, and it re-evaluated visible verdicts, for which no depth change can matter. Also confirmed from the code: the v1.24 change map's soundness hole (references taken at the mark, so a texel that got nearer and back stayed unmarked).
+
+v1.27:
+- **Kept (drawn) verdicts are reused whatever the depth does** (drawing an object can never be unsafe). Each is re-evaluated on its turn every 16 frames (`kKeptRecheckFrames`, staggered by address) so an object that has meanwhile gone behind something is hidden within 16 frames. At location 1 that is ~120 evaluations a frame instead of ~1,900, and the visible mesh shapes' cells go with them.
+- **Hidden verdicts carry their evidence**: the level-0 texel rectangle whose texels were all nearer than the verdict's threshold, and the smallest such threshold (buffer depth); for a mesh shape the union of its hidden cells' rectangles and their smallest threshold (the whole box's when it settled). Reuse: if none of its blocks changed since the depth it was last verified against, it holds (as before); otherwise the evidence is re-checked against the current depth with one coarse query (`AllNearer`, refine 2, no ray test), and a pass counts as verified against this depth (the record's readback moves up, so the next frame's block check is relative to now); only a failure runs the full evaluation. A pass is sound by the same epoch argument as before (the dilated bound covers the camera within the epoch; the threshold was derived from the dilated nearest point), and it is independent of the change map. Sun outcomes keep their own blocks and readback (`sunBlocks`, `sunReadback`); a "behind surfaces" sun outcome is re-evaluated when its blocks changed while the view outcome was reused ("sun re-evaluated under a reused view" in the log).
+- **Change map soundness**: a texel's reference is now the nearest farthest depth (and the farthest nearest depth) seen since its block's last mark, not the depth at the mark (HiZBuild.h; one min/max per texel per capture). "Unmarked since capture R" then really means no texel is farther (or nearer) than at any capture since R beyond the tolerance. The offline test's model follows (tools/tests/hiz_gpu_test.cpp): 6,464,337 texels bit-exact, 76,076 block decisions agree, 8 borderline tolerated.
+- Mesh shapes: the cell scan starts at the cell last seen visible (`Record::cellHint`), so a mesh that stays visible settles at its first cell.
+- Log: the cache line reads "reused N (hidden re-checked against the depth N) | evaluated: new, camera epoch, bound changed, depth changed, kept on its turn, never-reuse | sun re-evaluated under a reused view N"; the cost line splits the object tests into "view evaluations (of which mesh shapes), sun evaluations, cache reuse and bookkeeping" (TSC-sampled every 8th frame as before).
+- Record is 64 bytes (was 48). No new settings. Version 1.27.0.
+
+Expected at location 1 standing still: "depth changed" falls from ~2,700 to the hidden objects whose evidence fails the re-check (those straddling a moving silhouette, which legitimately flip); "kept on its turn" ~120; shape cells from ~13,800 to the failed re-checks' cells; the object tests from 2.2 ms toward 0.6-1.0 ms; the cull stage from 3.3 toward ~2 ms; the A/B at parity or better (the pre-pass saving is 1.1 ms here). Floor of this architecture at this spot: the engine offers ~10k objects a frame with previs off, and answering each from the cache costs ~40-60 ns, ~0.5 ms; beating previs by more needs fewer offers, which cell-node pruning cannot give at exteriors (v1.22).
+
+If the next log shows "hidden re-checked" low and "depth changed" still high: the evidence rectangles of the shape-settled meshes include sky between their cells (the union of an L-shape) and fail; the next lever is per-cell evidence in a side table keyed by object (or two rectangles per record). If "kept on its turn" objects often come back hidden, the 16-frame turn is too long for the scene's dynamics; halve it. If the cost split shows "cache reuse and bookkeeping" dominating, the per-object overhead itself (Bump's thread-local lookups, the stream copy) is next.
+
+Next run: the same spot, standing still, a few F8 rounds (previs / CBRO); read the cache line, the cost split, the spread ("confirming" flips), and the A/B. Then a short walk: the cache should degrade gracefully (camera epochs re-evaluate everything; no correctness change).
+
+### v1.27 run and v1.28 (2026-09-29; built and installed, not yet run): where the other 2 ms are
+v1.27 run (log 16:17, the load spot = "location 0", one CBRO segment right after the load, one previs segment, then the game was exited): the cache change did what it was meant to. Per CBRO-mode frame: object tests 0.93 ms (v1.26 at this spot: 1.42), of which view evaluations 0.08, sun 0.04, reuse and bookkeeping 0.82; "reused 4,942 (hidden re-checked against the depth 842) | evaluated: new 28, camera epoch 108, bound changed 99, depth changed 44, kept on its turn 58"; the cull stage ~1.7 ms (v1.26: 2.45). **Yet the same-session A/B gap is unchanged: previs 10.62 ms median 10.50 vs CBRO 13.69 ms median 12.60, +2 ms, the same gap v1.26 showed at location 1.** So the cull-stage CPU time was not what limits the frame; the v1.26 stage arithmetic (cull +2.5, pre-pass -1.1) described CPU stage costs that evidently don't add up to the frame. What CBRO changes in the frame that it doesn't time: with previs off the sun's cascades cull group 0 (~4,000 entries after the early skips) and draw every caster in range (3,583 registrations a frame here versus previs's ~2,800 at the v1.22 light spot; the engine notes put the cascades at 55-65% of all draws), all of it at Render_PreUI+0x1BF between the pre-pass and the forward pass, outside the two timed stages; and the GPU draws whatever both views register. Also: the v1.27 CBRO segment was the first 5.8 s after the load (streaming, shader compiles, the shape builder), which the A/B's 120-frame settle doesn't cover; and "cache reuse and bookkeeping" at 0.82 ms for ~5,300 objects (155 ns each, with the 842 re-checks inside) is higher than the 40 ns per hit estimated from v1.26's regression.
+
+v1.28 (measurement only; no behaviour change):
+- **The whole frame in buckets, per mode.** Render-stage hooks now also wrap the sun-cascades call (Render_PreUI+0x1BF, 1108521) and the forward pass (+0x1C9); QPC marks at cull begin/end, pre-pass begin/end, sun begin/end, forward begin/end and the next cull begin give six buckets: cull, pre-pass, sun cascades, forward, between (the gaps inside Render_PreUI), rest (forward end to the next cull: deferred composite, post, UI, present, the game update). Kept per mode (the frame's mode after its cull begin), so a 600-frame interval with F8 presses inside still compares like with like: "CPU per frame by mode (ms, ...): previs: cull a | pre-pass b | sun cascades c | forward d | between e | rest f = total (N frames) || CBRO: ...".
+- **The same buckets on the GPU:** D3D11 timestamp queries on the engine's immediate context (a disjoint bracket per frame from its cull begin to the next, timestamps at the marks, read back 4+ frames later without waiting): "GPU per frame by mode (ms, timestamp spans, idle between marks included): ...". A span includes GPU idle time between its marks, so: a span that grows with a mode while its CPU bucket doesn't is GPU work (more draws); GPU total = CPU total in both modes with the CPU buckets explaining the difference = CPU-paced.
+- **Registrations in both modes:** the accumulator (RegisterObject) hook now stays in during previs mode, counting only (it filters only while DrawWorld culls in CBRO mode; ~5 ns a call), so "registrations per frame by accumulator" prints previs's and CBRO's draw sets side by side (main deferred gbuffer, the four sun cascades, lamps).
+- The sun-path integrity check (CullGroups::CallsTo) accepts CBRO's own pass-through wrapper on +0x1BF; anything else on that site still switches the sun's state to unknown (every shadow needed), as before.
+- **A/B warm-up:** the first 600 frames after a load count for neither mode (kLoadSettleFrames), on top of the 120-frame settle after a switch. The frame-time line adds "by mode: previs X ms over N frames / CBRO Y ms over M frames" for the interval (hitches and menus left out).
+- The cost line now reports the object tests per CBRO-mode frame (v1.27 divided by all frames of the interval, previs frames included). Version 1.28.0.
+
+Next run, at the same spot: load, stand still ~10 s (warm-up), then F8 rounds of ~10 s each (previs, CBRO, previs, CBRO), then exit. Read the two per-mode lines: if CBRO's "sun cascades" CPU bucket or GPU span carries the +2 ms, the lever is the cascades' caster set (what previs leaves out of the shadow maps versus what CBRO keeps); if "rest" carries it with the GPU spans equal, it is the wait for the GPU and the registration counts say which view draws more; if "pre-pass"/"forward" do, the main view's draw set. Then fix that, measured.
+
+### v1.28 runs (2026-09-29 16:37 and 16:57): what previs really costs, and what CBRO's previs switch does to the scene
+Run 1 (bStartActive=1, load spot then location 1): CBRO mode and previs mode both 14.7 ms; in "previs mode" the main view registered 3,270 objects with a 3.4 ms GPU pre-pass versus 2,940 / 2.4 ms in CBRO mode: previs was culling nothing. Run 2 (bStartActive=0: previs untouched at load, F8 rounds at the load spot, a walk to location 1 in previs mode, F8 rounds there, then CBRO-mode walks to locations 2-3):
+- **Real previs at the load spot: 6.46 ms (155 fps), main view 1,045 registrations, cascades 3,851; CBRO: 9.0 ms (110 fps), 28% slower.** At location 1: real previs 8.07 ms (124 fps), main 1,195; CBRO 10.55 ms, 31% slower. CBRO's buckets versus previs at the load spot: cull 2.7 vs 0.37 (CBRO's own tests 1.5 of it, "cache reuse and bookkeeping" 1.37), pre-pass 1.4 vs 0.79 (GPU 1.9-2.1 vs 0.62), sun cascades 1.85 vs 1.37 (GPU 1.6 vs 1.16), forward 0.54 vs 0.38, rest 2.25 vs 3.3 (less waiting). The GPU timeline read every frame (no drops, no disjoint).
+- **F8 round trips restored real previs at the load spot every time (1,044 again within 3 s) but never at location 1 or 3** (3,270-3,286 for the rest of the stay; at location 3 one later interval read 2,337, probably while moving). Re-enable is a byte write; the re-apply evidently rides on cell attach events, which still happen in the first minute after a load and not while standing still later.
+- **CBRO mode after previs was applied and flushed is not the lean CBRO mode of v1.26.** Same spot, same Group::Add count (7,227 vs 7,234), but Block::Add 15,236 vs 6,128, ChildPush 8,087 vs 4,946, main-accumulator registrations 5,038 vs 2,025 ("dropped with their parent" 2,601 vs 146, "left out" 3,200 vs 157), cascades 5,012 vs 3,458. Kept in the main view: 1,838 vs 1,868, the same. So previs's application leaves ~9,000 extra entries per frame in the previs-off walk (the per-reference records it materializes), which the flush does not remove; CBRO hides nearly all of them but pays the per-object cost (bookkeeping 1.37 ms) and the cascades draw ~1,500 more casters. With bStartActive=1 (previs never applied) the scene stays lean, but then the F8 baseline is the crippled previs. With bStartActive=0 the baseline is real but CBRO mode carries the extra entries. Neither configuration gives a fair A/B without a working re-apply, and the re-apply function was not found (FO4-ENGINE-NOTES §5.5a).
+- **Bottom line for the design decision:** at both measured spots real previs draws half or less of what CBRO's occlusion leaves (1,045 vs 1,850 kept at the load spot), and previs's cull stage costs 0.4 ms against the previs-off traversal's 2-3 ms (engine ~1 ms + CBRO's per-object work). The lean v1.26 state at the load spot ran ~8.4 ms versus real previs 6.46: about 30% behind before any of the flush effects. Replacing previs cannot reach previs's frame time at these exteriors with this architecture; a hybrid (previs on, CBRO removing what previs leaves that is occluded per frame) would test ~1,000 objects a frame and could only be faster than previs, at the price of previs's known over-culling. That is the user's call (hybrid was rejected 2026-09-28 on correctness grounds).
+- Build flags: the user added /GL /fp:fast /Gw /Qpar and /LTCG (not yet built). Kept /GL, /LTCG, /Gw; removed /fp:fast (the tests depend on isfinite guards and infinity for sky) and /Qpar (OpenMP threads inside the engine's frame plus a vcomp140.dll dependency, nothing to gain).
