@@ -1,0 +1,93 @@
+#pragma once
+
+// The engine's previs fast path (OG 1.10.163; PREVIS-FEED-PLAN.md §2, FO4-ENGINE-NOTES §5.5b). With previs active,
+// DrawWorld's scene walk (1138818) skips the cell expansion and files the previs main list through the feed it calls
+// at walk+0x16A (997287: `Feed(group 2, group 1)`), and the sun's cascade cull (1390075) files the previs sun list
+// through the feed at +0x1B4 (1142692: `Feed(stack group)`), with previs suspended around it. CBRO wraps both call
+// sites: in frames CBRO owns, its own feed functions run instead; in every other frame the previous target runs
+// (the engine's feed, or another plugin's such as Addictol's). Also here: read-only accessors for the engine state the
+// policy (Core/Feed) decides by, the flush-free suspend switch, and EnumerateCandidates, the replica of what the
+// previs-off walk would file (the input a CBRO-owned feed judges). Nothing here decides anything.
+
+namespace CBRO::Hooks::PrevisFeed
+{
+	enum class Owner : std::uint8_t
+	{
+		kPrevis,  // the previous targets run (the engine's lists)
+		kCBRO,    // CBRO's feed functions run
+	};
+	using MainFeedFn = void (*)(void* a_group2, void* a_group1);
+	using SunFeedFn = void (*)(void* a_stackGroup);
+
+	// Wraps both sites (pass-through until an owner and feed functions are set). False, and Available() false, if a
+	// site isn't a `call rel32` (another plugin patched it): feed mode is then off for the session.
+	bool Install();
+	[[nodiscard]] bool Available() noexcept;
+	void SetOwner(Owner a_owner) noexcept;  // main thread, at the cull begin (both thunks run on the main thread)
+	void SetMainFeed(MainFeedFn a_fn) noexcept;
+	void SetSunFeed(SunFeedFn a_fn) noexcept;
+
+	struct FeedCalls
+	{
+		std::uint64_t mainPrevious{ 0 };  // main-site calls passed to the previous target
+		std::uint64_t mainCBRO{ 0 };      // ... served by CBRO's feed
+		std::uint64_t sunPrevious{ 0 };
+		std::uint64_t sunCBRO{ 0 };
+	};
+	[[nodiscard]] FeedCalls TakeFeedCalls() noexcept;
+
+	// The engine's previs state and the gates the fast path depends on (read under SEH; `readable` false = unknown).
+	struct Gates
+	{
+		bool          readable{ false };
+		bool          enabled{ false };       // BSPreCulledObjects enabled byte (493183)
+		bool          ini{ false };           // bUsePreCulledObjects (1472203)
+		bool          suspended{ false };     // suspended byte (718924)
+		bool          active{ false };        // enabled && ini && !suspended: what IsActive() returns
+		std::uint32_t gateA{ 0 };             // u32 scene root +0x14C: non-zero = the walk expands the cells even with previs active
+		std::uint16_t gateB{ 0 };             // u16 scene root +0x180: non-zero = DrawWorld's root loop runs even with previs active
+		bool          exterior{ false };      // the culler's exterior byte ([[culler+0x150]+0x138])
+		bool          overrideRoot{ false };  // the override-root global (127974) is set
+	};
+	[[nodiscard]] Gates ReadGates() noexcept;
+
+	// The engine's BSPreCulledObjects::SetSuspended(a_suspend, flush = false): never flushes (the flush is what breaks
+	// previs until the cells reload; see PLAN.md §7 "v1.28 runs"). Main thread, before DrawWorld's cull.
+	void SetSuspended(bool a_suspend) noexcept;
+
+	// A culling group's six frustum planes (NiPlane {n, d}, 16 bytes each, at group+0). False if unreadable.
+	[[nodiscard]] bool GroupPlanes(const void* a_group, float a_planes[6][4]) noexcept;
+
+	// Where the previs-off walk would have filed a candidate.
+	enum class Route : std::uint8_t
+	{
+		kGroup0,  // shadow casters (the sun's cascades read it with previs off)
+		kGroup1,  // non-casters (main view only)
+		kArray,   // a group-array slot (a root filed whole; main view only)
+	};
+	// Which rule of the walk (PREVIS-FEED-PLAN.md §2.6) produced it, for the audit.
+	enum class Site : std::uint8_t
+	{
+		kR1,       // scene root child 2's subtree (five fixed adds)
+		kR2,       // the world node's child 0
+		kR3b,      // a cell child that isn't a node, whole
+		kR3c,      // a cell's node 3: an exact-NiNode container's children
+		kR3d,      // a cell's node 3 or 9: any other grandchild, whole
+		kR3e,      // a cell's node 2: its children
+		kR4Whole,  // DrawWorld's root loop: a root filed whole
+		kR4Child,  // DrawWorld's root loop: a root's children
+		kCount
+	};
+	using Visitor = void (*)(void* a_context, RE::NiAVObject* a_object, Route a_route, Site a_site);
+
+	// Replica of the previs-off scene walk's exterior path (rules R1-R3) plus DrawWorld's root loop (R4), in the
+	// engine's order: every object the engine would offer to Group::Add, with its route. Enumeration only, nothing is
+	// filed and no engine flag is written. False when the walk isn't replicable (interior or override-root path, no
+	// world node, a faulting read): the caller falls back to the engine's own walk. Main thread.
+	[[nodiscard]] bool EnumerateCandidates(Visitor a_visit, void* a_context) noexcept;
+
+	// The replicated site a main-pass Group::Add return address belongs to, if any (for the audit).
+	[[nodiscard]] bool SiteOf(std::uintptr_t a_returnAddress, Site& a_out) noexcept;
+	[[nodiscard]] std::string_view SiteName(Site a_site) noexcept;
+	[[nodiscard]] std::string_view RouteName(Route a_route) noexcept;
+}

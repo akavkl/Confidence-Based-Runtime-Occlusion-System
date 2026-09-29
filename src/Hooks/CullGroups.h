@@ -177,6 +177,11 @@ namespace CBRO::Hooks::CullGroups
 	// Owner value shared by DrawWorld's culling groups (0 before DrawWorld initialized).
 	[[nodiscard]] std::uintptr_t MainOwner() noexcept;
 
+	// Files a_object into a_group through the engine's Group::Add (its gateway, inside the group scope so the
+	// Block::Add that follows knows the group), bypassing the group filter: for a caller that has already decided
+	// (Core/Feed). Main thread, while DrawWorld culls. False if Group::Add isn't hooked.
+	bool AddDirect(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags) noexcept;
+
 	// The sun's shadow cascades as the engine has them set up (main thread, once per culled frame: what ran is
 	// counted since the previous call). False if the engine's structures couldn't be read (then nothing about
 	// the sun is known).

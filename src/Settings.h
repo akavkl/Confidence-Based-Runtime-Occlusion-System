@@ -28,6 +28,8 @@ namespace CBRO
 		bool          lampShadowCulling{ true };   // leave casters out of point-light shadow maps where they can't shadow the view
 		bool          lampShadowVolumes{ true };   // ... also when their shadow volume misses every visible surface (nearest/farthest depth test)
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
+		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
+		std::uint32_t feedAuditInterval{ 600 };    // frames between audits of CBRO's scene-walk replica (0 = off)
 		bool          verdictCache{ true };        // reuse last frame's verdict while nothing it depended on changed
 		float         cacheMove{ 4.0f };           // camera movement (units) a reused verdict tolerates; bounds grow by it
 		float         cacheAngle{ 0.1f };          // camera turn (degrees) a reused verdict tolerates; bounds grow by depth x it

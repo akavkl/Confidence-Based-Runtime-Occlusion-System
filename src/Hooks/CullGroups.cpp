@@ -587,9 +587,11 @@ namespace CBRO::Hooks::CullGroups
 			if (current == a_target) {
 				return true;
 			}
+			// (write_call<5> makes the site call a jump stub in the trampoline that lands on the thunk; v1.28 compared the
+			// stub with the thunk itself, so the path always read as changed and the sun culling never ran)
 			using RenderStages::Stage;
 			const auto thunk = RenderStages::ThunkOf(Stage::kSunCascades);
-			return thunk != 0 && current == thunk && RenderStages::OriginalOf(Stage::kSunCascades) == a_target;
+			return thunk != 0 && Util::FollowJumps(current) == thunk && RenderStages::OriginalOf(Stage::kSunCascades) == a_target;
 		}
 
 		bool Intact(const std::array<CallSite, 2>& a_path) noexcept
@@ -826,6 +828,16 @@ namespace CBRO::Hooks::CullGroups
 	std::uint64_t TakeForcedCleared() noexcept
 	{
 		return g_forcedCleared.exchange(0);
+	}
+
+	bool AddDirect(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags) noexcept
+	{
+		if (!g_groupAddOriginal || !a_group || !a_object || !a_bound) {
+			return false;
+		}
+		GroupScope scope(a_group);  // (so the Block::Add that follows knows the group, as after a hooked Group::Add)
+		reinterpret_cast<GroupAddFn>(g_groupAddOriginal)(a_group, a_object, a_bound, a_flags);
+		return true;
 	}
 
 	std::uintptr_t MainOwner() noexcept

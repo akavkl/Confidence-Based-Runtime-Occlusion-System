@@ -14,6 +14,11 @@ namespace CBRO::Util
 	// Reads the target of the `call rel32` at a_src, or 0 if it isn't one.
 	[[nodiscard]] std::uintptr_t ReadCall5Target(std::uintptr_t a_src) noexcept;
 
+	// Follows `jmp rel32` / `jmp [rip+disp32]` chains from a_address (at most a_hops of them) and returns where they
+	// land; a_address itself when it isn't a jump. A `write_call<5>` makes a site call a jump stub in the trampoline
+	// that lands on the thunk: this resolves such a stub to the thunk.
+	[[nodiscard]] std::uintptr_t FollowJumps(std::uintptr_t a_address, int a_hops = 4) noexcept;
+
 	// Function-entry detour. a_prologue must be the exact leading bytes of a_src, made of whole,
 	// position-independent instructions totalling >= 5 bytes. They are verified (so an entry some
 	// other plugin already patched is left alone), relocated into a gateway, and replaced by a

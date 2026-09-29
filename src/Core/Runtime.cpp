@@ -1,9 +1,11 @@
 #include "Core/Runtime.h"
 
+#include "Core/Feed.h"
 #include "Core/HiZ.h"
 #include "Core/Occlusion.h"
 #include "Core/ShadowLights.h"
 #include "Hooks/CullGroups.h"
+#include "Hooks/PrevisFeed.h"
 #include "Hooks/RenderStages.h"
 #include "Settings.h"
 #include "Util/D3D.h"
@@ -941,15 +943,27 @@ namespace CBRO::Core::Runtime
 			++a_out.frames;
 		}
 
+		// Frame modes for the per-mode figures: 0 previs (CBRO off), 1 CBRO feed, 2 CBRO classic (Core/Feed's path).
+		constexpr std::size_t kModes = 3;
+		constexpr std::array  kModeNames{ "previs"sv, "CBRO feed"sv, "CBRO classic"sv };
+
+		int CurrentMode() noexcept
+		{
+			if (!Occlusion::Active()) {
+				return 0;
+			}
+			return Feed::Current() == Feed::Path::kFeed ? 1 : 2;
+		}
+
 		struct Timing
 		{
 			std::array<std::int64_t, kMarkCount> marks{};  // this frame's QPC marks (0 = not seen)
-			int                                  mode{ -1 };  // the frame's mode once its cull begin ran (0 previs, 1 CBRO)
+			int                                  mode{ -1 };  // the frame's mode once its cull begin ran (see kModeNames)
 			std::int64_t                         setupTicks{ 0 };
 			std::int64_t                         captureTicks{ 0 };
 			std::uint32_t                        cullFrames{ 0 };
 			std::uint32_t                        prepassFrames{ 0 };
-			std::array<ModeBuckets, 2>           cpu{};
+			std::array<ModeBuckets, kModes>      cpu{};
 		};
 		Timing g_timing;
 
@@ -1019,7 +1033,7 @@ namespace CBRO::Core::Runtime
 				}
 			}
 
-			std::array<ModeBuckets, 2> Take() noexcept
+			std::array<ModeBuckets, kModes> Take() noexcept
 			{
 				auto out = m_gpu;
 				m_gpu = {};
@@ -1102,7 +1116,7 @@ namespace CBRO::Core::Runtime
 						marks[i] = static_cast<double>(stamp) * 1000.0 / static_cast<double>(disjoint.Frequency);
 					}
 					if (ok && marks[0] > 0.0) {
-						FoldMarks(marks, m_gpu[static_cast<std::size_t>(frame.mode & 1)]);
+						FoldMarks(marks, m_gpu[static_cast<std::size_t>(std::clamp(frame.mode, 0, static_cast<int>(kModes) - 1))]);
 						++m_read;
 					} else {
 						++m_disjoint;
@@ -1114,7 +1128,7 @@ namespace CBRO::Core::Runtime
 			std::uint32_t              m_current{ 0 };
 			bool                       m_ready{ false };
 			bool                       m_failed{ false };
-			std::array<ModeBuckets, 2> m_gpu{};
+			std::array<ModeBuckets, kModes> m_gpu{};
 			std::uint64_t              m_read{ 0 };
 			std::uint64_t              m_dropped{ 0 };
 			std::uint64_t              m_disjoint{ 0 };
@@ -1145,8 +1159,8 @@ namespace CBRO::Core::Runtime
 			std::uint32_t       sinceSwitch{ 0 };
 			std::vector<float>  segment;       // settled frame times of the current segment
 			std::int64_t        segmentStart{ 0 };
-			std::array<ModeTime, 2> session{};  // settled frames at the current location
-			std::array<ModeTime, 2> still{};    // ... of which the camera was exactly where it was the frame before
+			std::array<ModeTime, kModes> session{};  // settled frames at the current location
+			std::array<ModeTime, kModes> still{};    // ... of which the camera was exactly where it was the frame before
 			RE::NiPoint3        anchor{};       // where the current location's comparison started
 			bool                anchored{ false };
 			std::uint32_t       location{ 0 };
@@ -1155,15 +1169,13 @@ namespace CBRO::Core::Runtime
 			double              intervalMax{ 0.0 };
 			std::uint32_t       intervalCount{ 0 };
 			ModeTime            intervalStill{};  // this interval's frames with the camera still (what a standing-still overlay shows)
-			std::array<ModeTime, 2> intervalMode{};  // this interval's frames by mode (hitches and menus left out)
+			std::array<ModeTime, kModes> intervalMode{};  // this interval's frames by mode (hitches and menus left out)
 			std::uint32_t       sinceLoad{ 0 };
 			RE::NiPoint3        lastPosition{};
 			float               lastRotate[3][3]{};
 			bool                lastCameraKnown{ false };
 		};
 		FrameClock g_frames;
-
-		constexpr std::array kModeNames{ "previs"sv, "CBRO"sv };
 
 		void CloseSegment(std::int64_t a_now)
 		{
@@ -1186,30 +1198,30 @@ namespace CBRO::Core::Runtime
 			samples.clear();
 		}
 
+		// Previs against each CBRO mode that has enough frames at this location.
 		void LogSessionAB()
 		{
-			const auto& previs = g_frames.session[0];
-			const auto& cbro = g_frames.session[1];
-			if (previs.count < 60 || cbro.count < 60) {
-				return;
-			}
-			const double previsMs = previs.sum / previs.count;
-			const double cbroMs = cbro.sum / cbro.count;
-			logger::info(
-				"A/B at location {} (settled frames): previs {:.2f} ms ({:.0f} fps, {} frames) | CBRO {:.2f} ms ({:.0f} fps, {} frames) | CBRO is {:.1f}% {}",
-				g_frames.location, previsMs, 1000.0 / previsMs, previs.count, cbroMs, 1000.0 / cbroMs, cbro.count,
-				std::abs(previsMs / cbroMs - 1.0) * 100.0, cbroMs <= previsMs ? "faster" : "slower");
+			const auto report = [](const std::array<ModeTime, kModes>& a_times, std::string_view a_what) {
+				const auto& previs = a_times[0];
+				if (previs.count < 60) {
+					return;
+				}
+				const double previsMs = previs.sum / previs.count;
+				for (std::size_t mode = 1; mode < kModes; ++mode) {
+					const auto& cbro = a_times[mode];
+					if (cbro.count < 60) {
+						continue;
+					}
+					const double cbroMs = cbro.sum / cbro.count;
+					logger::info(
+						"A/B at location {} ({}): previs {:.2f} ms ({:.0f} fps, {} frames) | {} {:.2f} ms ({:.0f} fps, {} frames) | {} is {:.1f}% {}",
+						g_frames.location, a_what, previsMs, 1000.0 / previsMs, previs.count, kModeNames[mode], cbroMs, 1000.0 / cbroMs, cbro.count,
+						kModeNames[mode], std::abs(previsMs / cbroMs - 1.0) * 100.0, cbroMs <= previsMs ? "faster" : "slower");
+				}
+			};
+			report(g_frames.session, "settled frames");
 			// Standing still only: the comparison the user makes with the overlay (movement changes both modes' load).
-			const auto& previsStill = g_frames.still[0];
-			const auto& cbroStill = g_frames.still[1];
-			if (previsStill.count >= 60 && cbroStill.count >= 60) {
-				const double p = previsStill.sum / previsStill.count;
-				const double c = cbroStill.sum / cbroStill.count;
-				logger::info(
-					"A/B at location {} (camera still): previs {:.2f} ms ({:.0f} fps, {} frames) | CBRO {:.2f} ms ({:.0f} fps, {} frames) | CBRO is {:.1f}% {}",
-					g_frames.location, p, 1000.0 / p, previsStill.count, c, 1000.0 / c, cbroStill.count,
-					std::abs(p / c - 1.0) * 100.0, c <= p ? "faster" : "slower");
-			}
+			report(g_frames.still, "camera still");
 		}
 
 		// A new place (load, fast travel, or walked away): close the comparison and start another.
@@ -1230,7 +1242,7 @@ namespace CBRO::Core::Runtime
 		void OnFrameBoundary()
 		{
 			const auto now = Qpc();
-			const int  mode = Occlusion::Active() ? 1 : 0;
+			const int  mode = CurrentMode();
 			if (mode != g_frames.mode) {
 				CloseSegment(now);
 				g_frames.mode = mode;
@@ -1324,16 +1336,20 @@ namespace CBRO::Core::Runtime
 				return a_time.count ? std::format("{:.2f} ms ({:.0f} fps) over {} frames", a_time.sum / a_time.count, 1000.0 * a_time.count / a_time.sum, a_time.count) : std::string("-");
 			};
 			logger::info(
-				"frame time (base, pre-pass to pre-pass): avg {:.2f} ms ({:.0f} fps), max {:.2f} ms over {} frames | by mode: previs {} / CBRO {} | camera still: {} | previs {}",
+				"frame time (base, pre-pass to pre-pass): avg {:.2f} ms ({:.0f} fps), max {:.2f} ms over {} frames | by mode: previs {} / CBRO feed {} / CBRO classic {} | camera still: {} | previs {}",
 				frameMs, 1000.0 / std::max(0.001, frameMs), g_frames.intervalMax, g_frames.intervalCount,
-				byMode(g_frames.intervalMode[0]), byMode(g_frames.intervalMode[1]),
+				byMode(g_frames.intervalMode[0]), byMode(g_frames.intervalMode[1]), byMode(g_frames.intervalMode[2]),
 				still.count ? std::format("{:.2f} ms ({:.0f} fps) over {} frames", stillMs, 1000.0 / std::max(0.001, stillMs), still.count) : std::string("no still frames"),
-				PrevisEnabled() ? "ACTIVE" : "OFF");
+				Feed::PrevisState());
 			g_frames.intervalStill = {};
 			g_frames.intervalMode = {};
-			logger::info("CPU per frame by mode (ms, main thread, between the render-stage hooks): previs: {} || CBRO: {}", g_timing.cpu[0].Describe(), g_timing.cpu[1].Describe());
+			logger::info(
+				"CPU per frame by mode (ms, main thread, between the render-stage hooks): previs: {} || CBRO feed: {} || CBRO classic: {}",
+				g_timing.cpu[0].Describe(), g_timing.cpu[1].Describe(), g_timing.cpu[2].Describe());
 			const auto gpu = g_gpu.Take();
-			logger::info("GPU per frame by mode (ms, timestamp spans, idle between marks included): previs: {} || CBRO: {} || {}", gpu[0].Describe(), gpu[1].Describe(), g_gpu.Status());
+			logger::info(
+				"GPU per frame by mode (ms, timestamp spans, idle between marks included): previs: {} || CBRO feed: {} || CBRO classic: {} || {}",
+				gpu[0].Describe(), gpu[1].Describe(), gpu[2].Describe(), g_gpu.Status());
 			const auto calls = Hooks::CullGroups::TakeHookCalls();
 			const auto flags = Hooks::CullGroups::ReadEngineFlags();
 			logger::info(
@@ -1342,9 +1358,9 @@ namespace CBRO::Core::Runtime
 				calls.blockAdds / intervalFrames, calls.groupAdds / intervalFrames, calls.childPushes / intervalFrames, calls.registrations / intervalFrames,
 				flags.cullingBatch ? 1 : 0, flags.dirShadows ? "on" : "off");
 			logger::info(
-				"registrations per frame by accumulator (which views register how much): previs: {} || CBRO: {}",
+				"registrations per frame by accumulator (which views register how much): previs: {} || CBRO (feed and classic together): {}",
 				Hooks::CullGroups::TakeRegistrationSites(false, std::max(1u, g_timing.cpu[0].frames)),
-				Hooks::CullGroups::TakeRegistrationSites(true, std::max(1u, g_timing.cpu[1].frames)));
+				Hooks::CullGroups::TakeRegistrationSites(true, std::max(1u, g_timing.cpu[1].frames + g_timing.cpu[2].frames)));
 			g_frames.intervalSum = 0.0;
 			g_frames.intervalMax = 0.0;
 			g_frames.intervalCount = 0;
@@ -1352,7 +1368,7 @@ namespace CBRO::Core::Runtime
 
 			const double cullFrames = std::max(1u, g_timing.cullFrames);
 			const double prepassFrames = std::max(1u, g_timing.prepassFrames);
-			const double cbroFrames = std::max(1u, g_timing.cpu[1].frames);  // (the tests only run in CBRO mode)
+			const double cbroFrames = std::max(1u, g_timing.cpu[1].frames + g_timing.cpu[2].frames);  // (the tests only run in CBRO mode)
 			const auto tests = Occlusion::TakeTestMilliseconds();
 			logger::info(
 				"cost per frame (ms): CBRO setup {:.3f} | CBRO depth capture {:.3f} | CBRO object tests per CBRO-mode frame {:.3f} CPU on all threads, {:.3f} of it on the main thread: view evaluations {:.3f} (of which mesh shapes {:.3f}), sun evaluations {:.3f}, cache reuse and bookkeeping {:.3f}",
@@ -1425,14 +1441,17 @@ namespace CBRO::Core::Runtime
 				effective ? "CBRO occlusion" : a_active ? "previs (CBRO requested but unavailable)" : "previs (CBRO off)", a_reason);
 			if (static_cast<int>(effective) != g_state.notifiedEffective) {
 				g_state.notifiedEffective = effective;
-				if (settings.disablePrevis) {
+				if (Feed::ManagesPrevis()) {
+					Notify(effective ? "CBRO on - previs suspended (not flushed)" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
+				} else if (settings.disablePrevis) {
 					Notify(effective ? "CBRO on - previs off" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
 				} else {
 					Notify(effective ? "CBRO on - working with previs" : a_active ? "CBRO unavailable - previs only" : "CBRO off - previs only");
 				}
 			}
 
-			if (!settings.disablePrevis) {
+			// With bPrevisFeed=1 previs is never switched off (Core/Feed suspends it without a flush at the cull begin).
+			if (!settings.disablePrevis || Feed::ManagesPrevis()) {
 				return;
 			}
 			// The switch itself runs at the next cull begin (ApplyPrevisRequest): main thread, before DrawWorld's
@@ -1531,8 +1550,9 @@ namespace CBRO::Core::Runtime
 				Notify(std::string(kNames[g_state.diagnostic]));
 			}
 			ApplyPrevisRequest();
-			// Previs switched outside CBRO (console `tpc`): follow it, so the two stay inverse.
-			if (settings.disablePrevis && g_state.expectedPrevis >= 0 && g_state.previsRequest.load() < 0) {
+			// Previs switched outside CBRO (console `tpc`): follow it, so the two stay inverse. (Not with bPrevisFeed=1:
+			// there CBRO never owns the enabled byte; Core/Feed only notes that previs is inactive.)
+			if (settings.disablePrevis && !Feed::ManagesPrevis() && g_state.expectedPrevis >= 0 && g_state.previsRequest.load() < 0) {
 				const int actual = PrevisEnabled() ? 1 : 0;
 				if (actual != g_state.expectedPrevis) {
 					g_state.expectedPrevis = actual;
@@ -1543,6 +1563,8 @@ namespace CBRO::Core::Runtime
 				g_state.failureHandled = true;
 				ApplyMode(g_state.wantActive, "hi-z unavailable");
 			}
+			// The frame's path (previs / CBRO classic / CBRO feed) and the previs suspension, before the hooks follow.
+			Feed::BeginFrame(Occlusion::Active(), g_state.clock + 1);
 			SyncHooks();
 
 			TrackStillness();
@@ -1633,6 +1655,7 @@ namespace CBRO::Core::Runtime
 				Occlusion::LogStats(g_state.framesSinceLog);
 				LogSun();
 				ShadowLights::LogStats(g_state.framesSinceLog);
+				Feed::LogStats(g_state.framesSinceLog);
 				LogTiming();
 				g_state.framesSinceLog = 0;
 			}
@@ -1692,8 +1715,8 @@ namespace CBRO::Core::Runtime
 					OnCullBegin();
 					g_timing.setupTicks += Qpc() - now;
 					++g_timing.cullFrames;
-					g_timing.mode = Occlusion::Active() ? 1 : 0;  // (OnCullBegin may have switched it)
-					Hooks::CullGroups::SetRegistrationMode(g_timing.mode == 1);
+					g_timing.mode = CurrentMode();  // (OnCullBegin may have switched it)
+					Hooks::CullGroups::SetRegistrationMode(g_timing.mode != 0);
 					g_gpu.FrameBegin(g_timing.mode);
 					// DrawWorld's cull registers the main view's objects (and waits for its jobs) inside this
 					// stage: only then may the main accumulator's registrations be filtered. On a frame CBRO
@@ -1725,6 +1748,7 @@ namespace CBRO::Core::Runtime
 				case Stage::kCull:
 					Hooks::CullGroups::SetMainCullActive(false);
 					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations);
+					Feed::EndCull();  // (closes an audit frame: DrawWorld's cull and its jobs are done)
 					g_timing.marks[1] = Qpc();
 					g_gpu.Mark(1);
 					break;
@@ -1773,6 +1797,8 @@ namespace CBRO::Core::Runtime
 
 		Occlusion::Install();
 		ShadowLights::Install();
+		Hooks::PrevisFeed::Install();  // (pass-through wrappers on the engine's two previs feed sites, plus the accessors)
+		Feed::Install();
 		Hooks::RenderStages::AddListener(&g_listener);
 		g_state.installed = true;
 		g_state.wantActive = settings.startActive;
@@ -1789,6 +1815,7 @@ namespace CBRO::Core::Runtime
 		}
 		HiZ::Reset();
 		ResetAB();
+		Feed::OnGameLoaded();
 		ApplyMode(g_state.wantActive, "game loaded");
 	}
 }

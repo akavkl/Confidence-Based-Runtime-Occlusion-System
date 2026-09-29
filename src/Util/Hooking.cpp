@@ -81,6 +81,19 @@ namespace CBRO::Util
 		return result;
 	}
 
+	std::uintptr_t FollowJumps(std::uintptr_t a_address, int a_hops) noexcept
+	{
+		auto current = a_address;
+		for (int hop = 0; hop < a_hops && current; ++hop) {
+			const auto next = FollowJump(current);
+			if (!next || next == current) {
+				break;
+			}
+			current = next;
+		}
+		return current;
+	}
+
 	std::uintptr_t ReadCall5Target(std::uintptr_t a_src) noexcept
 	{
 		if (!IsReadable(a_src, 5)) {

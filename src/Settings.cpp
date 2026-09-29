@@ -68,6 +68,8 @@ namespace CBRO
 		lampShadowCulling = ReadBool(path, L"Occlusion", L"bLampShadowCulling", lampShadowCulling);
 		lampShadowVolumes = ReadBool(path, L"Occlusion", L"bLampShadowVolumes", lampShadowVolumes);
 		cellNodePruning = ReadBool(path, L"Occlusion", L"bCellNodePruning", cellNodePruning);
+		previsFeed = ReadBool(path, L"Occlusion", L"bPrevisFeed", previsFeed);
+		feedAuditInterval = ReadUInt(path, L"Occlusion", L"iFeedAuditInterval", feedAuditInterval);
 		verdictCache = ReadBool(path, L"Occlusion", L"bVerdictCache", verdictCache);
 		cacheMove = std::clamp(ReadFloat(path, L"Occlusion", L"fCacheMove", cacheMove), 0.5f, 64.0f);
 		cacheAngle = std::clamp(ReadFloat(path, L"Occlusion", L"fCacheAngle", cacheAngle), 0.01f, 2.0f);
@@ -91,8 +93,8 @@ namespace CBRO
 
 		logger::info("settings: {} ({})", path.string(), exists ? "found" : "missing, using defaults");
 		logger::info(
-			"settings: occlusion={} disablePrevis={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} meshShapes={} sunShadowCulling={} lampShadowCulling={} cellNodePruning={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
-			occlusion, disablePrevis, startActive, observeOnly, toggleHotkey, statusHotkey, notify, hiZDownsample, hiZTemporalFrames, confirmFrames, maxSnapshotAge,
+			"settings: occlusion={} disablePrevis={} previsFeed={} feedAuditInterval={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} meshShapes={} sunShadowCulling={} lampShadowCulling={} cellNodePruning={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
+			occlusion, disablePrevis, previsFeed, feedAuditInterval, startActive, observeOnly, toggleHotkey, statusHotkey, notify, hiZDownsample, hiZTemporalFrames, confirmFrames, maxSnapshotAge,
 			maxCameraMove, maxCameraAngle, nearDistance, cullActors, meshShapes, sunShadowCulling, lampShadowCulling, cellNodePruning, depthTolerance, depthSlack,
 			worldDepthMin, worldDepthMax);
 		logger::info(
