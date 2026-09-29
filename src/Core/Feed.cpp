@@ -24,8 +24,8 @@ namespace CBRO::Core::Feed
 		bool          g_enabled{ false };   // bPrevisFeed
 		std::uint32_t g_auditInterval{ 0 };
 		Path          g_path{ Path::kPrevis };
-		bool          g_weSuspended{ false };  // CBRO holds previs suspended
-		bool          g_suspendLogged{ false };
+		bool          g_cbroFrame{ false };    // the last cull begin was a CBRO frame (previs suspended inside the windows)
+		bool          g_windowLogged{ false };
 		std::uintptr_t g_group0{ 0 };
 		std::uintptr_t g_group1{ 0 };
 		std::uintptr_t g_groupArray{ 0 };
@@ -34,11 +34,11 @@ namespace CBRO::Core::Feed
 		struct Stats
 		{
 			std::uint32_t previs{ 0 };
-			std::uint32_t classicSuspended{ 0 };   // classic frames with previs suspended by CBRO
+			std::uint32_t classicSuspended{ 0 };   // classic frames with previs suspended by CBRO inside the windows
 			std::uint32_t classicInactive{ 0 };    // classic frames with previs already inactive (INI off, tpc, workshop)
 			std::uint32_t classicLegacy{ 0 };      // classic frames with bPrevisFeed=0 (Runtime's switch)
 			std::uint32_t feed{ 0 };
-			std::uint32_t reSuspended{ 0 };        // the engine unsuspended previs while CBRO held it (workshop exit); re-suspended
+			std::uint32_t switchFrames{ 0 };       // frames whose cull window was still the previous mode's (a switch)
 			std::uint32_t gateA{ 0 };
 			std::uint32_t gateB{ 0 };
 			std::uint32_t interior{ 0 };           // not the exterior path, or an override root
@@ -250,7 +250,7 @@ namespace CBRO::Core::Feed
 		g_offered.reserve(16384);
 		logger::info(
 			"previs feed: {}; audit every {} frames",
-			g_enabled ? "previs is never switched off: suspended (without flush) while CBRO is on" : "off (bPrevisFeed=0: v1.28 previs switching)",
+			g_enabled ? "previs is never switched off: in CBRO frames it is suspended (without flush) only inside the cull and cascade windows" : "off (bPrevisFeed=0: v1.28 previs switching)",
 			g_auditInterval);
 	}
 
@@ -284,37 +284,47 @@ namespace CBRO::Core::Feed
 		Hooks::PrevisFeed::SetOwner(Hooks::PrevisFeed::Owner::kPrevis);  // (feed mode: plan phase 3)
 
 		if (!a_cbroMode) {
-			if (g_weSuspended) {
-				if (gates.readable && gates.suspended) {
-					Hooks::PrevisFeed::SetSuspended(false);
-				}
-				g_weSuspended = false;
-				logger::info("previs feed: previs released (CBRO off): full-strength previs, nothing was flushed");
+			// CBRO off: nothing of previs is touched from the next pre-cull on. A cull window the pre-cull wrapper already
+			// opened this frame (a switch frame) stays open until the cull's end: this one frame's walk is previs-off with
+			// CBRO's hooks out (frustum-only, nothing hidden), rather than releasing mid-frame with the engine's pre-cull
+			// helper already run.
+			Hooks::PrevisFeed::SetWindow(false);
+			if (Hooks::PrevisFeed::Held()) {
+				++g_stats.switchFrames;
+			}
+			if (g_cbroFrame) {
+				g_cbroFrame = false;
+				logger::info("previs feed: CBRO off: previs runs untouched from the next frame on (it was never switched off or flushed; full-strength previs)");
 			}
 			g_path = Path::kPrevis;
 			++g_stats.previs;
 			return g_path;
 		}
 
-		// CBRO on: the classic path with previs suspended, never switched off.
+		// CBRO on: the classic path. Previs is suspended (never switched off) only inside the two windows: from
+		// Render_PreUI+0x157 to the cull stage's end, and around the cascade cull. The pre-cull wrapper opened this
+		// frame's window if the previous frame was a CBRO frame; on a switch frame (or without the wrapper) it opens here.
 		if (gates.readable && gates.enabled && gates.ini) {
-			if (!gates.suspended) {
-				if (g_weSuspended) {
-					++g_stats.reSuspended;  // the engine unsuspended it (workshop mode exit): hold it again
-				}
-				Hooks::PrevisFeed::SetSuspended(true);
-				g_weSuspended = true;
-				if (!g_suspendLogged) {
-					g_suspendLogged = true;
-					logger::info("previs feed: previs suspended without flush (CBRO on, classic path: the engine walks the scene as with previs off)");
+			Hooks::PrevisFeed::SetWindow(true);
+			if (!Hooks::PrevisFeed::Held()) {
+				Hooks::PrevisFeed::HoldNow();
+				if (g_cbroFrame) {
+					++g_stats.switchFrames;  // (held state lost mid-run: counted so it shows)
 				}
 			}
+			if (!g_windowLogged) {
+				g_windowLogged = true;
+				logger::info(
+					"previs feed: CBRO on: previs suspended without flush inside the cull window (Render_PreUI+0x157 to the cull's end) and the cascade window (1108521+0xE49) of every CBRO frame; active for the rest of the frame{}",
+					Hooks::PrevisFeed::WindowsAvailable() ? "" : " (a window wrapper is missing: see the install lines)");
+			}
+			g_cbroFrame = true;
 			++g_stats.classicSuspended;
 		} else {
-			++g_stats.classicInactive;  // already inactive for another reason (INI, tpc, unreadable): nothing to do
-			if (g_weSuspended && gates.readable && !gates.suspended) {
-				g_weSuspended = false;  // (someone re-enabled / cleared it: not ours any more)
-			}
+			// Already inactive for another reason (INI, tpc, the engine's own suspension) or unreadable: no window needed.
+			Hooks::PrevisFeed::SetWindow(false);
+			g_cbroFrame = false;
+			++g_stats.classicInactive;
 		}
 		g_path = Path::kClassic;
 
@@ -326,6 +336,7 @@ namespace CBRO::Core::Feed
 
 	void EndCull()
 	{
+		Hooks::PrevisFeed::ReleaseWindow();  // the cull window closes: previs active again for the rest of the frame
 		if (g_auditing.load(std::memory_order_acquire)) {
 			FinishAudit();
 		}
@@ -357,10 +368,10 @@ namespace CBRO::Core::Feed
 			return "unknown"sv;
 		}
 		if (gates.active) {
-			return "ACTIVE"sv;
+			return g_cbroFrame ? "ACTIVE outside CBRO's cull windows"sv : "ACTIVE"sv;
 		}
-		if (gates.suspended && g_weSuspended) {
-			return "suspended by CBRO"sv;
+		if (gates.suspended && Hooks::PrevisFeed::Held()) {
+			return "suspended by CBRO (cull window open)"sv;
 		}
 		return gates.enabled && gates.ini ? "suspended by the engine"sv : "OFF"sv;
 	}
@@ -374,11 +385,13 @@ namespace CBRO::Core::Feed
 	{
 		(void)a_frames;
 		const auto calls = Hooks::PrevisFeed::TakeFeedCalls();
+		const auto windows = Hooks::PrevisFeed::TakeWindowCounts();
 		const auto gates = Hooks::PrevisFeed::ReadGates();
 		logger::info(
-			"previs feed paths this interval: previs {} | CBRO classic {} (previs suspended by CBRO {}, already inactive {}, legacy switch {}) | CBRO feed {} | re-suspended after the engine released it {} || gates: A non-zero {} frames, B non-zero {}, interior/override {}, unreadable {} | now: enabled {} ini {} suspended {} A {} B {} exterior {} || feed sites: main previous {} / CBRO {}, sun previous {} / CBRO {}",
+			"previs feed paths this interval: previs {} | CBRO classic {} (previs suspended inside CBRO's windows {}, already inactive {}, legacy switch {}) | CBRO feed {} | windows: cull {} (opened at the cull begin {}), cascade {}, switch frames {} || gates: A non-zero {} frames, B non-zero {}, interior/override {}, unreadable {} | now: enabled {} ini {} suspended {} A {} B {} exterior {} || feed sites: main previous {} / CBRO {}, sun previous {} / CBRO {}",
 			g_stats.previs, g_stats.classicSuspended + g_stats.classicInactive + g_stats.classicLegacy, g_stats.classicSuspended, g_stats.classicInactive, g_stats.classicLegacy,
-			g_stats.feed, g_stats.reSuspended, g_stats.gateA, g_stats.gateB, g_stats.interior, g_stats.unreadable,
+			g_stats.feed, windows.preCull + windows.cullBegin, windows.cullBegin, windows.cascade, g_stats.switchFrames,
+			g_stats.gateA, g_stats.gateB, g_stats.interior, g_stats.unreadable,
 			gates.enabled, gates.ini, gates.suspended, gates.gateA, gates.gateB, gates.exterior,
 			calls.mainPrevious, calls.mainCBRO, calls.sunPrevious, calls.sunCBRO);
 		if (g_auditInterval) {

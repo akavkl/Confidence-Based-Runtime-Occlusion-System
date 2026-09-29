@@ -51,9 +51,30 @@ namespace CBRO::Hooks::PrevisFeed
 	};
 	[[nodiscard]] Gates ReadGates() noexcept;
 
-	// The engine's BSPreCulledObjects::SetSuspended(a_suspend, flush = false): never flushes (the flush is what breaks
-	// previs until the cells reload; see PLAN.md §7 "v1.28 runs"). Main thread, before DrawWorld's cull.
+	// The engine's BSPreCulledObjects::SetSuspended(a_suspend, flush = false): a byte write, never a flush (the flush
+	// is what breaks previs until the cells reload; see PLAN.md §7 "v1.28 runs"). Main thread.
 	void SetSuspended(bool a_suspend) noexcept;
+
+	// The suspension windows (FO4-ENGINE-NOTES 5.5c): in a CBRO frame previs is suspended only from Render_PreUI+0x157's
+	// return to the cull stage's end (the walk, DrawWorld's cull and its jobs: the engine's previs-off flow, helper
+	// included) and around the cascade cull (1108521+0xE49: the group-0 path). Everything else in the frame (the
+	// previs query, the lamps, the third view, cell loads, the game's update) sees previs active, as vanilla. Both
+	// wrappers are pass-through when the frame isn't a CBRO frame. Main thread.
+	[[nodiscard]] bool WindowsAvailable() noexcept;  // both sites wrapped
+	void SetWindow(bool a_cbroFrame) noexcept;       // at the cull begin: this frame's cascade window and the next frame's pre-cull window
+	[[nodiscard]] bool Held() noexcept;              // the cull window is open (the pre-cull wrapper or HoldNow opened it)
+	void HoldNow() noexcept;                         // at the cull begin, when the pre-cull wrapper didn't open it (a switch frame): opens it and runs the engine's pre-cull helper
+	void ReleaseWindow() noexcept;                   // at the cull stage's end: closes it (the engine's own byte restored)
+	struct WindowCounts
+	{
+		std::uint32_t preCull{ 0 };    // cull windows opened by the pre-cull wrapper
+		std::uint32_t cullBegin{ 0 };  // ... opened at the cull begin instead (switch frames, or no pre-cull wrapper)
+		std::uint32_t cascade{ 0 };    // cascade windows
+	};
+	[[nodiscard]] WindowCounts TakeWindowCounts() noexcept;
+	// For CullGroups' sun-path check: the cascade site calls CBRO's wrapper, which chains to this previous target.
+	[[nodiscard]] std::uintptr_t CascadeCullThunkAddress() noexcept;
+	[[nodiscard]] std::uintptr_t CascadeCullPrevious() noexcept;
 
 	// A culling group's six frustum planes (NiPlane {n, d}, 16 bytes each, at group+0). False if unreadable.
 	[[nodiscard]] bool GroupPlanes(const void* a_group, float a_planes[6][4]) noexcept;

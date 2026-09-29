@@ -1444,7 +1444,7 @@ namespace CBRO::Core::Runtime
 			if (static_cast<int>(effective) != g_state.notifiedEffective) {
 				g_state.notifiedEffective = effective;
 				if (Feed::ManagesPrevis()) {
-					Notify(effective ? "CBRO on - previs suspended (not flushed)" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
+					Notify(effective ? "CBRO on - previs suspended only inside CBRO's cull windows" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
 				} else if (settings.disablePrevis) {
 					Notify(effective ? "CBRO on - previs off" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
 				} else {

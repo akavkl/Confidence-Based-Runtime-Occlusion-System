@@ -1,5 +1,6 @@
 #include "Hooks/CullGroups.h"
 
+#include "Hooks/PrevisFeed.h"
 #include "Hooks/RenderStages.h"
 #include "Settings.h"
 #include "Util/Hooking.h"
@@ -591,8 +592,14 @@ namespace CBRO::Hooks::CullGroups
 			// (write_call<5> makes the site call a jump stub in the trampoline that lands on the thunk; v1.28 compared the
 			// stub with the thunk itself, so the path always read as changed and the sun culling never ran)
 			using RenderStages::Stage;
+			const auto landing = Util::FollowJumps(current);
 			const auto thunk = RenderStages::ThunkOf(Stage::kSunCascades);
-			return thunk != 0 && Util::FollowJumps(current) == thunk && RenderStages::OriginalOf(Stage::kSunCascades) == a_target;
+			if (thunk != 0 && landing == thunk && RenderStages::OriginalOf(Stage::kSunCascades) == a_target) {
+				return true;
+			}
+			// Likewise CBRO's cascade-window wrapper on 1108521+0xE49 (Hooks/PrevisFeed), chained to the engine's cull.
+			const auto window = PrevisFeed::CascadeCullThunkAddress();
+			return window != 0 && landing == window && PrevisFeed::CascadeCullPrevious() == a_target;
 		}
 
 		bool Intact(const std::array<CallSite, 2>& a_path) noexcept

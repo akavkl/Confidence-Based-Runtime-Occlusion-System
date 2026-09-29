@@ -26,6 +26,22 @@ namespace CBRO::Hooks::PrevisFeed
 		constexpr std::uint64_t kSetSuspendedID = 1263609;   // void(bool suspend, bool flush)
 		constexpr std::uint64_t kNiNodeRttiID = 191219;      // NiNode's NiRTTI (the walk expands exact NiNodes only)
 
+		// ---- the suspension windows (FO4-ENGINE-NOTES 5.5c) ----------------------------------------------------------
+		// Render_PreUI (984743): +0x80 the previs query (if IsActive()); +0x157 `call 322222`; +0x15C `if (!IsActive())
+		// call 102390` (the per-frame pre-cull helper the walk itself calls when previs is active); +0x16A DrawWorld's
+		// cull (RenderStages' cull stage). Suspending inside the +0x157 call's wrapper, after the engine's routine ran,
+		// gives the engine's exact previs-off flow from +0x15C to the cull's end: the helper, the walk's expansion and
+		// DrawWorld's own root loop and group processing, all as with previs disabled. The unbatched shadow stage
+		// (1108521) calls the cascade cull (1390075) at +0xE49 with group 0: suspended around that call alone, the
+		// cascades read group 0 (CBRO's sun verdicts apply) while the lamps in the same stage, the previs query, the
+		// third view and cell loads see previs active, as vanilla.
+		constexpr std::uint64_t kRenderPreUIID = 984743;
+		constexpr std::size_t   kPreCullSiteOffset = 0x157;
+		constexpr std::uint64_t kPreCullTargetID = 322222;
+		constexpr std::uint64_t kPreCullHelperID = 102390;    // void(): what Render_PreUI+0x165 calls when previs is inactive
+		constexpr std::uint64_t kUnbatchedStageID = 1108521;
+		constexpr std::size_t   kCascadeCullSiteOffset = 0xE49;  // 1108521: call 1390075 (kCascadeCullID)
+
 		// ---- layouts (OG; RE::NiAVObject: worldBound +0xB0, flags +0x108; RE::NiNode::children is a NiTObjectArray at
 		// +0x120: data +8, u16 count +0x12; NiObject vtable: 2 GetRTTI, 4 IsNode, 6 IsFadeNode) -------------------------
 		constexpr std::size_t kWorldBound = 0xB0;
@@ -74,6 +90,20 @@ namespace CBRO::Hooks::PrevisFeed
 		FeedSite g_mainSite;
 		FeedSite g_sunSite;
 		bool     g_available{ false };
+		FeedSite g_preCullSite;   // Render_PreUI+0x157: the cull window opens after its call
+		FeedSite g_cascadeSite;   // 1108521+0xE49: the cascade window is that call
+		bool     g_windowsAvailable{ false };
+
+		// The windows (main thread only: Render_PreUI's thread). `g_window` is the policy's word for the frame ("a CBRO
+		// frame: suspend inside the windows"), set at the cull begin and read by the cascade wrapper later that frame
+		// and by the pre-cull wrapper of the next frame (before that frame's cull begin). `g_held` is the cull window
+		// being open; `g_savedByte` what the engine had in the suspended byte when it opened (restored on close, so an
+		// engine-side suspension is left as found).
+		std::atomic<bool> g_window{ false };
+		bool              g_held{ false };
+		std::uint8_t      g_savedByte{ 0 };
+		std::uintptr_t    g_preCullHelper{ 0 };
+		WindowCounts      g_windowCounts{};
 
 		std::atomic<Owner>         g_owner{ Owner::kPrevis };
 		std::atomic<MainFeedFn>    g_mainFn{ nullptr };
@@ -119,6 +149,68 @@ namespace CBRO::Hooks::PrevisFeed
 			}
 			g_calls[2].fetch_add(1, std::memory_order_relaxed);
 			return reinterpret_cast<PassFn>(g_sunSite.previous)(a1, a2, a3, a4);
+		}
+
+		// ---- the windows' wrappers -----------------------------------------------------------------------------------
+		void WriteSuspended(bool a_suspend) noexcept
+		{
+			if (g_setSuspended) {
+				using Fn = void (*)(bool, bool);
+				reinterpret_cast<Fn>(g_setSuspended)(a_suspend, false);  // (a byte write: 5.5c)
+			}
+		}
+
+		std::uint8_t ReadSuspendedByte() noexcept
+		{
+			__try {
+				return g_suspended ? *reinterpret_cast<const std::uint8_t*>(g_suspended) : std::uint8_t{ 0 };
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		// Opens the cull window: previs suspended until ReleaseWindow (the cull stage's end), the engine's own state
+		// remembered. No-op while open.
+		void OpenWindow() noexcept
+		{
+			if (g_held) {
+				return;
+			}
+			g_savedByte = ReadSuspendedByte();
+			if (!g_savedByte) {
+				WriteSuspended(true);
+			}
+			g_held = true;
+		}
+
+		// Render_PreUI+0x157: the engine's routine first (previs active for it, as vanilla), then, in a CBRO frame, the
+		// cull window opens so that +0x15C's IsActive() is false and Render_PreUI itself runs the pre-cull helper.
+		std::uintptr_t PreCullThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
+		{
+			const auto result = reinterpret_cast<PassFn>(g_preCullSite.previous)(a1, a2, a3, a4);
+			if (g_window.load(std::memory_order_relaxed)) {
+				OpenWindow();
+				++g_windowCounts.preCull;
+			}
+			return result;
+		}
+
+		// 1108521+0xE49: the cascade cull with previs suspended around it (a CBRO frame), so it takes its group-0 path.
+		std::uintptr_t CascadeCullThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
+		{
+			if (!g_window.load(std::memory_order_relaxed)) {
+				return reinterpret_cast<PassFn>(g_cascadeSite.previous)(a1, a2, a3, a4);
+			}
+			const auto saved = ReadSuspendedByte();
+			if (!saved) {
+				WriteSuspended(true);
+			}
+			++g_windowCounts.cascade;
+			const auto result = reinterpret_cast<PassFn>(g_cascadeSite.previous)(a1, a2, a3, a4);
+			if (!saved) {
+				WriteSuspended(false);
+			}
+			return result;
 		}
 
 		bool InstallSite(FeedSite& a_site, std::uint64_t a_functionID, std::size_t a_offset, std::uint64_t a_feedID, std::uintptr_t a_thunk, const char* a_name)
@@ -353,7 +445,76 @@ namespace CBRO::Hooks::PrevisFeed
 		const bool sun = InstallSite(g_sunSite, kCascadeCullID, kSunFeedSiteOffset, kSunFeedID, Util::FnAddr(&SunFeedThunk), "previsfeed:sun feed");
 		g_available = main && sun;
 		logger::info("previs feed: wrappers {} (owner: previs; pass-through)", g_available ? "installed on both sites" : "incomplete: feed mode unavailable this session");
+
+		// The windows: the pre-cull wrapper is what makes a CBRO frame a previs-off frame for the cull; without it CBRO
+		// falls back to suspending at the cull begin (the cull-begin hold below, which skips the engine's pre-cull
+		// helper for that frame). The cascade wrapper is the sun culling's window; without it the cascades take their
+		// previs path and CBRO's sun verdicts have no reader (CullGroups then reports the path as changed).
+		g_preCullHelper = CBRO::Engine::OG(kPreCullHelperID).address();
+		const bool preCull = InstallSite(g_preCullSite, kRenderPreUIID, kPreCullSiteOffset, kPreCullTargetID, Util::FnAddr(&PreCullThunk), "previsfeed:pre-cull window");
+		const bool cascade = InstallSite(g_cascadeSite, kUnbatchedStageID, kCascadeCullSiteOffset, kCascadeCullID, Util::FnAddr(&CascadeCullThunk), "previsfeed:cascade window");
+		g_windowsAvailable = preCull && cascade;
+		logger::info(
+			"previs feed: suspension windows {} (pre-cull {}, cascade cull {}); previs is suspended only inside them in CBRO frames",
+			g_windowsAvailable ? "installed" : "INCOMPLETE", preCull ? "wrapped" : "NOT wrapped: cull-begin hold instead", cascade ? "wrapped" : "NOT wrapped: no sun-shadow culling");
 		return g_available;
+	}
+
+	bool WindowsAvailable() noexcept
+	{
+		return g_windowsAvailable;
+	}
+
+	void SetWindow(bool a_cbroFrame) noexcept
+	{
+		g_window.store(a_cbroFrame, std::memory_order_relaxed);
+	}
+
+	bool Held() noexcept
+	{
+		return g_held;
+	}
+
+	void HoldNow() noexcept
+	{
+		if (g_held) {
+			return;
+		}
+		OpenWindow();
+		++g_windowCounts.cullBegin;
+		// Render_PreUI saw previs active at +0x15C and left the pre-cull helper to the walk, which will now run
+		// previs-off and not call it either: run it here, as +0x165 would have (no arguments; globals only).
+		if (g_preCullHelper) {
+			reinterpret_cast<void (*)()>(g_preCullHelper)();
+		}
+	}
+
+	void ReleaseWindow() noexcept
+	{
+		if (!g_held) {
+			return;
+		}
+		if (!g_savedByte) {
+			WriteSuspended(false);
+		}
+		g_held = false;
+	}
+
+	WindowCounts TakeWindowCounts() noexcept
+	{
+		const auto counts = g_windowCounts;
+		g_windowCounts = {};
+		return counts;
+	}
+
+	std::uintptr_t CascadeCullThunkAddress() noexcept
+	{
+		return g_cascadeSite.ok ? Util::FnAddr(&CascadeCullThunk) : 0;
+	}
+
+	std::uintptr_t CascadeCullPrevious() noexcept
+	{
+		return g_cascadeSite.ok ? g_cascadeSite.previous : 0;
 	}
 
 	bool Available() noexcept
@@ -395,11 +556,7 @@ namespace CBRO::Hooks::PrevisFeed
 
 	void SetSuspended(bool a_suspend) noexcept
 	{
-		if (!g_setSuspended) {
-			return;
-		}
-		using Fn = void (*)(bool, bool);
-		reinterpret_cast<Fn>(g_setSuspended)(a_suspend, false);
+		WriteSuspended(a_suspend);
 	}
 
 	bool GroupPlanes(const void* a_group, float a_planes[6][4]) noexcept

@@ -3,13 +3,16 @@
 // Policy for the previs fast path (PREVIS-FEED-PLAN.md §4; the engine facts are in Hooks/PrevisFeed). Each frame, at
 // the cull begin, decides which path the frame takes:
 //   - previs:  CBRO is off; the engine's previs lists are fed and CBRO's hooks are out (as before).
-//   - classic: CBRO is on and judges the engine's full walk. With bPrevisFeed=1, previs is SUSPENDED for the whole
-//              time CBRO is on (the engine's own flush-free switch, the one its cascade cull uses every frame) and
-//              never switched off, so nothing is flushed and F8 back to previs mode gets full-strength previs at once.
-//              Kept suspended across the whole frame rather than around the cull alone, so every reader of
-//              IsActive() (the previs query at Render_PreUI+0x80, the helper at +0x15C, the third previs view, the
-//              cascades) sees one consistent "previs off" frame, exactly as when previs is disabled, minus the flush.
-//              With bPrevisFeed=0 this is v1.28's behaviour (Runtime switches previs off, which flushes it).
+//   - classic: CBRO is on and judges the engine's full walk. With bPrevisFeed=1, previs is SUSPENDED (the engine's
+//              own flush-free byte, the one its cascade cull flips around its sun feed) only inside two windows of a
+//              CBRO frame: from Render_PreUI+0x157's return to the cull stage's end (so +0x15C runs the engine's
+//              pre-cull helper and the walk, DrawWorld's cull and its jobs take their previs-off flow), and around
+//              the cascade cull (its group-0 path, the reader of CBRO's sun verdicts). The rest of the frame (the
+//              previs query at +0x80, the lamp shadow maps, the third view, cell loads, the game's update) sees
+//              previs active, as vanilla: nothing is flushed, no state is held across frames, and F8 back to previs
+//              mode is the engine untouched. (v1.31-v1.32 held the byte across the whole frame instead, fought the
+//              engine's per-update release every frame, and left the lamp pass and cell loads with a state vanilla
+//              never has.) With bPrevisFeed=0 this is v1.28's behaviour (Runtime switches previs off, which flushes).
 //   - feed:    (not built yet: PREVIS-FEED-PLAN.md phase 3) previs stays active and CBRO fills the engine's lists.
 // Also the completeness audit (plan §4.5): every iFeedAuditInterval frames on the classic path, CBRO's replica of the
 // engine's scene walk (PrevisFeed::EnumerateCandidates) is compared with what the engine actually offered to
