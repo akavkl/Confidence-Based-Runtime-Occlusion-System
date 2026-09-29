@@ -883,7 +883,9 @@ namespace CBRO::Core::Runtime
 			kBucketRest,
 			kBucketCount
 		};
-		constexpr std::array   kBucketNames{ "cull"sv, "pre-pass"sv, "sun cascades"sv, "forward"sv, "between"sv, "rest"sv };
+		// (the "shadow maps" stage, Render_PreUI+0x1BF, renders the lamps' shadow maps as well as the sun's cascades: the
+		// v1.31 interior run had 10 ms of lamp shadow maps in it with no sun at all)
+		constexpr std::array   kBucketNames{ "cull"sv, "pre-pass"sv, "shadow maps"sv, "forward"sv, "between"sv, "rest"sv };
 		constexpr std::size_t  kMarkCount = 9;
 
 		struct ModeBuckets

@@ -119,8 +119,9 @@ namespace CBRO::Hooks::CullGroups
 			}
 		}
 		// RegisterObject calls per accumulator (which views register how much), for the log: one table per mode
-		// (0 previs, 1 CBRO), since the accumulator hook counts in both.
-		std::array<std::array<SiteCount, 16>, 2> g_registrationSites{};
+		// (0 previs, 1 CBRO), since the accumulator hook counts in both. Lamp shadow accumulators come and go at new
+		// addresses (their cameras are pooled), so the tables are wide enough not to fill up with dead ones.
+		std::array<std::array<SiteCount, 64>, 2> g_registrationSites{};
 		std::atomic<int>                         g_registrationMode{ 1 };
 
 		void RecordRegistration(std::uintptr_t a_accumulator) noexcept
@@ -672,7 +673,7 @@ namespace CBRO::Hooks::CullGroups
 		}
 		std::ranges::sort(sites, std::greater{});
 		std::string text;
-		for (std::size_t i = 0; i < sites.size() && i < 8; ++i) {
+		for (std::size_t i = 0; i < sites.size() && i < 14; ++i) {
 			const auto& [count, site] = sites[i];
 			const auto  mode = ReadRenderMode(site);
 			const auto  name = RenderModeName(mode);

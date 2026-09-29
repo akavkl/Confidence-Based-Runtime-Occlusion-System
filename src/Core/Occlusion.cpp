@@ -1455,9 +1455,12 @@ namespace CBRO::Core::Occlusion
 			return last + 1 == a_clock ? std::min(streak + 1, 255u) : 1u;
 		}
 
-		// Exempt types that tested hidden, sampled every 32nd frame, for the log (which kinds are kept).
+		// Exempt types that tested hidden, sampled every 32nd frame, for the log (which kinds are kept); and the types
+		// CBRO leaves out of group 0 entirely (never filed or rejected in every view), to name what another reader
+		// of group 0 may be missing.
 		std::mutex                                     g_exemptLock;
 		std::unordered_map<std::uintptr_t, std::uint32_t> g_exemptTypes;
+		std::unordered_map<std::uintptr_t, std::uint32_t> g_leftOutTypes;
 
 		void SampleExemptType(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
 		{
@@ -1467,6 +1470,17 @@ namespace CBRO::Core::Occlusion
 			if (const auto vtable = Util::TryReadVtable(a_object)) {
 				std::scoped_lock lock(g_exemptLock);
 				++g_exemptTypes[vtable];
+			}
+		}
+
+		void SampleLeftOutType(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
+		{
+			if (a_context.clock % 32 != 0) {
+				return;
+			}
+			if (const auto vtable = Util::TryReadVtable(a_object)) {
+				std::scoped_lock lock(g_exemptLock);
+				++g_leftOutTypes[vtable];
 			}
 		}
 
@@ -1844,8 +1858,12 @@ namespace CBRO::Core::Occlusion
 			a_out.sunBlocks[0] = 255;
 			switch (a_context.sun.state) {
 			case FrameContext::Sun::State::kOff:
+				// The sun's cascades don't read group 0 this frame, but something else does: in the v1.31 interior run,
+				// leaving hidden and out-of-view entries out of group 0 with the sun off made the lamp shadow maps
+				// vanish (seven "shadowmap PB" accumulators a frame in previs mode, none in CBRO mode). Until that
+				// reader is identified, a sun-off frame removes nothing from group 0 (main-view drops only).
 				Bump(kSunOff);
-				a_out.sun = SunOutcome::kUnneeded;
+				a_out.sun = SunOutcome::kUnknown;
 				return;
 			case FrameContext::Sun::State::kUnknown:
 				a_out.sun = SunOutcome::kUnknown;
@@ -1983,10 +2001,15 @@ namespace CBRO::Core::Occlusion
 				Bump(a_out.sunStreak < g_tunables.confirmFrames ? kSunConfirming : kSunHidden);
 				break;
 			case SunOutcome::kUnneeded:
-				Bump(a_context.sun.state == FrameContext::Sun::State::kOff ? kSunOff : kSunOutside);
+				Bump(kSunOutside);
 				break;
 			case SunOutcome::kNeeded:
 				Bump(kSunNeeded);
+				break;
+			case SunOutcome::kUnknown:
+				if (a_context.sun.state == FrameContext::Sun::State::kOff) {
+					Bump(kSunOff);
+				}
 				break;
 			default:
 				break;
@@ -2050,7 +2073,7 @@ namespace CBRO::Core::Occlusion
 			switch (a_context.sun.state) {
 			case FrameContext::Sun::State::kOff:
 				Bump(kSunOff);
-				return true;
+				return false;  // (group 0 has other readers with the sun off: see EvaluateSun)
 			case FrameContext::Sun::State::kUnknown:
 				return false;
 			default:
@@ -2116,6 +2139,7 @@ namespace CBRO::Core::Occlusion
 				const bool hiddenConfirmed = out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames;
 				if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !(out.flags & kRecordLight) && SunUnneededIn(out)) {
 					Bump(kCasterRejected);
+					SampleLeftOutType(a_context, a_add.object);
 					return &a_context.reject;
 				}
 				if (hiddenConfirmed && !g_drops.Insert(a_add.object, tag)) {
@@ -2215,6 +2239,7 @@ namespace CBRO::Core::Occlusion
 					if (group0) {
 						if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !light && SunUnneededIn(out)) {
 							Bump(kCasterSkipped);
+							SampleLeftOutType(*context, a_object);
 							skip = true;
 						} else if (hiddenConfirmed && !g_drops.Insert(a_object, DropSet::Tag(context->clock))) {
 							Bump(kDropFull);
@@ -3049,7 +3074,7 @@ namespace CBRO::Core::Occlusion
 			"occlusion main view only (groups the sun's shadow cascades read too) per frame: entries {:.0f} | dropped with their parent {:.0f} | registrations {:.0f}, left out {:.0f} | drop table full {:.0f}",
 			per(kShared), per(kDropInherited), per(kRegistered), per(kRegistrationsDropped), per(kDropFull));
 		logger::info(
-			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f}, sun shadows off {:.0f} | confirming {:.0f} | needed {:.0f} || objects nothing needs: never filed {:.0f}, rejected {:.0f}",
+			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f} | sun off (kept in group 0 for its other readers) {:.0f} | confirming {:.0f} | needed {:.0f} || objects nothing needs: never filed {:.0f}, rejected {:.0f}",
 			per(kSunTests), per(kSunOutside), per(kSunHidden), per(kSunOff), per(kSunConfirming), per(kSunNeeded), per(kCasterSkipped), per(kCasterRejected));
 		logger::info(
 			"occlusion early skips per frame (main-view-only groups, never filed with the engine): hidden {:.0f} | out of view {:.0f} | top-level adds considered {:.0f}",
@@ -3082,24 +3107,29 @@ namespace CBRO::Core::Occlusion
 			"occlusion frames: culling {:.0f} / blocked {:.0f} (stale depth, camera jump, or inactive) | history {} objects",
 			delta[kFramesCulling], delta[kFramesBlocked], g_used.load());
 
-		std::vector<std::pair<std::uint32_t, std::uintptr_t>> exempt;
-		{
-			std::scoped_lock lock(g_exemptLock);
-			for (const auto& [vtable, count] : g_exemptTypes) {
-				exempt.emplace_back(count, vtable);
+		const auto logTypes = [](std::unordered_map<std::uintptr_t, std::uint32_t>& a_types, std::string_view a_what) {
+			std::vector<std::pair<std::uint32_t, std::uintptr_t>> ranked;
+			{
+				std::scoped_lock lock(g_exemptLock);
+				for (const auto& [vtable, count] : a_types) {
+					ranked.emplace_back(count, vtable);
+				}
+				a_types.clear();
 			}
-			g_exemptTypes.clear();
-		}
-		if (!exempt.empty()) {
-			std::ranges::sort(exempt, std::greater{});
+			if (ranked.empty()) {
+				return;
+			}
+			std::ranges::sort(ranked, std::greater{});
 			std::string text;
-			for (std::size_t i = 0; i < exempt.size() && i < 8; ++i) {
+			for (std::size_t i = 0; i < ranked.size() && i < 10; ++i) {
 				char                 name[64]{};
-				const std::uintptr_t vtableOnly = exempt[i].second;  // an "object" whose first qword is the vtable
+				const std::uintptr_t vtableOnly = ranked[i].second;  // an "object" whose first qword is the vtable
 				Util::TryGetRTTIName(&vtableOnly, name, sizeof(name));
-				text += std::format(" {} x{}", name[0] ? name : "?", exempt[i].first);
+				text += std::format(" {} x{}", name[0] ? name : "?", ranked[i].first);
 			}
-			logger::info("hidden but exempt by type (sampled every 32nd frame):{}", text);
-		}
+			logger::info("{} (sampled every 32nd frame):{}", a_what, text);
+		};
+		logTypes(g_exemptTypes, "hidden but exempt by type"sv);
+		logTypes(g_leftOutTypes, "left out of group 0 by type (never filed or rejected in every view)"sv);
 	}
 }
