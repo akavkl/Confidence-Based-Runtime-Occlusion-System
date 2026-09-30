@@ -170,9 +170,14 @@ namespace CBRO::Core::ShadowLights
 			return key ? key : 1;
 		}
 
-		Slot* FindSlot(std::uint64_t a_key) noexcept
+		// Slots are never freed: over a session the table fills with lights left behind. A full neighbourhood
+		// recycles the slot whose light went longest without a test (v1.45 and earlier took the first slot, which
+		// two live lights sharing it took from each other every frame: neither was ever confirmed).
+		Slot* FindSlot(std::uint64_t a_key, std::uint32_t a_clock) noexcept
 		{
-			const auto start = static_cast<std::size_t>((a_key * 0x9E3779B97F4A7C15ull) >> 56) % kSlots;
+			const auto    start = static_cast<std::size_t>((a_key * 0x9E3779B97F4A7C15ull) >> 56) % kSlots;
+			Slot*         stalest = nullptr;
+			std::uint32_t stalestAge = 0;
 			for (std::size_t probe = 0; probe < 16; ++probe) {
 				auto& slot = g_slots[(start + probe) % kSlots];
 				auto  current = slot.key.load(std::memory_order_acquire);
@@ -185,13 +190,18 @@ namespace CBRO::Core::ShadowLights
 				if (current == a_key) {
 					return &slot;
 				}
+				const auto age = a_clock - slot.lastClock.load(std::memory_order_relaxed);
+				if (!stalest || age > stalestAge) {
+					stalest = &slot;
+					stalestAge = age;
+				}
 			}
-			// Full neighbourhood: recycle the first slot (its light gets a fresh, conservative streak).
-			auto& slot = g_slots[start];
-			slot.key.store(a_key);
-			slot.streak.store(0);
-			slot.lastClock.store(0);
-			return &slot;
+			// A fresh, conservative streak, reset before the key names the new light (a reader finding the key
+			// never sees the old light's streak).
+			stalest->streak.store(0, std::memory_order_relaxed);
+			stalest->lastClock.store(0, std::memory_order_relaxed);
+			stalest->key.store(a_key, std::memory_order_release);
+			return stalest;
 		}
 
 		bool ShouldEmpty(const void* a_culler, const RE::NiCamera* a_camera) noexcept
@@ -217,7 +227,7 @@ namespace CBRO::Core::ShadowLights
 
 			const auto verdict = Occlusion::TestSphere(position, reach);
 			const auto clock = Occlusion::Clock();
-			auto&      slot = *FindSlot(LightKey(position, reach));
+			auto&      slot = *FindSlot(LightKey(position, reach), clock);
 			auto       streak = slot.streak.load(std::memory_order_relaxed);
 			// Behind visible surfaces or out of view entirely: either way no visible pixel is in reach.
 			const bool unseen = verdict == Occlusion::SphereVerdict::kHidden || verdict == Occlusion::SphereVerdict::kOutOfView;

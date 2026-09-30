@@ -1463,10 +1463,40 @@ namespace CBRO::Core::Occlusion
 
 		// Exempt types that tested hidden, sampled every 32nd frame, for the log (which kinds are kept); and the types
 		// CBRO leaves out of group 0 entirely (never filed or rejected in every view), to name what another reader
-		// of group 0 may be missing.
-		std::mutex                                     g_exemptLock;
-		std::unordered_map<std::uintptr_t, std::uint32_t> g_exemptTypes;
-		std::unordered_map<std::uintptr_t, std::uint32_t> g_leftOutTypes;
+		// of group 0 may be missing. A sampled frame counts thousands of objects (the v1.45 run: ~5,800 left out of
+		// group 0 each), so the counts live in a small lock-free table keyed by vtable (a few dozen types): no mutex
+		// and no allocation on the walk threads. Types stay once seen; the log takes only the counts.
+		struct TypeCounts
+		{
+			static constexpr std::size_t kBits = 7;
+			static constexpr std::size_t kSlots = std::size_t{ 1 } << kBits;
+			struct Slot
+			{
+				std::atomic<std::uintptr_t> vtable{ 0 };
+				std::atomic<std::uint32_t>  count{ 0 };
+			};
+			std::array<Slot, kSlots>   slots{};
+			std::atomic<std::uint32_t> untracked{ 0 };  // more distinct types than slots
+
+			void Add(std::uintptr_t a_vtable) noexcept
+			{
+				auto index = static_cast<std::size_t>(((a_vtable >> 3) * 0x9E3779B97F4A7C15ull) >> (64 - kBits));
+				for (std::size_t probe = 0; probe < kSlots; ++probe, index = (index + 1) & (kSlots - 1)) {
+					auto& slot = slots[index];
+					auto  current = slot.vtable.load(std::memory_order_acquire);
+					if (current == 0 && slot.vtable.compare_exchange_strong(current, a_vtable, std::memory_order_acq_rel)) {
+						current = a_vtable;
+					}
+					if (current == a_vtable) {
+						slot.count.fetch_add(1, std::memory_order_relaxed);
+						return;
+					}
+				}
+				untracked.fetch_add(1, std::memory_order_relaxed);
+			}
+		};
+		TypeCounts g_exemptTypes;
+		TypeCounts g_leftOutTypes;
 
 		void SampleExemptType(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
 		{
@@ -1474,8 +1504,7 @@ namespace CBRO::Core::Occlusion
 				return;
 			}
 			if (const auto vtable = Util::TryReadVtable(a_object)) {
-				std::scoped_lock lock(g_exemptLock);
-				++g_exemptTypes[vtable];
+				g_exemptTypes.Add(vtable);
 			}
 		}
 
@@ -1485,8 +1514,7 @@ namespace CBRO::Core::Occlusion
 				return;
 			}
 			if (const auto vtable = Util::TryReadVtable(a_object)) {
-				std::scoped_lock lock(g_exemptLock);
-				++g_leftOutTypes[vtable];
+				g_leftOutTypes.Add(vtable);
 			}
 		}
 
@@ -2692,7 +2720,12 @@ namespace CBRO::Core::Occlusion
 	void BeginFrame(const FrameContext& a_context)
 	{
 		g_mainStats = &LocalStats();  // (BeginFrame runs on the main thread)
-		if (g_resetRequested.exchange(false) || g_used.load() > kTableSize * 7 / 10) {
+		const bool reset = g_resetRequested.exchange(false);
+		if (const auto used = g_used.load(); reset || used > kTableSize * 7 / 10) {
+			if (!reset) {
+				// (rare: logged each time, so a run shows whether a long session ever pays the restart)
+				logger::info("occlusion history: table full ({} of {} objects); cleared, every streak restarts", used, kTableSize);
+			}
 			ClearTable();
 		}
 		// Drop tags repeat every kTagCycle frames: forget the old ones before a tag is reused.
@@ -3154,15 +3187,15 @@ namespace CBRO::Core::Occlusion
 			"occlusion frames: culling {:.0f} / blocked {:.0f} (stale depth, camera jump, or inactive) | history {} objects",
 			delta[kFramesCulling], delta[kFramesBlocked], g_used.load());
 
-		const auto logTypes = [](std::unordered_map<std::uintptr_t, std::uint32_t>& a_types, std::string_view a_what) {
+		const auto logTypes = [](TypeCounts& a_types, std::string_view a_what) {
 			std::vector<std::pair<std::uint32_t, std::uintptr_t>> ranked;
-			{
-				std::scoped_lock lock(g_exemptLock);
-				for (const auto& [vtable, count] : a_types) {
+			for (auto& slot : a_types.slots) {
+				const auto vtable = slot.vtable.load(std::memory_order_acquire);
+				if (const auto count = vtable ? slot.count.exchange(0, std::memory_order_relaxed) : 0u) {
 					ranked.emplace_back(count, vtable);
 				}
-				a_types.clear();
 			}
+			const auto untracked = a_types.untracked.exchange(0, std::memory_order_relaxed);
 			if (ranked.empty()) {
 				return;
 			}
@@ -3173,6 +3206,9 @@ namespace CBRO::Core::Occlusion
 				const std::uintptr_t vtableOnly = ranked[i].second;  // an "object" whose first qword is the vtable
 				Util::TryGetRTTIName(&vtableOnly, name, sizeof(name));
 				text += std::format(" {} x{}", name[0] ? name : "?", ranked[i].first);
+			}
+			if (untracked) {
+				text += std::format(" | untracked types x{}", untracked);
 			}
 			logger::info("{} (sampled every 32nd frame):{}", a_what, text);
 		};
