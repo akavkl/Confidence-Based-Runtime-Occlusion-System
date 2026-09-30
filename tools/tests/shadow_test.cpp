@@ -3,7 +3,8 @@
 //  2. the kept part of the sweep projects inside the box around its two end spheres' projections, and no point
 //     of it is nearer than the nearer end's depth minus its radius (what TestSun compares against the Hi-Z);
 //  3. CasterOutside never drops a point-light caster that comes within the filter's reach of a segment from the
-//     light to a visible point, with the camera turned and moved since the cone was built.
+//     light to a visible point, with the camera turned and moved since the cone was built;
+//  4. SpotSphere holds every point of a spot light's reach that lies inside its frustum.
 // Build: cl /std:c++latest /O2 /EHsc /I src tools\tests\shadow_test.cpp   (VS x64 prompt)
 #include <algorithm>
 #include <array>
@@ -225,6 +226,39 @@ int main()
 		std::printf("3. point-light casters: %llu lights, %llu casters, %llu dropped, %llu near a visible point's light segment, %llu of those dropped (must be 0)\n",
 			(unsigned long long)lights, (unsigned long long)casters, (unsigned long long)dropped, (unsigned long long)relevantPairs, (unsigned long long)wrong);
 		failures += static_cast<int>(wrong);
+	}
+
+	// ---- 4: spot-light lit volume (SpotSphere) -------------------------------------------------------------------
+	{
+		std::uint64_t spots = 0, points = 0, outside = 0, tighter = 0;
+		for (int trial = 0; trial < 20000; ++trial) {
+			const V3    apex{ U(-5000, 5000), U(-5000, 5000), U(-500, 2000) };
+			const V3    dir = RandomUnit();
+			const V3    right = Unit(Cross(dir, std::abs(dir[2]) < 0.9f ? V3{ 0, 0, 1 } : V3{ 1, 0, 0 }));
+			const V3    up = Cross(right, dir);
+			const float length = U(16.0f, 6000.0f);
+			const float tanX = U(0.02f, 2.0f), tanY = trial % 3 ? tanX : U(0.02f, 2.0f);  // mostly square, as spot frusta are
+			float       along = 0.0f, radius = 0.0f;
+			SpotSphere(length, std::sqrt(tanX * tanX + tanY * tanY), along, radius);
+			const V3 center = Add(apex, Mul(dir, along));
+			++spots;
+			tighter += radius < length;
+			// points within the reach and inside the frustum, many on the reach's rim along the frustum's corners
+			for (int k = 0; k < 64;) {
+				const float sx = k < 4 ? (k & 1 ? 1.0f : -1.0f) : U(-1.0f, 1.0f), sy = k < 4 ? (k & 2 ? 1.0f : -1.0f) : U(-1.0f, 1.0f);
+				const V3    ray = Unit(Add(dir, Add(Mul(right, sx * tanX), Mul(up, sy * tanY))));
+				const float t = k < 16 ? length : length * std::cbrt(U(0.0f, 1.0f));
+				const V3    p = Add(apex, Mul(ray, t));
+				++k;
+				++points;
+				if (Len(Sub(p, center)) > radius * 1.0001f + 0.01f && outside++ < 5) {
+					std::printf("  lit point outside its sphere: trial %d\n", trial);
+				}
+			}
+		}
+		std::printf("4. spot-light volumes: %llu spots (%llu with a sphere smaller than the whole reach), %llu points, %llu outside their sphere (must be 0)\n",
+			(unsigned long long)spots, (unsigned long long)tighter, (unsigned long long)points, (unsigned long long)outside);
+		failures += static_cast<int>(outside);
 	}
 
 	std::printf(failures ? "FAILED: %d\n" : "all checks passed\n", failures);

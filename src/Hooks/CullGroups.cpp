@@ -210,6 +210,7 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<MainRegistrationObserver> g_mainRegistrationObserver{ nullptr };
 		std::atomic<CellNodeFilter>     g_cellNodeFilter{ nullptr };
 		std::atomic<bool>           g_mainCullActive{ false };
+		std::atomic<const void*>    g_droppedAccumulator{ nullptr };
 
 		std::atomic<std::uint64_t> g_forcedCleared{ 0 };
 		std::atomic<std::uint64_t> g_groupAddsConsidered{ 0 };
@@ -255,6 +256,7 @@ namespace CBRO::Hooks::CullGroups
 			std::atomic<std::uint64_t> groupAdds{ 0 };
 			std::atomic<std::uint64_t> childPushes{ 0 };
 			std::atomic<std::uint64_t> registrations{ 0 };
+			std::atomic<std::uint64_t> dropped{ 0 };  // registrations into the dropped accumulator
 		};
 		constexpr std::size_t              kCountSlots = 64;
 		std::array<CallCounts, kCountSlots> g_callCounts{};
@@ -445,6 +447,10 @@ namespace CBRO::Hooks::CullGroups
 			Count(counts.registrations);
 			if ((counts.registrations.load(std::memory_order_relaxed) & 15) == 0) {  // sampled 1 in 16 per thread (the log scales it back)
 				RecordRegistration(reinterpret_cast<std::uintptr_t>(a_accumulator));
+			}
+			if (a_accumulator && a_accumulator == g_droppedAccumulator.load(std::memory_order_relaxed)) {
+				Count(counts.dropped);
+				return true;  // an emptied lamp shadow map (callers ignore the result)
 			}
 			if (const auto observer = g_mainRegistrationObserver.load(std::memory_order_relaxed);
 				observer && a_accumulator && a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
@@ -661,6 +667,29 @@ namespace CBRO::Hooks::CullGroups
 	void SetMainRegistrationObserver(MainRegistrationObserver a_observer)
 	{
 		g_mainRegistrationObserver.store(a_observer);
+	}
+
+	void SetDroppedAccumulator(const void* a_accumulator) noexcept
+	{
+		g_droppedAccumulator.store(a_accumulator, std::memory_order_release);
+	}
+
+	std::uint64_t ReadDroppedRegistrations() noexcept
+	{
+		std::uint64_t total = 0;
+		for (const auto& slot : g_callCounts) {
+			total += slot.dropped.load(std::memory_order_relaxed);
+		}
+		return total;
+	}
+
+	std::uint64_t TakeDroppedRegistrations() noexcept
+	{
+		static std::uint64_t reported = 0;
+		const auto           total = ReadDroppedRegistrations();
+		const auto           since = total - reported;
+		reported = total;
+		return since;
 	}
 
 	void SetCellNodeFilter(CellNodeFilter a_filter)

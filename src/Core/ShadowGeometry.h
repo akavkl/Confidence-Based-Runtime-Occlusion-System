@@ -115,4 +115,20 @@ namespace CBRO::Core::ShadowGeometry
 		}
 		return false;
 	}
+
+	// Spot light: a sphere holding its lit volume, the points within a_length of the light that lie inside the shadow
+	// frustum (the engine's own bound of the volume), i.e. within the frustum's corner angle of the axis, whose tangent
+	// is a_tanCorner. The center lies a_along down the axis. Under 60 degrees the sphere through the light and the
+	// cap's rim, R = L / (2 cos), holds the cone's cap and so every segment from the light to it; wider, the ball itself.
+	inline void SpotSphere(float a_length, float a_tanCorner, float& a_along, float& a_radius) noexcept
+	{
+		const float cosCorner = 1.0f / std::sqrt(1.0f + a_tanCorner * a_tanCorner);
+		if (cosCorner > 0.5f) {
+			a_radius = 0.5f * a_length / cosCorner;
+			a_along = a_radius;
+		} else {
+			a_radius = a_length;
+			a_along = 0.0f;
+		}
+	}
 }

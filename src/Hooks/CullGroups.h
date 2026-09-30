@@ -144,6 +144,12 @@ namespace CBRO::Hooks::CullGroups
 	void SetBlockObserver(BlockObserver a_observer);
 	void SetGroupObserver(GroupObserver a_observer);
 
+	// A lamp shadow map's accumulator that files nothing (Core/ShadowLights: a spot light whose lit volume is hidden):
+	// every registration into it is dropped. Null = none. Set on the main thread, read on any thread.
+	void SetDroppedAccumulator(const void* a_accumulator) noexcept;
+	[[nodiscard]] std::uint64_t TakeDroppedRegistrations() noexcept;  // registrations dropped there since the last call (main thread)
+	[[nodiscard]] std::uint64_t ReadDroppedRegistrations() noexcept;  // ... running total since load
+
 	// Installs the detours and the accumulator hook (idempotent). Returns false unless Block::Add and the
 	// main-view registration are both hooked: without them nothing can be culled without also cutting
 	// shadows. A missing Group::Add or ChildPush hook only costs culling (their entries count as shared).

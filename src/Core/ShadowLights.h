@@ -8,6 +8,13 @@
 // camera and adds nothing, so the shadow pass draws nothing. Lights reaching the camera, partly
 // off-screen, or with unknown reach are never touched.
 //
+// Spot lights (v1.48; bSpotShadowCulling): their casters come from a culling-group pass, not a traversal, so they
+// are dropped at their shadow map's accumulator instead: when the lit volume (a sphere around the part of the light's
+// reach inside its shadow frustum, the pyramid the engine itself tests the light's visibility by; the whole reach when
+// the frustum's corners lie over 60 degrees off its axis) is hidden behind the main view's depth for confirmFrames
+// frames, no caster is filed and the shadow map draws nothing.
+// Previs does the same job by marking such lights occluded (FO4-ENGINE-NOTES 6.2a/6.7).
+//
 // For every other light, its traversal's per-object test (Process(object)) also drops casters that can't
 // shadow a visible pixel: the light and every visible point lie in the view cone pushed out until it holds
 // the light, so each light-to-pixel segment does too, and a caster entirely outside that region (by more
@@ -26,6 +33,10 @@ namespace CBRO::Core::ShadowLights
 
 	// Takes the vtable hooks out (CBRO off: the engine's own culler runs) or puts them back. Main thread.
 	bool SetHooksIn(bool a_in);
+
+	// The main frame's deferred-lights stage (its lamp loop) begins (true, CBRO frames only) or ends (false): spot-light
+	// shadow maps are emptied only inside it. Main thread.
+	void SetLampStage(bool a_open) noexcept;
 
 	struct Lamp
 	{

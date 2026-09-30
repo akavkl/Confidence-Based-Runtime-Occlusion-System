@@ -113,7 +113,9 @@ namespace CBRO::Core::Occlusion
 	// Once per frame at the cull stage's end (main thread, DrawWorld's jobs done), with the running total of
 	// every accumulator's registrations (Hooks::CullGroups::ReadHookCalls): records how much the culled set
 	// changes from frame to frame (LogStats prints the spread).
-	void EndFrameSample(std::uint64_t a_registrationsTotal);
+	// a_droppedTotal: registrations dropped at emptied lamp shadow maps (Hooks::CullGroups, running total). Frames whose
+	// drawn set rises well over the recent median are logged with the flips behind them (diagnostic, bounded).
+	void EndFrameSample(std::uint64_t a_registrationsTotal, std::uint64_t a_droppedTotal);
 
 	void SetActive(bool a_active);
 	void SetObserveOnly(bool a_observeOnly);  // runtime override of [Occlusion] bObserveOnly (diagnostics)
@@ -132,7 +134,23 @@ namespace CBRO::Core::Occlusion
 		kHidden,     // every visible surface in its screen area is in front of it
 		kOutOfView,  // entirely outside the current view (needs a known view footprint)
 	};
-	[[nodiscard]] SphereVerdict TestSphere(const RE::NiPoint3& a_center, float a_radius) noexcept;
+	// Why (for the stats): kOverhang with kHidden, the others with kUnknown.
+	enum class SphereReason : std::uint8_t
+	{
+		kNone,
+		kOverhang,  // hidden, part of it judged by the depth frame's edge: the view overhangs the frame by a thin strip
+		kNoDepth,   // no usable depth this frame
+		kEdge,      // part of it is in view where the depth frame never rendered (a wider overhang)
+		kNear,      // it reaches in front of the near distance (the camera is at or in it)
+		kInvalid,   // a bad bound
+	};
+	// A light's whole reach: unlike an object's test, a thin strip where the current view overhangs the depth frame (a
+	// camera turned a fraction of a degree since the depth was rendered) is taken to hold what the frame's edge holds,
+	// and the Hi-Z is refined down to single texels (a far texel counts only where the light's rays pass).
+	[[nodiscard]] SphereVerdict TestSphere(const RE::NiPoint3& a_center, float a_radius, SphereReason* a_reason = nullptr) noexcept;
+
+	// Diagnostic (ShadowLights): an emptied lamp shadow map had to be drawn again (its light no longer judged unseen).
+	void NoteLightFlip(bool a_spot, const RE::NiPoint3& a_center, float a_radius, SphereVerdict a_verdict, SphereReason a_reason) noexcept;
 
 	// Whether a point light's caster can shadow anything visible this frame: its shadow volume (the cone from the
 	// lamp through the caster's sphere, out to the lamp's reach) against the current depth (ShadowLights).

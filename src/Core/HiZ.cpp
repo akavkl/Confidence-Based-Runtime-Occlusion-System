@@ -466,6 +466,37 @@ namespace CBRO::Core::HiZ
 		return true;
 	}
 
+	Snapshot::FartherScan Snapshot::ScanFarther(float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, const SphereRays* a_rays) const noexcept
+	{
+		FartherScan scan{};
+		const auto  w = width[0];
+		const auto  h = height[0];
+		const auto  x0 = static_cast<std::uint32_t>(std::clamp(a_x0, 0.0f, static_cast<float>(w - 1)));
+		const auto  x1 = static_cast<std::uint32_t>(std::clamp(a_x1, 0.0f, static_cast<float>(w - 1)));
+		const auto  y0 = static_cast<std::uint32_t>(std::clamp(a_y0, 0.0f, static_cast<float>(h - 1)));
+		const auto  y1 = static_cast<std::uint32_t>(std::clamp(a_y1, 0.0f, static_cast<float>(h - 1)));
+		for (auto y = y0; y <= y1; ++y) {
+			const auto* row = texels + offset[0] + y * w;
+			for (auto x = x0; x <= x1; ++x) {
+				if (row[x] < a_threshold) {
+					continue;
+				}
+				const float fx = static_cast<float>(x), fy = static_cast<float>(y);
+				if (a_rays && a_rays->Misses(fx - 0.25f, fy - 0.25f, fx + 1.249f, fy + 1.249f)) {
+					continue;
+				}
+				if (scan.texels++ == 0) {
+					scan.x = fx;
+					scan.y = fy;
+				}
+				scan.farPlane += row[x] >= 0.99999f;
+				scan.firstPerson += row[x] >= 0.99999f && nearest[offset[0] + y * w + x] <= 0.0f;
+				scan.farthest = std::max(scan.farthest, row[x]);
+			}
+		}
+		return scan;
+	}
+
 	bool Snapshot::AllFarther(float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine) const noexcept
 	{
 		auto          span = std::max(a_x1 - a_x0, a_y1 - a_y0);

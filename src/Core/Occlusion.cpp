@@ -36,6 +36,11 @@ namespace CBRO::Core::Occlusion
 		// ... and when a cached hidden verdict's evidence is re-checked against a newer depth (ViewValid): fewer, since a
 		// failure only means the full test runs.
 		constexpr std::uint32_t kRecheckRefine = 2;
+		// Light tests only (TestSphere): how far (NDC) the current view may overhang the depth frame and still be judged,
+		// the overhang taken to hold what the frame's adjacent edge holds. A camera swaying by a fraction of a degree
+		// (first-person idle motion) leaves such a strip every few frames; judged unknown, every lamp crossing it
+		// dropped out of its emptied state and re-drew its whole shadow map for two frames. 0.03 is ~38 px at 2560.
+		constexpr float kLightOverhang = 0.03f;
 		// A cached kept (drawn) verdict is re-evaluated every this many frames (staggered by object), never sooner: no
 		// depth change can make drawing an object unsafe, so this only bounds how long a newly hidden one stays drawn.
 		constexpr std::uint32_t kKeptRecheckFrames = 16;
@@ -133,6 +138,7 @@ namespace CBRO::Core::Occlusion
 			kCacheRecheck,        // hidden verdicts reused after their evidence was re-checked against the current depth (their blocks had changed)
 			kCacheKeptRecheck,    // kept (drawn) verdicts re-evaluated on their periodic turn (never because the depth changed)
 			kCacheSunDepth,       // sun outcomes re-evaluated under a reused view outcome (the blocks their shadow test read changed)
+			kStreakFromBackup,    // hidden verdicts without last frame's record whose streak the table's backup continued
 			kCycles,              // TSC cycles in the per-object tests (sampled frames, scaled)
 			kCyclesEvaluate,      // ... of which: full view evaluations (sphere tests, mesh shapes, lights)
 			kCyclesShape,         // ... of which: the mesh-shape tests inside those evaluations
@@ -467,8 +473,9 @@ namespace CBRO::Core::Occlusion
 		using ShadowGeometry::SphereExtent;
 
 		// Clips an NDC rectangle of the depth frame to the part the current camera can see.
-		// kHidden here means "judge it": the clipped rectangle lies within the depth frame.
-		Verdict ClipToView(const FrameContext& a_context, float& a_x0, float& a_x1, float& a_y0, float& a_y1) noexcept
+		// kHidden here means "judge it": the clipped rectangle lies within the depth frame. With a_overhang (light tests
+		// only), a part in view beyond the frame by at most that much is judged by the frame's edge (*a_overhung set).
+		Verdict ClipToView(const FrameContext& a_context, float& a_x0, float& a_x1, float& a_y0, float& a_y1, float a_overhang = 0.0f, bool* a_overhung = nullptr) noexcept
 		{
 			a_x0 = std::max(a_x0, a_context.view[0]);
 			a_x1 = std::min(a_x1, a_context.view[1]);
@@ -479,7 +486,19 @@ namespace CBRO::Core::Occlusion
 			}
 			// A visible part the depth frame never rendered: turning the camera brought it into view.
 			if (a_x0 < -1.0f || a_x1 > 1.0f || a_y0 < -1.0f || a_y1 > 1.0f) {
-				return Verdict::kEdge;
+				if (!(a_x0 >= -1.0f - a_overhang && a_x1 <= 1.0f + a_overhang && a_y0 >= -1.0f - a_overhang && a_y1 <= 1.0f + a_overhang)) {
+					return Verdict::kEdge;
+				}
+				a_x0 = std::max(a_x0, -1.0f);
+				a_x1 = std::min(a_x1, 1.0f);
+				a_y0 = std::max(a_y0, -1.0f);
+				a_y1 = std::min(a_y1, 1.0f);
+				if (a_x0 >= a_x1 || a_y0 >= a_y1) {
+					return Verdict::kEdge;  // (nothing of it inside the frame to judge by)
+				}
+				if (a_overhung) {
+					*a_overhung = true;
+				}
 			}
 			return Verdict::kHidden;
 		}
@@ -573,7 +592,28 @@ namespace CBRO::Core::Occlusion
 			return a_context.cacheEnabled ? a_limit * (1.0f + HiZ::kCacheDepthTolerance) + HiZ::kCacheDepthSlack : a_limit;
 		}
 
-		Verdict TestViewSpace(const FrameContext& a_context, const RE::NiBound& a_bound, float a_radius, DepthRect* a_rect = nullptr) noexcept
+		// Diagnostic: where a kVisible verdict read the depth (the flip samples re-scan it at level 0).
+		struct VisibleEvidence
+		{
+			bool            valid{ false };
+			bool            rays{ false };
+			float           x0{ 0.0f }, y0{ 0.0f }, x1{ 0.0f }, y1{ 0.0f };  // level-0 texel rectangle
+			float           threshold{ 0.0f };
+			float           nearest{ 0.0f };  // view depth of the sphere's nearest point
+			HiZ::SphereRays sphere{};
+		};
+
+		// A light's reach tested (TestSphere): a thin overhang of the view judged by the frame's edge, and every Hi-Z level
+		// refined down to single texels, so a far texel only counts where the light's rays pass (a coarse texel's far
+		// corner elsewhere made whole lamps "visible": their shadow maps re-drawn for two frames).
+		struct LightTest
+		{
+			float         overhang{ kLightOverhang };
+			std::uint32_t refine{ 16 };
+			bool          overhung{ false };  // out: part of it was judged by the frame's edge
+		};
+
+		Verdict TestViewSpace(const FrameContext& a_context, const RE::NiBound& a_bound, float a_radius, DepthRect* a_rect = nullptr, LightTest* a_light = nullptr, VisibleEvidence* a_evidence = nullptr) noexcept
 		{
 			const auto& snapshot = *a_context.snapshot;
 			const auto& camera = snapshot.camera;
@@ -608,7 +648,7 @@ namespace CBRO::Core::Occlusion
 			x1 *= camera.scaleX;
 			y0 *= camera.scaleY;
 			y1 *= camera.scaleY;
-			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1); clip != Verdict::kHidden) {
+			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1, a_light ? a_light->overhang : 0.0f, a_light ? &a_light->overhung : nullptr); clip != Verdict::kHidden) {
 				return clip;
 			}
 
@@ -641,7 +681,10 @@ namespace CBRO::Core::Occlusion
 			rays.texelsPerTanY = camera.scaleY * height * 0.5f;
 			rays.axisX = width * 0.5f;
 			rays.axisY = height * 0.5f;
-			if (!snapshot.AllNearer(px0, py0, px1, py1, threshold, kRefineLevels, &rays)) {
+			if (!snapshot.AllNearer(px0, py0, px1, py1, threshold, a_light ? a_light->refine : kRefineLevels, &rays)) {
+				if (a_evidence) {
+					*a_evidence = VisibleEvidence{ true, true, px0, py0, px1, py1, threshold, nearest, rays };
+				}
 				return Verdict::kVisible;
 			}
 			if (a_rect) {
@@ -651,7 +694,7 @@ namespace CBRO::Core::Occlusion
 		}
 
 		// Fallback when the view-space form couldn't be verified: project the bound's box corners.
-		Verdict TestCorners(const FrameContext& a_context, const RE::NiBound& a_bound, float a_radius, DepthRect* a_rect = nullptr) noexcept
+		Verdict TestCorners(const FrameContext& a_context, const RE::NiBound& a_bound, float a_radius, DepthRect* a_rect = nullptr, LightTest* a_light = nullptr) noexcept
 		{
 			const auto& snapshot = *a_context.snapshot;
 			const auto& camera = snapshot.camera;
@@ -677,7 +720,7 @@ namespace CBRO::Core::Occlusion
 				ymax = std::max(ymax, (px * m[0][1] + py * m[1][1] + pz * m[2][1] + m[3][1]) * inv);
 				zmin = std::min(zmin, (px * m[0][2] + py * m[1][2] + pz * m[2][2] + m[3][2]) * inv);
 			}
-			if (const auto clip = ClipToView(a_context, xmin, xmax, ymin, ymax); clip != Verdict::kHidden) {
+			if (const auto clip = ClipToView(a_context, xmin, xmax, ymin, ymax, a_light ? a_light->overhang : 0.0f, a_light ? &a_light->overhung : nullptr); clip != Verdict::kHidden) {
 				return clip;
 			}
 
@@ -1083,7 +1126,7 @@ namespace CBRO::Core::Occlusion
 			return anyHidden ? Verdict::kHidden : Verdict::kOutside;
 		}
 
-		Verdict Test(const FrameContext& a_context, const RE::NiBound& a_bound, DepthRect* a_rect = nullptr) noexcept
+		Verdict Test(const FrameContext& a_context, const RE::NiBound& a_bound, DepthRect* a_rect = nullptr, LightTest* a_light = nullptr, VisibleEvidence* a_evidence = nullptr) noexcept
 		{
 			auto radius = a_bound.fRadius;
 			if (!(radius > 0.0f) || !std::isfinite(radius) || radius > 1.0e6f ||
@@ -1094,13 +1137,13 @@ namespace CBRO::Core::Occlusion
 			// uncover it). The same growth covers the shift of the current view's footprint.
 			radius += a_context.dilateMove;
 			if (a_context.snapshot->camera.viewSpace) {
-				return TestViewSpace(a_context, a_bound, radius, a_rect);
+				return TestViewSpace(a_context, a_bound, radius, a_rect, a_light, a_evidence);
 			}
 			// (no view-space form: the turn tolerance is covered by the distance from the eye, which bounds the depth)
 			const auto& eye = a_context.snapshot->camera.eye;
 			const float dx = a_bound.center.x - eye[0], dy = a_bound.center.y - eye[1], dz = a_bound.center.z - eye[2];
 			radius += std::sqrt(dx * dx + dy * dy + dz * dz) * a_context.angularSlack;
-			return TestCorners(a_context, a_bound, radius, a_rect);
+			return TestCorners(a_context, a_bound, radius, a_rect, a_light);
 		}
 
 		void CountVerdict(Verdict a_verdict) noexcept
@@ -1241,6 +1284,61 @@ namespace CBRO::Core::Occlusion
 			}
 			const auto streak = static_cast<std::uint32_t>((a_value >> 32) & 0xFF);
 			return static_cast<std::uint32_t>(a_value) != a_clock ? std::min(streak + 1, 255u) : streak;
+		}
+
+		// A backup of an object's view streak that doesn't depend on which thread judged it (history table value bits
+		// [0,40): the frame of its last hidden verdict and the streak then; merge-instanced meshes keep their own verdict
+		// there). The streams carry the streak on the thread that judged the object, in walk order; when the engine's
+		// jobs hand a block of objects to another thread, reorder a node's children, or a child was dropped with its
+		// parent (not judged at all), the stream has no record and the object restarted its confirmation: drawn again
+		// for a frame, a node's ~600 children at once in the v1.49 interior log ("confirming" max ~597 per interval,
+		// ~54 records a frame found missing with the camera still).
+		constexpr std::uint32_t kStreakBackupGap = 8;      // frames a backup stays usable
+		constexpr std::uint32_t kStreakRefreshFrames = 4;  // reused and inherited hidden verdicts refresh it this often
+
+		// The streak a hidden verdict continues from the backup (0: none usable).
+		std::uint32_t BackupStreak(std::uint64_t a_value, std::uint32_t a_clock) noexcept
+		{
+			if (a_value & kIsMerged) {
+				return 0;
+			}
+			const auto clock = static_cast<std::uint32_t>(a_value);
+			const auto streak = static_cast<std::uint32_t>((a_value >> 32) & 0xFF);
+			if (streak == 0 || a_clock - clock > kStreakBackupGap) {
+				return 0;
+			}
+			return clock == a_clock ? streak : std::min(streak + 1, 255u);
+		}
+
+		void StoreStreak(Entry& a_entry, std::uint32_t a_clock, std::uint32_t a_streak) noexcept
+		{
+			auto value = a_entry.value.load(std::memory_order_relaxed);
+			for (;;) {
+				if (value & kIsMerged) {
+					return;
+				}
+				const auto next = (value & ~kLowBits) | (static_cast<std::uint64_t>(std::min(a_streak, 255u)) << 32) | a_clock;
+				if (next == value || a_entry.value.compare_exchange_weak(value, next, std::memory_order_relaxed)) {
+					return;
+				}
+			}
+		}
+
+		bool RefreshTurn(const void* a_object, std::uint32_t a_clock) noexcept
+		{
+			return (a_clock + static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(a_object) >> 4)) % kStreakRefreshFrames == 0;
+		}
+
+		// A child dropped with its parent: hidden by implication (inside the parent's confirmed-hidden bound), so its
+		// backup continues, at least at the confirmation length.
+		void InheritHidden(const void* a_object, std::uint32_t a_clock, std::uint32_t a_confirmFrames) noexcept
+		{
+			if (!RefreshTurn(a_object, a_clock)) {
+				return;
+			}
+			if (const auto entry = FindEntry(reinterpret_cast<std::uintptr_t>(a_object))) {
+				StoreStreak(*entry, a_clock, std::max(BackupStreak(entry->value.load(std::memory_order_relaxed), a_clock), a_confirmFrames));
+			}
 		}
 
 		bool Observing() noexcept
@@ -1710,6 +1808,70 @@ namespace CBRO::Core::Occlusion
 
 		// The full view test, with the classification and the streak, into a fresh record. a_old is last frame's
 		// record of the same object (streak continuity, the shape's cell hint) or null.
+		// ---- diagnostic: what turns a confirmed-hidden verdict visible (flip samples, logged with the spike frames) ----
+		enum class FlipKind : std::uint8_t
+		{
+			kObject,
+			kPoint,
+			kSpot,
+			kCount
+		};
+		struct FlipSample
+		{
+			std::uint32_t              clock{ 0 };
+			FlipKind                   kind{ FlipKind::kObject };
+			std::uint8_t               verdict{ 0 };
+			bool                       scanned{ false };
+			float                      bound[4]{};
+			float                      nearest{ 0.0f };
+			std::uint32_t              readback{ 0 };
+			std::uint32_t              heldSince{ 0 };  // objects: the depth the hidden verdict last held against
+			HiZ::Snapshot::FartherScan scan{};
+			char                       type[40]{};
+		};
+		constexpr std::size_t                   kFlipRing = 256;
+		constexpr std::uint32_t                 kFlipSamplesPerFrame = 6;  // per kind
+		std::array<FlipSample, kFlipRing>       g_flipRing{};
+		std::atomic<std::uint32_t>              g_flipNext{ 0 };
+		std::atomic<std::uint32_t>              g_flipClock{ 0 };  // the frame the per-frame counts below belong to
+		std::array<std::atomic<std::uint32_t>, 3> g_flipTaken{};    // samples taken this frame, per kind
+		std::array<std::atomic<std::uint64_t>, 3> g_flipCount{};    // flips, per kind (running totals)
+
+		// A confirmed-hidden verdict turned into a kept one: counted, and a few per frame sampled with a level-0 scan of
+		// the depth that made it visible. Any thread.
+		void NoteFlip(const FrameContext& a_context, FlipKind a_kind, const RE::NiAVObject* a_object, const RE::NiBound& a_bound, Verdict a_verdict, std::uint32_t a_heldSince) noexcept
+		{
+			const auto kind = static_cast<std::size_t>(a_kind);
+			g_flipCount[kind].fetch_add(1, std::memory_order_relaxed);
+			if (g_flipClock.load(std::memory_order_relaxed) != a_context.clock || g_flipTaken[kind].fetch_add(1, std::memory_order_relaxed) >= kFlipSamplesPerFrame) {
+				return;
+			}
+			FlipSample sample{};
+			sample.clock = a_context.clock;
+			sample.kind = a_kind;
+			sample.verdict = static_cast<std::uint8_t>(a_verdict);
+			sample.bound[0] = a_bound.center.x;
+			sample.bound[1] = a_bound.center.y;
+			sample.bound[2] = a_bound.center.z;
+			sample.bound[3] = a_bound.fRadius;
+			sample.readback = a_context.readback;
+			sample.heldSince = a_heldSince;
+			VisibleEvidence evidence{};
+			if (a_verdict == Verdict::kVisible) {
+				LightTest light{};
+				(void)Test(a_context, a_bound, nullptr, a_kind == FlipKind::kObject ? nullptr : &light, &evidence);
+			}
+			if (evidence.valid) {
+				sample.scanned = true;
+				sample.nearest = evidence.nearest;
+				sample.scan = a_context.snapshot->ScanFarther(evidence.x0, evidence.y0, evidence.x1, evidence.y1, evidence.threshold, evidence.rays ? &evidence.sphere : nullptr);
+			}
+			if (a_object) {
+				Util::TryGetRTTIName(a_object, sample.type, sizeof(sample.type));
+			}
+			g_flipRing[g_flipNext.fetch_add(1, std::memory_order_relaxed) % kFlipRing] = sample;
+		}
+
 		void EvaluateView(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add, const Record* a_old, Record& a_out, bool a_timed)
 		{
 			a_out = Record{};
@@ -1817,10 +1979,17 @@ namespace CBRO::Core::Occlusion
 					} else {
 						a_out.outcome = Outcome::kHidden;
 						// Consecutive frames hidden: last frame's record continues the count when it was hidden (or only
-						// out of view, which says nothing about the depth); anything seen starts over.
+						// out of view, which says nothing about the depth); anything seen starts over. With no record
+						// (another thread or place in the walk judged it last frame, or it was dropped with its parent)
+						// the table's backup continues it.
+						const auto backup = a_old ? 0u : BackupStreak(value, a_context.clock);
 						a_out.streak = a_old && (a_old->outcome == Outcome::kHidden || a_old->outcome == Outcome::kOutside) ?
 						                   static_cast<std::uint8_t>(std::min<std::uint32_t>(a_old->streak + 1u, 255u)) :
-						                   static_cast<std::uint8_t>(1u);
+						                   static_cast<std::uint8_t>(std::max(backup, 1u));
+						if (backup) {
+							Bump(kStreakFromBackup);
+						}
+						StoreStreak(*entry, a_context.clock, a_out.streak);
 						if (a_out.streak < g_tunables.confirmFrames) {
 							Bump(kConfirming);
 							RecordKept(a_context, a_add.object, *a_add.bound, "hidden, confirming");
@@ -1837,6 +2006,16 @@ namespace CBRO::Core::Occlusion
 			}
 			if (a_out.outcome == Outcome::kHidden) {
 				SetEvidence(a_context, a_out, rect);  // (what a later frame re-checks the verdict by)
+			} else {
+				if (a_out.outcome == Outcome::kKept && a_old && a_old->outcome == Outcome::kHidden && a_old->streak >= g_tunables.confirmFrames) {
+					NoteFlip(a_context, FlipKind::kObject, a_add.object, *a_add.bound, verdict, a_old->readback);  // (diagnostic)
+				}
+				// Seen (or out of view): the streak backup starts over too, if there may be one.
+				if (!a_old || a_old->outcome == Outcome::kHidden) {
+					if (const auto entry = FindEntry(reinterpret_cast<std::uintptr_t>(a_add.object))) {
+						StoreStreak(*entry, a_context.clock, 0);
+					}
+				}
 			}
 		}
 
@@ -2048,6 +2227,12 @@ namespace CBRO::Core::Occlusion
 						a_out.readback = a_context.readback;  // the evidence was verified against this depth
 					}
 					reused = true;
+					// (the streak backup, kept fresh for a record the stream may lose)
+					if (a_out.outcome == Outcome::kHidden && RefreshTurn(a_add.object, a_context.clock)) {
+						if (const auto entry = FindEntry(reinterpret_cast<std::uintptr_t>(a_add.object))) {
+							StoreStreak(*entry, a_context.clock, a_out.streak);
+						}
+					}
 				}
 			}
 			if (!reused) {
@@ -2178,6 +2363,7 @@ namespace CBRO::Core::Occlusion
 					if (!g_drops.Insert(a_add.object, tag)) {
 						Bump(kDropFull);
 					}
+					InheritHidden(a_add.object, a_context.clock, g_tunables.confirmFrames);
 					return nullptr;
 				}
 				JudgeOrLookup(a_context, streams.child, a_add, true, out);
@@ -2207,6 +2393,7 @@ namespace CBRO::Core::Occlusion
 					if (!g_drops.Insert(a_add.object, tag)) {
 						Bump(kDropFull);
 					}
+					InheritHidden(a_add.object, a_context.clock, g_tunables.confirmFrames);
 					return nullptr;
 				}
 				JudgeOrLookup(a_context, streams.child, a_add, false, out);
@@ -2589,12 +2776,94 @@ namespace CBRO::Core::Occlusion
 			std::uint64_t confirming{ 0 };
 			std::uint64_t allRegistrations{ 0 };
 		};
-		FrameTotals g_frameTotals;
-		bool        g_frameTotalsKnown{ false };
-		Spread      g_spreadKept;
-		Spread      g_spreadOther;
-		Spread      g_spreadRejected;
-		Spread      g_spreadConfirming;
+		FrameTotals   g_frameTotals;
+		bool          g_frameTotalsKnown{ false };
+		std::uint64_t g_droppedTotal{ 0 };  // registrations dropped at emptied lamp shadow maps (running total)
+		Spread        g_spreadKept;
+		Spread        g_spreadOther;
+		Spread        g_spreadRejected;
+		Spread        g_spreadConfirming;
+
+		// Diagnostic: frames whose drawn registrations (main view kept + lamp shadow maps filed) rise over the recent
+		// median are logged with the flips behind them (a few sampled per kind) and the depth the frame judged by.
+		struct DrawnHistory
+		{
+			std::array<float, 16>                   values{};
+			std::uint32_t                           count{ 0 };
+			std::uint32_t                           logged{ 0 };
+			std::array<std::uint64_t, 3>            flipsThen{};
+			std::uint32_t                           epoch{ 0 };
+			std::uint32_t                           stillFrames{ 0 };
+			std::uint32_t                           lastLogged{ 0 };
+		};
+		DrawnHistory            g_drawn;
+		constexpr std::uint32_t kSpikeLogs = 16;         // per session
+		constexpr float         kSpikeRise = 800.0f;     // registrations over the median (~400 draw calls)
+		constexpr std::uint32_t kSpikeSettle = 120;      // still frames before any is logged
+		constexpr std::uint32_t kSpikeSpacing = 30;      // frames between two logged
+
+		void LogFlipSamples(std::uint32_t a_clock, FlipKind a_kind) noexcept
+		{
+			constexpr const char* kKinds[]{ "object", "point light", "spot light" };
+			for (const auto& sample : g_flipRing) {
+				if (sample.clock != a_clock || sample.kind != a_kind) {
+					continue;
+				}
+				std::string scan;
+				if (sample.scanned) {
+					scan = sample.scan.texels ?
+					           std::format(" | nearest at depth {:.0f}: level-0 texels beyond it {} (far plane {}, first-person {}), farthest {:.6f}, first at ({:.0f},{:.0f})",
+								   sample.nearest, sample.scan.texels, sample.scan.farPlane, sample.scan.firstPerson, sample.scan.farthest, sample.scan.x, sample.scan.y) :
+					           std::format(" | nearest at depth {:.0f}: no level-0 texel beyond it (a coarse texel alone)", sample.nearest);
+				}
+				logger::info(
+					"  flip: {} {} at ({:.0f},{:.0f},{:.0f}) r {:.0f} -> {}{} | readback {}{}",
+					kKinds[static_cast<std::size_t>(a_kind)], sample.type[0] ? sample.type : "", sample.bound[0], sample.bound[1], sample.bound[2], sample.bound[3],
+					VerdictName(static_cast<Verdict>(sample.verdict)), scan, sample.readback,
+					sample.heldSince ? std::format(" (hidden since readback {})", sample.heldSince) : std::string{});
+			}
+		}
+
+		void NoteDrawn(double a_kept, double a_shadowFiled, double a_confirming) noexcept
+		{
+			const auto  context = CurrentContext();
+			const float drawn = static_cast<float>(a_kept + a_shadowFiled);
+			std::array<std::uint64_t, 3> flips{};
+			for (std::size_t i = 0; i < flips.size(); ++i) {
+				flips[i] = g_flipCount[i].load(std::memory_order_relaxed);
+			}
+			const auto flipsThen = std::exchange(g_drawn.flipsThen, flips);
+			// Only a settled, still view: the same view epoch for a while and the view on the depth frame (the frames
+			// after a load or a turn rise for good reasons; v1.50 spent its whole budget in a load's first second).
+			const bool still = context && context->viewEpoch == g_drawn.epoch && context->view[0] == -1.0f && context->view[1] == 1.0f &&
+			                   context->view[2] == -1.0f && context->view[3] == 1.0f;
+			g_drawn.epoch = context ? context->viewEpoch : 0;
+			if (!still) {
+				g_drawn.stillFrames = 0;
+				g_drawn.count = 0;
+				return;
+			}
+			if (++g_drawn.stillFrames > kSpikeSettle && g_drawn.count >= g_drawn.values.size() && g_drawn.logged < kSpikeLogs &&
+				context->clock - g_drawn.lastLogged >= kSpikeSpacing) {
+				auto       recent = g_drawn.values;
+				const auto n = recent.size();
+				std::nth_element(recent.begin(), recent.begin() + n / 2, recent.end());
+				const float median = recent[n / 2];
+				if (drawn > median + kSpikeRise) {
+					++g_drawn.logged;
+					g_drawn.lastLogged = context->clock;
+					const auto& snapshot = *context->snapshot;
+					logger::info(
+						"drawn-set spike {}/{}: clock {} | drawn registrations {:.0f} (recent median {:.0f}): main view kept {:.0f} (confirming {:.0f}), lamp shadow maps filed {:.0f} | flips: objects {}, point lights {}, spot lights {} | depth: readback {} from frame {} merged over {} | view [{:.3f},{:.3f}]x[{:.3f},{:.3f}], camera moved {:.1f}, view epoch {}",
+						g_drawn.logged, kSpikeLogs, context->clock, drawn, median, a_kept, a_confirming, a_shadowFiled, flips[0] - flipsThen[0], flips[1] - flipsThen[1], flips[2] - flipsThen[2],
+						context->readback, snapshot.frame, snapshot.mergedFrames, context->view[0], context->view[1], context->view[2], context->view[3], context->dilateMove, context->viewEpoch);
+					LogFlipSamples(context->clock, FlipKind::kObject);
+					LogFlipSamples(context->clock - 1, FlipKind::kPoint);
+					LogFlipSamples(context->clock - 1, FlipKind::kSpot);
+				}
+			}
+			g_drawn.values[g_drawn.count++ % g_drawn.values.size()] = drawn;
+		}
 
 		// ---- merge-instanced meshes (their instance entries) ------------------------------------
 
@@ -2698,7 +2967,25 @@ namespace CBRO::Core::Occlusion
 		Hooks::CullGroups::SetCellNodeFilter(&SkipCellNode);
 	}
 
-	void EndFrameSample(std::uint64_t a_registrationsTotal)
+	void NoteLightFlip(bool a_spot, const RE::NiPoint3& a_center, float a_radius, SphereVerdict a_verdict, SphereReason a_reason) noexcept
+	{
+		const auto context = CurrentContext();
+		if (!context) {
+			g_flipCount[static_cast<std::size_t>(a_spot ? FlipKind::kSpot : FlipKind::kPoint)].fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		// (the raw verdict again, for the sample: kVisible, or the reason it was unknown)
+		const auto verdict = a_verdict == SphereVerdict::kVisible ? Verdict::kVisible :
+		                     a_reason == SphereReason::kEdge      ? Verdict::kEdge :
+		                     a_reason == SphereReason::kNear      ? Verdict::kNear :
+		                                                            Verdict::kInvalid;
+		RE::NiBound bound{};
+		bound.center = a_center;
+		bound.fRadius = a_radius;
+		NoteFlip(*context, a_spot ? FlipKind::kSpot : FlipKind::kPoint, nullptr, bound, verdict, 0);
+	}
+
+	void EndFrameSample(std::uint64_t a_registrationsTotal, std::uint64_t a_droppedTotal)
 	{
 		const FrameTotals now{
 			Total(kRegistered), Total(kRegistrationsDropped), Total(kRejected) + Total(kDropInherited),
@@ -2708,18 +2995,26 @@ namespace CBRO::Core::Occlusion
 		if (g_frameTotalsKnown && culled) {
 			const auto   d = [](std::uint64_t a_now, std::uint64_t a_then) { return static_cast<double>(a_now - a_then); };
 			const double registered = d(now.registered, g_frameTotals.registered);
-			g_spreadKept.Add(registered - d(now.dropped, g_frameTotals.dropped));
-			g_spreadOther.Add(d(now.allRegistrations, g_frameTotals.allRegistrations) - registered);
+			const double kept = registered - d(now.dropped, g_frameTotals.dropped);
+			const double other = d(now.allRegistrations, g_frameTotals.allRegistrations) - registered;
+			g_spreadKept.Add(kept);
+			g_spreadOther.Add(other);
 			g_spreadRejected.Add(d(now.rejected, g_frameTotals.rejected));
 			g_spreadConfirming.Add(d(now.confirming, g_frameTotals.confirming));
+			NoteDrawn(kept, other - d(a_droppedTotal, g_droppedTotal), d(now.confirming, g_frameTotals.confirming));
 		}
 		g_frameTotals = now;
+		g_droppedTotal = a_droppedTotal;
 		g_frameTotalsKnown = culled;  // (two culled frames in a row give a per-frame delta)
 	}
 
 	void BeginFrame(const FrameContext& a_context)
 	{
 		g_mainStats = &LocalStats();  // (BeginFrame runs on the main thread)
+		g_flipClock.store(a_context.clock, std::memory_order_relaxed);  // (flip samples: a few per kind per frame)
+		for (auto& taken : g_flipTaken) {
+			taken.store(0, std::memory_order_relaxed);
+		}
 		const bool reset = g_resetRequested.exchange(false);
 		if (const auto used = g_used.load(); reset || used > kTableSize * 7 / 10) {
 			if (!reset) {
@@ -2770,23 +3065,40 @@ namespace CBRO::Core::Occlusion
 		g_observeOverride.store(a_observeOnly);
 	}
 
-	SphereVerdict TestSphere(const RE::NiPoint3& a_center, float a_radius) noexcept
+	SphereVerdict TestSphere(const RE::NiPoint3& a_center, float a_radius, SphereReason* a_reason) noexcept
 	{
+		const auto reason = [&](SphereReason a_value) {
+			if (a_reason) {
+				*a_reason = a_value;
+			}
+		};
+		reason(SphereReason::kNone);
 		const auto context = CurrentContext();
 		if (!context) {
+			reason(SphereReason::kNoDepth);
 			return SphereVerdict::kUnknown;
 		}
 		RE::NiBound bound{};
 		bound.center = a_center;
 		bound.fRadius = a_radius;
-		switch (Test(*context, bound)) {
+		LightTest light{};
+		switch (Test(*context, bound, nullptr, &light)) {
 		case Verdict::kHidden:
+			reason(light.overhung ? SphereReason::kOverhang : SphereReason::kNone);
 			return SphereVerdict::kHidden;
 		case Verdict::kVisible:
 			return SphereVerdict::kVisible;
 		case Verdict::kOutside:
+		case Verdict::kBehind:  // (entirely behind the eye: nothing visible is in it)
 			return SphereVerdict::kOutOfView;
+		case Verdict::kEdge:
+			reason(SphereReason::kEdge);
+			return SphereVerdict::kUnknown;
+		case Verdict::kNear:
+			reason(SphereReason::kNear);
+			return SphereVerdict::kUnknown;
 		default:
+			reason(SphereReason::kInvalid);
 			return SphereVerdict::kUnknown;
 		}
 	}
@@ -3167,8 +3479,8 @@ namespace CBRO::Core::Occlusion
 			"occlusion lamp shadow volumes per frame (casters of point lights): outside the view {:.0f} | misses every visible surface {:.0f} | confirming {:.0f} | needed {:.0f} | unknown {:.0f}",
 			per(kLampVolumeOutside), per(kLampVolumeMisses), per(kLampVolumeConfirming), per(kLampVolumeNeeded), per(kLampVolumeUnknown));
 		logger::info(
-			"verdict cache per frame: reused {:.0f} (hidden re-checked against the depth {:.0f}) | evaluated: new {:.0f}, camera epoch {:.0f}, bound changed {:.0f}, depth changed {:.0f}, kept on its turn {:.0f}, never-reuse {:.0f} | sun re-evaluated under a reused view {:.0f}",
-			per(kCacheHits), per(kCacheRecheck), per(kCacheNew), per(kCacheEpoch), per(kCacheBound), per(kCacheDepth), per(kCacheKeptRecheck), per(kCacheNoCache), per(kCacheSunDepth));
+			"verdict cache per frame: reused {:.0f} (hidden re-checked against the depth {:.0f}) | evaluated: new {:.0f}, camera epoch {:.0f}, bound changed {:.0f}, depth changed {:.0f}, kept on its turn {:.0f}, never-reuse {:.0f} | sun re-evaluated under a reused view {:.0f} | hidden streaks continued from the backup {:.1f}",
+			per(kCacheHits), per(kCacheRecheck), per(kCacheNew), per(kCacheEpoch), per(kCacheBound), per(kCacheDepth), per(kCacheKeptRecheck), per(kCacheNoCache), per(kCacheSunDepth), per(kStreakFromBackup));
 		logger::info(
 			"per-frame spread over culled frames (min/avg/max, sd, avg change between consecutive frames): main view kept {} | other views' registrations {} | rejected {} | confirming (verdict flips) {}",
 			g_spreadKept.Describe(), g_spreadOther.Describe(), g_spreadRejected.Describe(), g_spreadConfirming.Describe());

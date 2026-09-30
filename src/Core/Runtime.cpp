@@ -1949,6 +1949,7 @@ namespace CBRO::Core::Runtime
 					if (Settings::Get().lampDiagnostic && Occlusion::Active() && g_state.hooksIn) {
 						ShadowLights::LampLoopBegin();
 					}
+					ShadowLights::SetLampStage(Occlusion::Active() && g_state.hooksIn);  // (spot-light shadow maps may be emptied)
 					g_timing.marks[5] = Qpc();
 					g_gpu.Mark(5);
 					break;
@@ -1966,7 +1967,7 @@ namespace CBRO::Core::Runtime
 				switch (a_stage) {
 				case Stage::kCull:
 					Hooks::CullGroups::SetMainCullActive(false);
-					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations);
+					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations, Hooks::CullGroups::ReadDroppedRegistrations());
 					Feed::EndCull();  // (closes an audit frame: DrawWorld's cull and its jobs are done)
 					{
 						// The set-diff diagnostic files this frame's main-view registrations (settled frames only).
@@ -2011,6 +2012,7 @@ namespace CBRO::Core::Runtime
 				}
 				case Stage::kSunCascades:
 					ShadowLights::LampLoopEnd();  // (nothing unless LampLoopBegin ran this frame)
+					ShadowLights::SetLampStage(false);
 					g_timing.marks[6] = Qpc();
 					g_gpu.Mark(6);
 					break;

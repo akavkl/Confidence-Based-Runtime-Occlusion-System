@@ -109,6 +109,19 @@ namespace CBRO::Core::HiZ
 		// the sphere's rays can't reach are skipped.
 		[[nodiscard]] bool AllNearer(float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine, const SphereRays* a_rays = nullptr) const noexcept;
 
+		// Diagnostic: the level-0 texels of the rectangle (only those the sphere's rays reach, with a_rays) at or beyond
+		// a_threshold. No such texel means a coarse texel alone made AllNearer fail (its refinement ran out).
+		struct FartherScan
+		{
+			std::uint32_t texels{ 0 };
+			std::uint32_t farPlane{ 0 };     // ... of them at the far plane: cleared (no surface) or first-person pixels
+			std::uint32_t firstPerson{ 0 };  // ... of those holding first-person geometry (nearest 0)
+			float         farthest{ 0.0f };
+			float         x{ -1.0f };      // the first one found (level-0 texel coordinates)
+			float         y{ -1.0f };
+		};
+		[[nodiscard]] FartherScan ScanFarther(float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, const SphereRays* a_rays) const noexcept;
+
 	private:
 		[[nodiscard]] bool AllNearerAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept;
 		[[nodiscard]] bool AllFartherAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine) const noexcept;

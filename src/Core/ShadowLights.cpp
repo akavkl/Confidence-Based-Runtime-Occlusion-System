@@ -1,6 +1,7 @@
 #include "Core/ShadowLights.h"
 
 #include "Core/Occlusion.h"
+#include "Hooks/CullGroups.h"
 #include "Settings.h"
 #include "Util/Hooking.h"
 
@@ -51,6 +52,7 @@ namespace CBRO::Core::ShadowLights
 		// The light's NiLight is at +0xB8 (BSLight), as for the parabolic light; NiLight::spec.r (+0x138) is the radius.
 		constexpr std::uint64_t kFrustumLightVtableID = 67506;
 		constexpr std::size_t   kLightNiLightOffset = 0xB8;
+		constexpr std::size_t   kLightFaces = 0x198;  // the shadow faces record (one face for a spot light)
 
 		// ---- the lamps of a frame (main thread: the shadow stage writes, the cull begin publishes) --------------------
 		LampList                   g_lampLists[2];
@@ -159,6 +161,50 @@ namespace CBRO::Core::ShadowLights
 		std::atomic<std::uint64_t> g_outOfViewVerdicts{ 0 };
 		std::atomic<int>           g_samplesLogged{ 0 };
 
+		// Why lights were kept though not seen, and how many were judged hidden through a thin view overhang (for the log).
+		struct ReasonCounts
+		{
+			std::atomic<std::uint64_t> overhang{ 0 };
+			std::atomic<std::uint64_t> nearCamera{ 0 };
+			std::atomic<std::uint64_t> edge{ 0 };
+			std::atomic<std::uint64_t> noDepth{ 0 };
+			std::atomic<std::uint64_t> invalid{ 0 };
+
+			void Count(Occlusion::SphereReason a_reason) noexcept
+			{
+				switch (a_reason) {
+				case Occlusion::SphereReason::kOverhang:
+					overhang.fetch_add(1, std::memory_order_relaxed);
+					break;
+				case Occlusion::SphereReason::kNear:
+					nearCamera.fetch_add(1, std::memory_order_relaxed);
+					break;
+				case Occlusion::SphereReason::kEdge:
+					edge.fetch_add(1, std::memory_order_relaxed);
+					break;
+				case Occlusion::SphereReason::kNoDepth:
+					noDepth.fetch_add(1, std::memory_order_relaxed);
+					break;
+				case Occlusion::SphereReason::kInvalid:
+					invalid.fetch_add(1, std::memory_order_relaxed);
+					break;
+				default:
+					break;
+				}
+			}
+
+			std::string Take(double a_frames) noexcept
+			{
+				const auto per = [&](std::atomic<std::uint64_t>& a_counter) { return static_cast<double>(a_counter.exchange(0)) / a_frames; };
+				const double nearCameraPer = per(nearCamera), edgePer = per(edge), noDepthPer = per(noDepth), invalidPer = per(invalid);
+				return std::format(
+					" [reaches the camera {:.2f}, view overhang too wide {:.2f}, no depth {:.2f}, bad bound {:.2f}] | hidden through a thin view overhang {:.2f}",
+					nearCameraPer, edgePer, noDepthPer, invalidPer, per(overhang));
+			}
+		};
+		ReasonCounts g_pointReasons;
+		ReasonCounts g_spotReasons;
+
 		std::uint64_t LightKey(const RE::NiPoint3& a_position, float a_reach) noexcept
 		{
 			const auto q = [](float a_v) { return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(a_v / 8.0f)) & 0xFFFF); };
@@ -221,7 +267,9 @@ namespace CBRO::Core::ShadowLights
 				return false;
 			}
 
-			const auto verdict = Occlusion::TestSphere(position, reach);
+			auto       reason = Occlusion::SphereReason::kNone;
+			const auto verdict = Occlusion::TestSphere(position, reach, &reason);
+			g_pointReasons.Count(reason);
 			const auto clock = Occlusion::Clock();
 			auto&      slot = *FindSlot(LightKey(position, reach), clock);
 			auto       streak = slot.streak.load(std::memory_order_relaxed);
@@ -234,6 +282,9 @@ namespace CBRO::Core::ShadowLights
 					slot.streak.store(streak, std::memory_order_relaxed);
 				}
 			} else {
+				if (streak >= g_confirmFrames) {
+					Occlusion::NoteLightFlip(false, position, reach, verdict, reason);  // (diagnostic: an emptied map drawn again)
+				}
 				slot.streak.store(0, std::memory_order_relaxed);
 				slot.lastClock.store(clock, std::memory_order_relaxed);
 				(verdict == Occlusion::SphereVerdict::kVisible ? g_visible : g_unknown).fetch_add(1, std::memory_order_relaxed);
@@ -249,6 +300,138 @@ namespace CBRO::Core::ShadowLights
 				return false;
 			}
 			g_emptied.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		}
+
+		// ---- spot lights: an empty shadow map when the lit volume is hidden (v1.48) -------------------------------------
+		// BSShadowFrustumLight::Update(camera) (slot 14, 0x1428D9E40) prepares the frame's shadow camera (faces +0x40: the
+		// NiLight's world transform; frustum far = light +0x204 if positive, else NiLight::spec.r) and the shadow map's
+		// accumulator (faces +0x48, render mode 15), then decides visibility (0x14285DA50) by overlapping the shadow
+		// camera's pyramid (far plane at far along rotation row 0, half extents far x top along row 1 and far x right
+		// along row 2) with the main camera's: the engine takes that pyramid as the lit volume. When its bounding sphere
+		// is hidden behind the depth, no visible pixel is lit, so every caster the light's cull then files into the
+		// accumulator is dropped (Hooks::CullGroups): the shadow map draws nothing; the light pass is left alone.
+		constexpr std::size_t   kFaceShadowCamera = 0x40;
+		constexpr std::size_t   kFaceAccumulator = 0x48;
+		constexpr std::size_t   kLightShadowFar = 0x204;
+		constexpr std::size_t   kCameraRotate = 0x70;     // NiAVObject world rotation (row 0: the view direction)
+		constexpr std::size_t   kCameraTranslate = 0xA0;  // ... world translate
+		constexpr std::size_t   kCameraFrustum = 0x160;   // NiFrustum: left, right, top, bottom, near, far, ortho (+0x18)
+		constexpr std::uint64_t kSpotKeySalt = 0x8000'0000'0000'0000ull;  // spot and point streaks keep separate slots
+
+		bool g_spotCulling{ true };  // bSpotShadowCulling
+		bool g_lampStage{ false };   // the main frame's deferred-lights stage is running (CBRO frame)
+
+		std::atomic<std::uint64_t> g_spotTests{ 0 };
+		std::atomic<std::uint64_t> g_spotEmptied{ 0 };
+		std::atomic<std::uint64_t> g_spotWouldEmpty{ 0 };
+		std::atomic<std::uint64_t> g_spotConfirming{ 0 };
+		std::atomic<std::uint64_t> g_spotVisible{ 0 };
+		std::atomic<std::uint64_t> g_spotUnknown{ 0 };
+		std::atomic<std::uint64_t> g_spotHidden{ 0 };
+		std::atomic<std::uint64_t> g_spotOutOfView{ 0 };
+		std::atomic<std::uint64_t> g_spotUnreadable{ 0 };
+		std::atomic<std::uint64_t> g_spotByFrustum{ 0 };
+		std::atomic<int>           g_spotVolumesLogged{ 0 };
+
+		// The spot light's lit volume as a sphere (around the whole reach's part inside the shadow frustum) and its
+		// shadow map's accumulator, read after the engine's Update(camera) passed (both are this frame's).
+		bool ReadSpotVolume(std::uintptr_t a_light, const RE::NiPoint3& a_position, float a_reach, RE::NiBound& a_volume, bool& a_byFrustum, const void*& a_accumulator) noexcept
+		{
+			__try {
+				const auto faces = *reinterpret_cast<const std::uintptr_t*>(a_light + kLightFaces);
+				const auto camera = faces ? *reinterpret_cast<const std::uintptr_t*>(faces + kFaceShadowCamera) : 0;
+				a_accumulator = faces ? *reinterpret_cast<const void* const*>(faces + kFaceAccumulator) : nullptr;
+				if (!camera || !a_accumulator) {
+					return false;
+				}
+				const auto  finite = [](float a_value) { return std::isfinite(a_value) ? a_value : 0.0f; };
+				const auto* frustum = reinterpret_cast<const float*>(camera + kCameraFrustum);
+				// Every lit point lies within this of the light: its radius, bounds, shadow far and frustum far.
+				const float length = std::max({ a_reach, finite(*reinterpret_cast<const float*>(a_light + kLightShadowFar)), finite(frustum[5]) });
+				a_volume.center = a_position;
+				a_volume.fRadius = length;
+				a_byFrustum = false;
+
+				const bool  ortho = *reinterpret_cast<const std::uint8_t*>(camera + kCameraFrustum + 0x18) != 0;
+				const auto* row0 = reinterpret_cast<const float*>(camera + kCameraRotate);
+				const auto* apex = reinterpret_cast<const float*>(camera + kCameraTranslate);
+				const float tanX = std::max(std::abs(frustum[0]), std::abs(frustum[1]));
+				const float tanY = std::max(std::abs(frustum[2]), std::abs(frustum[3]));
+				const float axis = row0[0] * row0[0] + row0[1] * row0[1] + row0[2] * row0[2];
+				const float dx = apex[0] - a_position.x, dy = apex[1] - a_position.y, dz = apex[2] - a_position.z;
+				// Only a perspective frustum with a unit axis, at the light (the camera follows the NiLight).
+				if (ortho || !std::isfinite(tanX) || !std::isfinite(tanY) || !(tanX > 0.0f) || !(tanY > 0.0f) || !(std::abs(axis - 1.0f) < 0.01f) ||
+					!(dx * dx + dy * dy + dz * dz < 64.0f)) {
+					return true;
+				}
+				float along = 0.0f, radius = 0.0f;
+				ShadowGeometry::SpotSphere(length, std::sqrt(tanX * tanX + tanY * tanY), along, radius);
+				if (std::isfinite(radius) && radius < a_volume.fRadius) {
+					a_volume.center = RE::NiPoint3{ apex[0] + row0[0] * along, apex[1] + row0[1] * along, apex[2] + row0[2] * along };
+					a_volume.fRadius = radius;
+					a_byFrustum = true;
+				}
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		// Whether the spot light's shadow map can stay empty this frame (its lit volume hidden for confirmFrames frames),
+		// with the accumulator its casters go to. Main thread (the lamp loop).
+		bool ShouldEmptySpot(std::uintptr_t a_light, const void*& a_accumulator) noexcept
+		{
+			g_spotTests.fetch_add(1, std::memory_order_relaxed);
+			RE::NiPoint3 position{};
+			float        reach = 0.0f;
+			RE::NiBound  volume{};
+			bool         byFrustum = false;
+			if (!ReadSpotLight(a_light, position, reach) || !ReadSpotVolume(a_light, position, reach, volume, byFrustum, a_accumulator)) {
+				g_spotUnreadable.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			if (byFrustum) {
+				g_spotByFrustum.fetch_add(1, std::memory_order_relaxed);
+			}
+			auto       reason = Occlusion::SphereReason::kNone;
+			const auto verdict = Occlusion::TestSphere(volume.center, volume.fRadius, &reason);
+			g_spotReasons.Count(reason);
+			if (g_spotVolumesLogged.load(std::memory_order_relaxed) < 8 && g_spotVolumesLogged.fetch_add(1) < 8) {
+				constexpr const char* kVerdicts[]{ "unknown", "visible", "hidden", "out of view" };
+				logger::info(
+					"shadow lights: spot light at ({:.0f},{:.0f},{:.0f}) reach {:.0f} | lit volume ({}) sphere at ({:.0f},{:.0f},{:.0f}) radius {:.0f} -> {}",
+					position.x, position.y, position.z, reach, byFrustum ? "shadow frustum" : "whole reach", volume.center.x, volume.center.y, volume.center.z,
+					volume.fRadius, kVerdicts[static_cast<int>(verdict)]);
+			}
+			const auto clock = Occlusion::Clock();
+			auto&      slot = *FindSlot(LightKey(position, reach) ^ kSpotKeySalt, clock);
+			auto       streak = slot.streak.load(std::memory_order_relaxed);
+			// Behind visible surfaces or out of view entirely: either way no visible pixel is lit.
+			if (verdict == Occlusion::SphereVerdict::kHidden || verdict == Occlusion::SphereVerdict::kOutOfView) {
+				(verdict == Occlusion::SphereVerdict::kHidden ? g_spotHidden : g_spotOutOfView).fetch_add(1, std::memory_order_relaxed);
+				if (slot.lastClock.exchange(clock, std::memory_order_relaxed) != clock) {
+					streak = std::min(streak + 1, 255u);
+					slot.streak.store(streak, std::memory_order_relaxed);
+				}
+			} else {
+				if (streak >= g_confirmFrames) {
+					Occlusion::NoteLightFlip(true, volume.center, volume.fRadius, verdict, reason);  // (diagnostic)
+				}
+				slot.streak.store(0, std::memory_order_relaxed);
+				slot.lastClock.store(clock, std::memory_order_relaxed);
+				(verdict == Occlusion::SphereVerdict::kVisible ? g_spotVisible : g_spotUnknown).fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			if (streak < g_confirmFrames) {
+				g_spotConfirming.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			if (Occlusion::Deciding()) {
+				g_spotWouldEmpty.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			g_spotEmptied.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
 
@@ -457,7 +640,6 @@ namespace CBRO::Core::ShadowLights
 		constexpr std::size_t   kStateRoomCount = 0x28;
 		constexpr std::size_t   kStateUnrestricted = 0x138;
 		constexpr std::size_t   kLightQueued = 0x18;
-		constexpr std::size_t   kLightFaces = 0x198;
 		constexpr std::size_t   kFaceCuller = 0xE0;
 		constexpr std::size_t   kFaceSlice = 0x54;
 		constexpr std::size_t   kNiLightFade = 0x144;
@@ -537,9 +719,17 @@ namespace CBRO::Core::ShadowLights
 		{
 			const bool result = reinterpret_cast<UpdateFn>(g_originalUpdateSpot)(a_light, a_camera);
 			NoteUpdate(a_light, result);
+			const void* dropped = nullptr;
 			if (result && Occlusion::Active()) {
-				RecordSpotLight(a_light);
+				RecordSpotLight(a_light);  // (emptied or not: the lamp list stays every lamp the engine lights)
+				// Only in the main frame's lamp loop: another view's render would be judged against the wrong depth.
+				const void* accumulator = nullptr;
+				if (g_spotCulling && g_lampStage && ShouldEmptySpot(a_light, accumulator)) {
+					dropped = accumulator;
+				}
 			}
+			// This light's cull comes next in the loop; the next light's Update (or the stage's end) resets it.
+			Hooks::CullGroups::SetDroppedAccumulator(dropped);
 			return result;
 		}
 
@@ -745,6 +935,8 @@ namespace CBRO::Core::ShadowLights
 		// lamp trimming (bLampGroupTrim) does nothing.
 		g_originalUpdateSpot = Util::WriteVFuncSwitchable(g_updateSpotHook, CBRO::Engine::OG(kFrustumLightVtableID).address(), kUpdateSlot, Util::FnAddr(&UpdateSpotThunk), "shadowlights:BSShadowFrustumLight::Update(cam)");
 		logger::info("shadow lights: spot lights recorded from Update(camera): hook {}", g_originalUpdateSpot ? "in" : "FAILED (lamp trimming off)");
+		g_spotCulling = Settings::Get().spotShadowCulling;
+		logger::info("shadow lights: spot-light shadow maps emptied when the lit volume is hidden: {}", !g_spotCulling ? "off (bSpotShadowCulling=0)" : g_originalUpdateSpot ? "on" : "unavailable (no Update hook)");
 
 		// The lamp-loop diagnostic: the point lights' Update(camera) too.
 		if (Settings::Get().lampDiagnostic) {
@@ -767,8 +959,19 @@ namespace CBRO::Core::ShadowLights
 		return *g_lampsPublished.load(std::memory_order_acquire);
 	}
 
+	void SetLampStage(bool a_open) noexcept
+	{
+		g_lampStage = a_open;
+		if (!a_open) {
+			Hooks::CullGroups::SetDroppedAccumulator(nullptr);
+		}
+	}
+
 	bool SetHooksIn(bool a_in)
 	{
+		if (!a_in) {
+			SetLampStage(false);  // (previs mode: nothing of the engine's is dropped)
+		}
 		bool ok = true;
 		for (auto* hook : { &g_cameraHook, &g_objectHook, &g_updatePointHook, &g_updateSpotHook }) {
 			if (hook->address && !Util::SetHook(*hook, a_in)) {
@@ -792,10 +995,19 @@ namespace CBRO::Core::ShadowLights
 		const auto   hidden = take(g_hiddenVerdicts);
 		const auto   outOfView = take(g_outOfViewVerdicts);
 		logger::info(
-			"shadow lights per frame: shadow culls {:.1f} | emptied {:.1f}{} (verdicts: behind surfaces {:.1f}, out of view {:.1f}) | confirming {:.1f} | visible {:.1f} | kept (reaches camera/partly off-screen/no depth) {:.1f}",
+			"shadow lights per frame: shadow culls {:.1f} | emptied {:.1f}{} (verdicts: behind surfaces {:.1f}, out of view {:.1f}) | confirming {:.1f} | visible {:.1f} | kept (reaches camera/partly off-screen/no depth) {:.1f}{}",
 			calls / frames, emptied / frames,
 			wouldEmpty > 0 ? std::format(" (decide-only: would empty {:.1f})", wouldEmpty / frames) : std::string{},
-			hidden / frames, outOfView / frames, confirming / frames, visible / frames, unknown / frames);
+			hidden / frames, outOfView / frames, confirming / frames, visible / frames, unknown / frames, g_pointReasons.Take(frames));
+		const auto spotTests = take(g_spotTests);
+		const auto spotWouldEmpty = take(g_spotWouldEmpty);
+		const auto spotDropped = static_cast<double>(Hooks::CullGroups::TakeDroppedRegistrations());
+		logger::info(
+			"spot-light shadow maps per frame: tested {:.1f} | emptied {:.1f}{} (verdicts: behind surfaces {:.1f}, out of view {:.1f}) | confirming {:.1f} | visible {:.1f} | kept (reaches camera/partly off-screen/no depth) {:.1f}{} | unreadable {:.1f} | lit volume from the shadow frustum {:.1f} (else the whole reach) | casters dropped {:.0f}",
+			spotTests / frames, take(g_spotEmptied) / frames,
+			spotWouldEmpty > 0 ? std::format(" (decide-only: would empty {:.1f})", spotWouldEmpty / frames) : std::string{},
+			take(g_spotHidden) / frames, take(g_spotOutOfView) / frames, take(g_spotConfirming) / frames, take(g_spotVisible) / frames,
+			take(g_spotUnknown) / frames, g_spotReasons.Take(frames), take(g_spotUnreadable) / frames, take(g_spotByFrustum) / frames, spotDropped / frames);
 		const auto regions = take(g_regionLights);
 		const auto inside = take(g_regionInside);
 		const auto tests = take(g_casterTests);

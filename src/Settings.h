@@ -28,6 +28,7 @@ namespace CBRO
 		bool          sunShadowCulling{ true };    // skip hidden objects whose sun shadow can't fall on anything visible
 		bool          lampShadowCulling{ true };   // leave casters out of point-light shadow maps where they can't shadow the view
 		bool          lampShadowVolumes{ true };   // ... also when their shadow volume misses every visible surface (nearest/farthest depth test)
+		bool          spotShadowCulling{ true };   // spot lights: the shadow map draws nothing while the lit volume (shadow frustum) is hidden
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
 		bool          interiors{ true };           // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)
