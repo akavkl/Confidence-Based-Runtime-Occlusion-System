@@ -70,6 +70,7 @@ namespace CBRO::Core::Runtime
 			std::uint64_t renderFrame{ 0 };  // advances at every pre-pass end
 			std::uint32_t clock{ 0 };        // advances at every cull stage
 			bool          wantActive{ false };
+			bool          interiorStandby{ false };   // the scene is an interior/override root and bInteriors=0: previs mode regardless of wantActive
 			bool          toggleKeyDown{ false };
 			bool          failureHandled{ false };
 			std::atomic<int> previsRequest{ -1 };  // previs to switch at the next cull begin: 0 off, 1 back to the original (-1: none)
@@ -1417,7 +1418,7 @@ namespace CBRO::Core::Runtime
 		void NotifyStatus()
 		{
 			if (!Occlusion::Active()) {
-				Notify(g_state.wantActive ? "CBRO unavailable - previs is handling visibility" : "CBRO off - previs on");
+				Notify(!g_state.wantActive ? "CBRO off - previs on" : g_state.interiorStandby ? "CBRO standing by (interior) - previs is handling visibility" : "CBRO unavailable - previs is handling visibility");
 				return;
 			}
 			const auto tested = Occlusion::TestedPerFrame();
@@ -1430,25 +1431,28 @@ namespace CBRO::Core::Runtime
 			           std::string("CBRO on (previs off) - warming up"));
 		}
 
-		void ApplyMode(bool a_active, std::string_view a_reason)
+		// The effective mode from the wish (wantActive), the interior standby and CBRO's availability.
+		void ApplyEffective(std::string_view a_reason)
 		{
 			const auto& settings = Settings::Get();
-			g_state.wantActive = a_active;
-			// Previs only goes off when CBRO can actually take over.
-			const bool effective = a_active && g_state.convention != Convention::kNone && !HiZ::Failed();
+			const bool  wanted = g_state.wantActive;
+			const bool  standby = g_state.interiorStandby;
+			// Previs only goes off when CBRO can actually take over, and never in an interior CBRO stands by in.
+			const bool effective = wanted && !standby && g_state.convention != Convention::kNone && !HiZ::Failed();
 			Occlusion::SetActive(effective);
 			Occlusion::ResetHistory();
 			logger::info(
 				"mode: {} ({})",
-				effective ? "CBRO occlusion" : a_active ? "previs (CBRO requested but unavailable)" : "previs (CBRO off)", a_reason);
+				effective ? "CBRO occlusion" : !wanted ? "previs (CBRO off)" : standby ? "previs (CBRO standing by: interior, bInteriors=0)" : "previs (CBRO requested but unavailable)", a_reason);
 			if (static_cast<int>(effective) != g_state.notifiedEffective) {
 				g_state.notifiedEffective = effective;
+				const char* off = !wanted ? "CBRO off - previs on" : standby ? "CBRO standing by (interior) - previs on" : "CBRO unavailable - previs on";
 				if (Feed::ManagesPrevis()) {
-					Notify(effective ? "CBRO on - previs suspended only inside CBRO's cull windows" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
+					Notify(effective ? "CBRO on - previs suspended only inside CBRO's cull windows" : off);
 				} else if (settings.disablePrevis) {
-					Notify(effective ? "CBRO on - previs off" : a_active ? "CBRO unavailable - previs on" : "CBRO off - previs on");
+					Notify(effective ? "CBRO on - previs off" : off);
 				} else {
-					Notify(effective ? "CBRO on - working with previs" : a_active ? "CBRO unavailable - previs only" : "CBRO off - previs only");
+					Notify(effective ? "CBRO on - working with previs" : !wanted ? "CBRO off - previs only" : standby ? "CBRO standing by (interior) - previs only" : "CBRO unavailable - previs only");
 				}
 			}
 
@@ -1462,6 +1466,29 @@ namespace CBRO::Core::Runtime
 			// shows the switch on five different thread ids. Its disable path runs the engine's flush callbacks,
 			// which must not race the main thread's cull.
 			g_state.previsRequest.store(effective ? 0 : 1);
+		}
+
+		void ApplyMode(bool a_active, std::string_view a_reason)
+		{
+			g_state.wantActive = a_active;
+			ApplyEffective(a_reason);
+		}
+
+		// bInteriors=0: in an interior or an override-root scene CBRO stands by (previs mode, nothing touched) and
+		// resumes in exteriors. Decided at the cull begin from the engine's own gates (Hooks/PrevisFeed), like the
+		// hotkey: the frame's window may still be the previous mode's (Core/Feed handles that switch frame).
+		void SyncInteriorStandby()
+		{
+			if (Settings::Get().interiors || !Feed::ManagesPrevis()) {
+				return;
+			}
+			const auto gates = Hooks::PrevisFeed::ReadGates();
+			const bool interior = gates.readable && (!gates.exterior || gates.overrideRoot);
+			if (interior == g_state.interiorStandby) {
+				return;
+			}
+			g_state.interiorStandby = interior;
+			ApplyEffective(interior ? "interior/override root: the engine's previs and rooms cull it (bInteriors=0)" : "exterior: CBRO resumes");
 		}
 
 		// Switches previs where the console's `tpc` does: on the main thread, with no cull reading previs data
@@ -1566,6 +1593,7 @@ namespace CBRO::Core::Runtime
 				ApplyMode(g_state.wantActive, "hi-z unavailable");
 			}
 			// The frame's path (previs / CBRO classic / CBRO feed) and the previs suspension, before the hooks follow.
+			SyncInteriorStandby();
 			Feed::BeginFrame(Occlusion::Active(), g_state.clock + 1);
 			SyncHooks();
 

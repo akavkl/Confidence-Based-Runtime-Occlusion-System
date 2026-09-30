@@ -29,6 +29,7 @@ namespace CBRO
 		bool          lampShadowVolumes{ true };   // ... also when their shadow volume misses every visible surface (nearest/farthest depth test)
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
+		bool          interiors{ false };          // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)
 		std::uint32_t feedAuditInterval{ 600 };    // frames between audits of CBRO's scene-walk replica (0 = off)
 		bool          verdictCache{ true };        // reuse last frame's verdict while nothing it depended on changed
 		float         cacheMove{ 4.0f };           // camera movement (units) a reused verdict tolerates; bounds grow by it
