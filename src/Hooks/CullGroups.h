@@ -130,6 +130,10 @@ namespace CBRO::Hooks::CullGroups
 	void SetInstanceFilter(InstanceFilter a_filter);
 	void SetGroupFilter(GroupFilter a_filter);
 	void SetMainViewFilter(MainViewFilter a_filter);
+	// Every main-accumulator registration, in both modes (a diagnostic observer, Core/SetDiff): the engine's object
+	// pointer, on whichever thread registers it. Null = none.
+	using MainRegistrationObserver = void (*)(RE::NiAVObject* a_object);
+	void SetMainRegistrationObserver(MainRegistrationObserver a_observer);
 	void SetCellNodeFilter(CellNodeFilter a_filter);
 	[[nodiscard]] std::uint64_t TakeGroupAddsConsidered() noexcept;  // main-only Group::Adds offered to the group filter
 	[[nodiscard]] std::string   TakeGroupAddSites(double a_frames);  // their callers (return addresses) since the last call, most frequent first

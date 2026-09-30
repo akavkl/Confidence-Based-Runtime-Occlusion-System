@@ -207,6 +207,7 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<GroupObserver>  g_groupObserver{ nullptr };
 		std::atomic<GroupFilter>    g_groupFilter{ nullptr };
 		std::atomic<MainViewFilter> g_mainViewFilter{ nullptr };
+		std::atomic<MainRegistrationObserver> g_mainRegistrationObserver{ nullptr };
 		std::atomic<CellNodeFilter>     g_cellNodeFilter{ nullptr };
 		std::atomic<bool>           g_mainCullActive{ false };
 
@@ -445,6 +446,10 @@ namespace CBRO::Hooks::CullGroups
 			if ((counts.registrations.load(std::memory_order_relaxed) & 15) == 0) {  // sampled 1 in 16 per thread (the log scales it back)
 				RecordRegistration(reinterpret_cast<std::uintptr_t>(a_accumulator));
 			}
+			if (const auto observer = g_mainRegistrationObserver.load(std::memory_order_relaxed);
+				observer && a_accumulator && a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
+				observer(a_object);  // (both modes: the diagnostic compares them)
+			}
 			if (g_mainCullActive.load(std::memory_order_relaxed) && a_accumulator &&
 				a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
 				if (const auto filter = g_mainViewFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
@@ -651,6 +656,11 @@ namespace CBRO::Hooks::CullGroups
 	void SetMainViewFilter(MainViewFilter a_filter)
 	{
 		g_mainViewFilter.store(a_filter);
+	}
+
+	void SetMainRegistrationObserver(MainRegistrationObserver a_observer)
+	{
+		g_mainRegistrationObserver.store(a_observer);
 	}
 
 	void SetCellNodeFilter(CellNodeFilter a_filter)

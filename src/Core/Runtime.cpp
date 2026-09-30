@@ -1,6 +1,7 @@
 #include "Core/Runtime.h"
 
 #include "Core/Feed.h"
+#include "Core/SetDiff.h"
 #include "Core/HiZ.h"
 #include "Core/Occlusion.h"
 #include "Core/ShadowLights.h"
@@ -878,6 +879,7 @@ namespace CBRO::Core::Runtime
 		{
 			kBucketCull,
 			kBucketPrePass,
+			kBucketHiZ,  // CBRO's depth capture and hi-z build, right after the pre-pass (marks 3-4; previs mode: nothing)
 			kBucketSun,
 			kBucketForward,
 			kBucketBetween,
@@ -886,8 +888,10 @@ namespace CBRO::Core::Runtime
 		};
 		// (the "shadow maps" stage, Render_PreUI+0x1BF, renders the lamps' shadow maps as well as the sun's cascades: the
 		// v1.31 interior run had 10 ms of lamp shadow maps in it with no sun at all)
-		constexpr std::array   kBucketNames{ "cull"sv, "pre-pass"sv, "shadow maps"sv, "forward"sv, "between"sv, "rest"sv };
-		constexpr std::size_t  kMarkCount = 9;
+		constexpr std::array   kBucketNames{ "cull"sv, "pre-pass"sv, "hi-z"sv, "shadow maps"sv, "forward"sv, "between"sv, "rest"sv };
+		// Marks: 0 cull begin, 1 cull end, 2 pre-pass begin, 3 pre-pass end (the engine's), 4 hi-z capture end, 5 shadow
+		// maps begin, 6 shadow maps end, 7 forward begin, 8 forward end, 9 the next frame's cull begin.
+		constexpr std::size_t  kMarkCount = 10;
 
 		struct ModeBuckets
 		{
@@ -927,10 +931,13 @@ namespace CBRO::Core::Runtime
 					case 2:
 						bucket = kBucketPrePass;
 						break;
-					case 4:
+					case 3:
+						bucket = kBucketHiZ;
+						break;
+					case 5:
 						bucket = kBucketSun;
 						break;
-					case 6:
+					case 7:
 						bucket = kBucketForward;
 						break;
 					default:
@@ -1239,6 +1246,7 @@ namespace CBRO::Core::Runtime
 			g_frames.anchored = false;
 			g_frames.dumpedHere = false;
 			++g_frames.location;
+			SetDiff::Reset();
 			logger::info("A/B: location {} starts ({})", g_frames.location, a_reason);
 		}
 
@@ -1686,6 +1694,7 @@ namespace CBRO::Core::Runtime
 				LogSun();
 				ShadowLights::LogStats(g_state.framesSinceLog);
 				Feed::LogStats(g_state.framesSinceLog);
+				SetDiff::LogStats();
 				LogTiming();
 				g_state.framesSinceLog = 0;
 			}
@@ -1760,12 +1769,12 @@ namespace CBRO::Core::Runtime
 					g_gpu.Mark(2);
 					break;
 				case Stage::kSunCascades:
-					g_timing.marks[4] = Qpc();
-					g_gpu.Mark(4);
+					g_timing.marks[5] = Qpc();
+					g_gpu.Mark(5);
 					break;
 				case Stage::kForward:
-					g_timing.marks[6] = Qpc();
-					g_gpu.Mark(6);
+					g_timing.marks[7] = Qpc();
+					g_gpu.Mark(7);
 					break;
 				default:
 					break;
@@ -1779,25 +1788,35 @@ namespace CBRO::Core::Runtime
 					Hooks::CullGroups::SetMainCullActive(false);
 					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations);
 					Feed::EndCull();  // (closes an audit frame: DrawWorld's cull and its jobs are done)
+					{
+						// The set-diff diagnostic files this frame's main-view registrations (settled frames only).
+						const auto ui = RE::UI::GetSingleton();
+						const bool settled = g_frames.sinceSwitch > kSettleFrames && g_frames.sinceLoad > kLoadSettleFrames && !(ui && ui->menuMode != 0);
+						const auto root = RE::Main::WorldRootCamera();
+						SetDiff::EndCull(CurrentMode(), settled, root ? root->world.translate : RE::NiPoint3{});
+					}
 					g_timing.marks[1] = Qpc();
 					g_gpu.Mark(1);
 					break;
 				case Stage::kPrePass: {
 					const auto end = Qpc();
 					++g_timing.prepassFrames;
-					OnPrePassEnd();
-					g_timing.captureTicks += Qpc() - end;
-					g_timing.marks[3] = end;  // (the depth capture that follows is CBRO's own, in the pre-pass bucket)
+					g_timing.marks[3] = end;  // the engine's pre-pass ends here; CBRO's depth capture follows (the "hi-z" bucket)
 					g_gpu.Mark(3);
+					OnPrePassEnd();
+					const auto captured = Qpc();
+					g_timing.captureTicks += captured - end;
+					g_timing.marks[4] = captured;
+					g_gpu.Mark(4);
 					break;
 				}
 				case Stage::kSunCascades:
-					g_timing.marks[5] = Qpc();
-					g_gpu.Mark(5);
+					g_timing.marks[6] = Qpc();
+					g_gpu.Mark(6);
 					break;
 				case Stage::kForward:
-					g_timing.marks[7] = Qpc();
-					g_gpu.Mark(7);
+					g_timing.marks[8] = Qpc();
+					g_gpu.Mark(8);
 					break;
 				default:
 					break;
@@ -1829,6 +1848,7 @@ namespace CBRO::Core::Runtime
 		ShadowLights::Install();
 		Hooks::PrevisFeed::Install();  // (pass-through wrappers on the engine's two previs feed sites, plus the accessors)
 		Feed::Install();
+		SetDiff::Install(settings.setDiff);
 		Hooks::RenderStages::AddListener(&g_listener);
 		g_state.installed = true;
 		g_state.wantActive = settings.startActive;
