@@ -36,6 +36,7 @@ namespace CBRO
 		bool          setDiff{ true };             // diagnostic: main-view registrations compared between the modes at each A/B location (Core/SetDiff)
 		bool          async{ true };               // verdicts judged by a worker after the cull, looked up by the walk a frame later (Core/Async); 0 = inside the walk
 		bool          lampGroupTrim{ true };       // sun off: group-0 entries the main view doesn't need are left out when no lamp's shadow of them can reach a visible surface
+		bool          unoccludeLights{ true };     // CBRO frames: clear the previs-driven BSLight::bOccluded mark before the deferred-lights stage (dark lamps otherwise)
 		std::uint32_t feedAuditInterval{ 600 };    // frames between audits of CBRO's scene-walk replica (0 = off)
 		bool          verdictCache{ true };        // reuse last frame's verdict while nothing it depended on changed
 		float         cacheMove{ 4.0f };           // camera movement (units) a reused verdict tolerates; bounds grow by it

@@ -1857,6 +1857,11 @@ namespace CBRO::Core::Runtime
 					g_gpu.Mark(2);
 					break;
 				case Stage::kSunCascades:
+					// The deferred-lights stage follows. In a CBRO frame the walk ran with previs inactive, so a light previs
+					// had marked occluded stays marked and dark (FO4-ENGINE-NOTES 6.7); clear the mark, as previs-off vanilla.
+					if (Settings::Get().unoccludeLights && Occlusion::Active() && g_state.hooksIn) {
+						ShadowLights::UnoccludeLights();
+					}
 					g_timing.marks[5] = Qpc();
 					g_gpu.Mark(5);
 					break;

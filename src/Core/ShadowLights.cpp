@@ -383,6 +383,74 @@ namespace CBRO::Core::ShadowLights
 		logger::info("shadow lights: spot-light hook not installed (see the comment: XMM arguments); spot lights are not recorded");
 	}
 
+	namespace
+	{
+		// ShadowSceneNode (global 879298 = 0x1467231B0, a pointer): the shadow lights at +0x170 (BSShadowLight* array,
+		// count u16 at +0x180: what DeferredLightsImpl's lamp loop walks through 43862), and the light list at +0x158
+		// (BSTArray<BSLight*>: data +0x158, capacity u32 +0x160, size u32 +0x164). BSLight::bOccluded is the byte at +0x17C.
+		constexpr std::uint64_t kShadowSceneNodeID = 879298;
+		constexpr std::size_t   kShadowLightsArray = 0x170;
+		constexpr std::size_t   kShadowLightsCount = 0x180;
+		constexpr std::size_t   kLightsArray = 0x158;
+		constexpr std::size_t   kLightsCapacity = 0x160;
+		constexpr std::size_t   kLightsSize = 0x164;
+		constexpr std::size_t   kLightOccluded = 0x17C;
+		constexpr std::uint32_t kMaxLights = 8192;
+		std::uintptr_t             g_shadowSceneNode{ 0 };
+		std::atomic<std::uint64_t> g_unoccludeFrames{ 0 };
+		std::atomic<std::uint64_t> g_unoccluded{ 0 };
+
+		std::uint32_t ClearOccluded(std::uintptr_t a_array, std::uint32_t a_count) noexcept
+		{
+			std::uint32_t cleared = 0;
+			if (!a_array || a_count > kMaxLights) {
+				return cleared;
+			}
+			for (std::uint32_t i = 0; i < a_count; ++i) {
+				const auto light = reinterpret_cast<const std::uintptr_t*>(a_array)[i];
+				if (!light) {
+					continue;
+				}
+				auto& occluded = *reinterpret_cast<std::uint8_t*>(light + kLightOccluded);
+				if (occluded) {
+					occluded = 0;
+					++cleared;
+				}
+			}
+			return cleared;
+		}
+
+		std::uint32_t UnoccludeLightsGuarded() noexcept
+		{
+			__try {
+				const auto node = *reinterpret_cast<const std::uintptr_t*>(g_shadowSceneNode);
+				if (!node) {
+					return 0;
+				}
+				std::uint32_t cleared = ClearOccluded(*reinterpret_cast<const std::uintptr_t*>(node + kShadowLightsArray), *reinterpret_cast<const std::uint16_t*>(node + kShadowLightsCount));
+				const auto    size = *reinterpret_cast<const std::uint32_t*>(node + kLightsSize);
+				const auto    capacity = *reinterpret_cast<const std::uint32_t*>(node + kLightsCapacity);
+				if (size <= capacity) {
+					cleared += ClearOccluded(*reinterpret_cast<const std::uintptr_t*>(node + kLightsArray), size);
+				}
+				return cleared;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+	}
+
+	std::uint32_t UnoccludeLights() noexcept
+	{
+		if (!g_shadowSceneNode) {
+			g_shadowSceneNode = CBRO::Engine::OG(kShadowSceneNodeID).address();
+		}
+		const auto cleared = UnoccludeLightsGuarded();
+		g_unoccludeFrames.fetch_add(1, std::memory_order_relaxed);
+		g_unoccluded.fetch_add(cleared, std::memory_order_relaxed);
+		return cleared;
+	}
+
 	void PublishLamps() noexcept
 	{
 		g_lampsPublished.store(&g_lampLists[g_lampWrite], std::memory_order_release);
@@ -436,5 +504,8 @@ namespace CBRO::Core::ShadowLights
 		const auto point = take(g_lampsPoint);
 		const auto spot = take(g_lampsSpot);
 		logger::info("shadow lamps recorded per frame (for group 0 with the sun off): point {:.1f} | spot {:.1f} | list overflow {}", point / frames, spot / frames, Lamps().overflow);
+		const auto unoccludeFrames = take(g_unoccludeFrames);
+		const auto unoccluded = take(g_unoccluded);
+		logger::info("lights un-occluded (previs-driven bOccluded cleared before the deferred-lights stage): {:.0f} CBRO frames, {:.2f} lights/frame", unoccludeFrames, unoccludeFrames > 0 ? unoccluded / unoccludeFrames : 0.0);
 	}
 }

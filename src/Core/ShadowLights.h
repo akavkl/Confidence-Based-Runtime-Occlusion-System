@@ -40,6 +40,15 @@ namespace CBRO::Core::ShadowLights
 		std::uint32_t                count{ 0 };
 		std::uint32_t                overflow{ 0 };
 	};
+	// Previs-driven light occlusion (FO4-ENGINE-NOTES 6.7): with previs active the engine marks lights previs deems
+	// unseen as occluded (`BSLight+0x17C`) and unmarks them through the same previs-gated callback (356257:
+	// `if (IsActive() && ...)`). With previs inactive for the walk (CBRO's windows, or v1.28's switch) nothing unmarks
+	// them, so a lamp marked while previs was active stays dark: DeferredLightsImpl's lamp loop skips every marked
+	// shadow light (no shadow map, no light pass). Vanilla with previs off never marks any. This clears the mark on every
+	// light of the ShadowSceneNode's lists; to run once per CBRO frame before the deferred-lights stage. Returns how
+	// many it cleared. Main thread.
+	std::uint32_t UnoccludeLights() noexcept;
+
 	// Main thread at the cull begin: last frame's lamps become the readable list; this frame's recording starts over.
 	void PublishLamps() noexcept;
 	// The published list (read-only until the next PublishLamps; any thread).
