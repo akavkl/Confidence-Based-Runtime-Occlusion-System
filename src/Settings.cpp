@@ -55,6 +55,7 @@ namespace CBRO
 		toggleHotkey = ReadUInt(path, L"Occlusion", L"iToggleHotkey", toggleHotkey);
 		statusHotkey = ReadUInt(path, L"Occlusion", L"iStatusHotkey", statusHotkey);
 		diagnosticHotkey = ReadUInt(path, L"Occlusion", L"iDiagnosticHotkey", diagnosticHotkey);
+		startDiagnostic = std::min(ReadUInt(path, L"Occlusion", L"iStartDiagnostic", startDiagnostic), 2u);
 		notify = ReadBool(path, L"Occlusion", L"bNotify", notify);
 		hiZDownsample = std::clamp(ReadUInt(path, L"Occlusion", L"iHiZDownsample", hiZDownsample), 1u, 16u);
 		confirmFrames = std::clamp(ReadUInt(path, L"Occlusion", L"iConfirmFrames", confirmFrames), 1u, 120u);

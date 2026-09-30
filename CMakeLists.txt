@@ -13,7 +13,7 @@ endif()
 set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "")
 
-project(CBRO VERSION 1.39.0 LANGUAGES CXX)
+project(CBRO VERSION 1.40.0 LANGUAGES CXX)
 
 if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
 	message(FATAL_ERROR "in-source builds are not allowed")
@@ -81,7 +81,7 @@ if(CBRO_INSTALL_DIR)
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${CBRO_INSTALL_DIR}/F4SE/Plugins"
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:CBRO>" "${CBRO_INSTALL_DIR}/F4SE/Plugins/"
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_PDB_FILE:CBRO>" "${CBRO_INSTALL_DIR}/F4SE/Plugins/"
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/res/CBRO.ini" "${CBRO_INSTALL_DIR}/F4SE/Plugins/"
+		# (res/CBRO.ini is NOT copied: the user's INI in the mod folder is theirs; new keys fall back to Settings.h's defaults)
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/res/meta.ini" "${CBRO_INSTALL_DIR}/"
 		COMMENT "Installing CBRO into ${CBRO_INSTALL_DIR}"
 	)

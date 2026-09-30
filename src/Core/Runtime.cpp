@@ -1958,6 +1958,11 @@ namespace CBRO::Core::Runtime
 		Hooks::RenderStages::AddListener(&g_listener);
 		g_state.installed = true;
 		g_state.wantActive = settings.startActive;
+		g_state.diagnostic = static_cast<int>(settings.startDiagnostic);
+		if (g_state.diagnostic != 0) {
+			Occlusion::SetObserveOnly(true);
+			logger::info("diagnostic state at load (iStartDiagnostic={}): {}", g_state.diagnostic, g_state.diagnostic == 2 ? "decide-only, no depth capture" : "decide-only (nothing hidden)");
+		}
 		logger::info(
 			"occlusion: installed ({}); starts in {} mode; {} toggles CBRO <-> previs",
 			settings.observeOnly ? "observe-only" : "culling", settings.startActive ? "CBRO" : "previs (previs untouched until the toggle)",
