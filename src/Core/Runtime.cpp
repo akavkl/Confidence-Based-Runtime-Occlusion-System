@@ -1,5 +1,6 @@
 #include "Core/Runtime.h"
 
+#include "Core/Async.h"
 #include "Core/Feed.h"
 #include "Core/SetDiff.h"
 #include "Core/HiZ.h"
@@ -1187,6 +1188,47 @@ namespace CBRO::Core::Runtime
 		};
 		FrameClock g_frames;
 
+		// ---- asynchronous verdicts (Core/Async): what the worker's job needs from the frame -------------------------
+		// The worker judges this frame's candidates for the NEXT frame's walk, so its context is this frame's with the
+		// dilation grown by the movement the next frame may bring and the view box widened by the turn it may bring:
+		// twice the last frame's, plus a floor. The next frame uses the map only if its camera stayed within them.
+		struct AsyncFrame
+		{
+			Occlusion::FrameContext context{};   // this frame's (as given to Occlusion::BeginFrame)
+			Async::Pose             pose{};      // the camera at this frame's cull begin
+			float                   angle{ 0.0f };  // turn since the depth frame (for the widened view box)
+			std::uint64_t           age{ 0 };
+			bool                    lastKnown{ false };
+			Async::Pose             last{};      // last frame's camera (the frame's own motion)
+			float                   moveMargin{ 0.0f };
+			float                   turnMargin{ 0.0f };
+		};
+		AsyncFrame g_asyncFrame;
+
+		float PoseDistance(const Async::Pose& a_a, const Async::Pose& a_b) noexcept
+		{
+			const float dx = a_a.eye[0] - a_b.eye[0], dy = a_a.eye[1] - a_b.eye[1], dz = a_a.eye[2] - a_b.eye[2];
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		}
+
+		// The current camera as a pose; false without one.
+		bool ReadPose(Async::Pose& a_out) noexcept
+		{
+			const auto root = RE::Main::WorldRootCamera();
+			if (!root) {
+				return false;
+			}
+			a_out.eye[0] = root->world.translate.x;
+			a_out.eye[1] = root->world.translate.y;
+			a_out.eye[2] = root->world.translate.z;
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 3; ++c) {
+					a_out.rotate[r][c] = root->world.rotate.entry[r].pt[c];
+				}
+			}
+			return true;
+		}
+
 		void CloseSegment(std::int64_t a_now)
 		{
 			if (g_frames.mode < 0) {
@@ -1449,6 +1491,7 @@ namespace CBRO::Core::Runtime
 			const bool effective = wanted && !standby && g_state.convention != Convention::kNone && !HiZ::Failed();
 			Occlusion::SetActive(effective);
 			Occlusion::ResetHistory();
+			Async::Reset();
 			logger::info(
 				"mode: {} ({})",
 				effective ? "CBRO occlusion" : !wanted ? "previs (CBRO off)" : standby ? "previs (CBRO standing by: interior, bInteriors=0)" : "previs (CBRO requested but unavailable)", a_reason);
@@ -1642,6 +1685,8 @@ namespace CBRO::Core::Runtime
 					context.blocksH = blocks.height;
 				}
 				g_footprint.lastValid = CurrentView(snapshot->camera, angle, g_stillness.frames, age, context.view);
+				g_asyncFrame.angle = angle;
+				g_asyncFrame.age = age;
 				if (g_footprint.lastValid) {
 					std::copy_n(context.view, 4, g_footprint.lastView);
 					g_footprint.lastAngle = angle;
@@ -1675,7 +1720,25 @@ namespace CBRO::Core::Runtime
 					context.coneValid = true;
 				}
 			}
+			// Asynchronous verdicts: this frame hides by the worker's map only if the camera stayed within the margins the
+			// worker judged with; the margins for the job this frame submits follow the frame's own motion.
+			if (Async::Enabled()) {
+				Async::Pose pose{};
+				const bool  known = ReadPose(pose);
+				float       frameMove = 0.0f, frameTurn = 0.0f;
+				if (known && g_asyncFrame.lastKnown) {
+					frameMove = PoseDistance(pose, g_asyncFrame.last);
+					frameTurn = RotationAngle(pose.rotate, g_asyncFrame.last.rotate);
+				}
+				context.asyncValid = known && context.cull && Async::BeginFrame(pose);
+				g_asyncFrame.pose = pose;
+				g_asyncFrame.last = pose;
+				g_asyncFrame.lastKnown = known;
+				g_asyncFrame.moveMargin = std::clamp(2.0f * frameMove + 4.0f, 6.0f, 48.0f);
+				g_asyncFrame.turnMargin = std::clamp(2.0f * frameTurn + 0.5f * 3.14159265f / 180.0f, 1.0f * 3.14159265f / 180.0f, 8.0f * 3.14159265f / 180.0f);
+			}
 			Occlusion::BeginFrame(context);
+			g_asyncFrame.context = context;
 			g_state.cullingThisFrame = context.cull;
 
 			// Once per location, after ~5 s standing still with CBRO culling: list what is still drawn.
@@ -1695,6 +1758,7 @@ namespace CBRO::Core::Runtime
 				ShadowLights::LogStats(g_state.framesSinceLog);
 				Feed::LogStats(g_state.framesSinceLog);
 				SetDiff::LogStats();
+				Async::LogStats(g_state.framesSinceLog);
 				LogTiming();
 				g_state.framesSinceLog = 0;
 			}
@@ -1795,6 +1859,25 @@ namespace CBRO::Core::Runtime
 						const auto root = RE::Main::WorldRootCamera();
 						SetDiff::EndCull(CurrentMode(), settled, root ? root->world.translate : RE::NiPoint3{});
 					}
+					// Asynchronous verdicts: this frame's candidates go to the worker with this frame's context, dilated and
+					// widened for the next frame's camera (the walk is done: every candidate is recorded).
+					if (Async::Enabled() && g_state.cullingThisFrame && g_asyncFrame.context.snapshot) {
+						auto worker = g_asyncFrame.context;
+						worker.dilateMove += g_asyncFrame.moveMargin;
+						float wide[4];
+						if (CurrentView(worker.snapshot->camera, g_asyncFrame.angle + g_asyncFrame.turnMargin, 0, g_asyncFrame.age, wide)) {
+							std::copy_n(wide, 4, worker.view);
+						} else {
+							constexpr float inf = std::numeric_limits<float>::infinity();
+							worker.view[0] = -inf;
+							worker.view[1] = inf;
+							worker.view[2] = -inf;
+							worker.view[3] = inf;
+						}
+						worker.asyncValid = false;
+						Occlusion::PrepareContext(worker);
+						Async::Submit(worker, g_asyncFrame.pose, g_asyncFrame.moveMargin, g_asyncFrame.turnMargin);
+					}
 					g_timing.marks[1] = Qpc();
 					g_gpu.Mark(1);
 					break;
@@ -1815,6 +1898,7 @@ namespace CBRO::Core::Runtime
 					g_gpu.Mark(6);
 					break;
 				case Stage::kForward:
+					Async::Wait();  // the worker's frame ends with the render: it never touches objects across the game's update
 					g_timing.marks[8] = Qpc();
 					g_gpu.Mark(8);
 					break;
@@ -1849,6 +1933,7 @@ namespace CBRO::Core::Runtime
 		Hooks::PrevisFeed::Install();  // (pass-through wrappers on the engine's two previs feed sites, plus the accessors)
 		Feed::Install();
 		SetDiff::Install(settings.setDiff);
+		Async::Install(settings.async);
 		Hooks::RenderStages::AddListener(&g_listener);
 		g_state.installed = true;
 		g_state.wantActive = settings.startActive;

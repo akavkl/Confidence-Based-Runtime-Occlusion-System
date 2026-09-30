@@ -1,5 +1,6 @@
 #include "Core/Occlusion.h"
 
+#include "Core/Async.h"
 #include "Core/DropSet.h"
 #include "Core/MeshProxy.h"
 #include "Hooks/CullGroups.h"
@@ -1543,51 +1544,7 @@ namespace CBRO::Core::Occlusion
 		// resyncs after an insertion): no hashing, prefetch-friendly. One stream for the top-level adds
 		// (Group::Add), one for the children (Block::Add from the jobs).
 
-		enum class Outcome : std::uint8_t
-		{
-			kNone,
-			kOutside,  // entirely outside the current view (geometry only)
-			kHidden,   // behind the depth (rejected once its streak reaches confirmFrames)
-			kKept,     // drawn: visible, near, at the edge, exempt, a light that reaches in, or a bad bound
-		};
-
-		enum class SunOutcome : std::uint8_t
-		{
-			kNone,      // not evaluated (the main view needed the object anyway)
-			kUnneeded,  // sun shadows off, or the shadow can't reach the view (geometry)
-			kBehind,    // the shadow falls only behind visible surfaces (needs its streak)
-			kNeeded,
-			kUnknown,   // the sun's state couldn't be verified: needed
-		};
-
-		enum RecordFlags : std::uint8_t
-		{
-			kRecordDepth = 1 << 0,     // a hidden view outcome with its evidence recorded (rect, threshold, blocks)
-			kRecordLight = 1 << 2,     // the object is a light (never skipped as out of view)
-			kRecordNoCache = 1 << 3,   // never reuse (a light's reach test, a table-full case)
-		};
-
-		struct Record
-		{
-			const void*   object{ nullptr };
-			float         bound[4]{};         // the bound tested (before dilation)
-			std::uint32_t viewEpoch{ 0 };
-			std::uint32_t readback{ 0 };      // the depth a hidden view outcome holds against (its evaluation's, or its last re-check's)
-			std::uint32_t sunReadback{ 0 };   // the depth the sun outcome read
-			std::uint16_t rect[4]{};          // hidden evidence: level-0 texels x0, y0, x1, y1 that were all nearer than `threshold`
-			float         threshold{ 0.0f };  // ... in buffer depth
-			std::uint8_t  blocks[4]{ 255, 0, 0, 0 };     // Hi-Z blocks the evidence covers, widened (255 = none)
-			std::uint8_t  sunBlocks[4]{ 255, 0, 0, 0 };  // Hi-Z blocks the sun's shadow test read, widened (255 = none)
-			Outcome       outcome{ Outcome::kNone };
-			std::uint8_t  verdict{ 0 };       // the Verdict behind the outcome (for the stats)
-			SunOutcome    sun{ SunOutcome::kNone };
-			std::uint8_t  sunEpoch{ 0 };
-			std::uint8_t  streak{ 0 };        // consecutive frames hidden
-			std::uint8_t  sunStreak{ 0 };     // consecutive frames with the shadow behind surfaces
-			std::uint8_t  flags{ 0 };
-			std::uint8_t  cellHint{ 0 };      // mesh shapes: the cell last seen visible (TestShape starts there)
-		};
-		static_assert(sizeof(Record) == 64);
+		// (Outcome, SunOutcome, RecordFlags and Record: Core/Verdict.h, shared with Core/Async)
 
 		struct Stream
 		{
@@ -2016,12 +1973,11 @@ namespace CBRO::Core::Occlusion
 			}
 		}
 
-		// The object's outcome for this frame: reused from last frame's record when everything it depended on
-		// still holds, evaluated otherwise; the sun part too when a_wantSun and the main view doesn't need the
-		// object. The record is pushed to this frame's stream either way.
-		void Judge(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
+		// The object's outcome for this frame: reused from its last record (a_old, or null) when everything it depended
+		// on still holds, evaluated otherwise; the sun part too when a_wantSun and the main view doesn't need the
+		// object.
+		void JudgeRecord(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add, const Record* old, bool a_wantSun, Record& a_out)
 		{
-			const Record* old = a_stream.Find(a_add.object);
 			const bool    reusable = a_context.cacheEnabled && a_context.clock != g_dumpClock.load(std::memory_order_relaxed);
 			const bool    timed = Timed(a_context);
 			bool          reused = false;
@@ -2062,7 +2018,39 @@ namespace CBRO::Core::Occlusion
 					}
 				}
 			}
+		}
+
+		// The synchronous path: last frame's record comes from the thread's stream, and the new one goes into it.
+		void Judge(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
+		{
+			JudgeRecord(a_context, a_add, a_stream.Find(a_add.object), a_wantSun, a_out);
 			a_stream.Push(a_out);
+		}
+
+		// With asynchronous verdicts (Core/Async): the entry is recorded for the worker, and its outcome comes from
+		// the worker's map (last frame's judgement of the same object with the same bound) when the map holds for
+		// this frame's camera; anything else counts as kept (nothing hidden). The walk evaluates nothing.
+		void JudgeOrLookup(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
+		{
+			if (!Async::Enabled()) {
+				Judge(a_context, a_stream, a_add, a_wantSun, a_out);
+				return;
+			}
+			Async::Record(a_add.object, *a_add.bound, a_add.kind);
+			a_out = Record{};
+			a_out.object = a_add.object;
+			a_out.outcome = Outcome::kKept;
+			if (!a_context.asyncValid) {
+				return;
+			}
+			const auto record = Async::Find(a_add.object);
+			if (!record || record->bound[0] != a_add.bound->center.x || record->bound[1] != a_add.bound->center.y ||
+				record->bound[2] != a_add.bound->center.z || record->bound[3] != a_add.bound->fRadius) {
+				Bump(record ? kCacheBound : kCacheNew);
+				return;
+			}
+			a_out = *record;
+			Bump(kCacheHits);
 		}
 
 		// Whether the sun's cascades can do without a caster (node pruning, on a node's entries' sphere). "Outside"
@@ -2112,7 +2100,7 @@ namespace CBRO::Core::Occlusion
 			Record out{};
 			switch (a_add.kind) {
 			case Hooks::CullGroups::GroupKind::kMainOnly: {
-				Judge(a_context, streams.child, a_add, false, out);
+				JudgeOrLookup(a_context, streams.child, a_add, false, out);
 				return out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing() ? &a_context.reject : nullptr;
 			}
 			case Hooks::CullGroups::GroupKind::kSunShared: {
@@ -2132,7 +2120,7 @@ namespace CBRO::Core::Occlusion
 					}
 					return nullptr;
 				}
-				Judge(a_context, streams.child, a_add, true, out);
+				JudgeOrLookup(a_context, streams.child, a_add, true, out);
 				if (Observing()) {
 					return nullptr;
 				}
@@ -2161,7 +2149,7 @@ namespace CBRO::Core::Occlusion
 					}
 					return nullptr;
 				}
-				Judge(a_context, streams.child, a_add, false, out);
+				JudgeOrLookup(a_context, streams.child, a_add, false, out);
 				if (out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing() && !g_drops.Insert(a_add.object, tag)) {
 					Bump(kDropFull);
 				}
@@ -2232,7 +2220,7 @@ namespace CBRO::Core::Occlusion
 				if (group0) {
 					Bump(kShared);
 				}
-				Judge(*context, streams.top, add, group0, out);
+				JudgeOrLookup(*context, streams.top, add, group0, out);
 				const bool hiddenConfirmed = out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames;
 				const bool light = (out.flags & kRecordLight) != 0;
 				if (!Observing()) {
@@ -2692,6 +2680,23 @@ namespace CBRO::Core::Occlusion
 	void SetActive(bool a_active)
 	{
 		g_active.store(a_active);
+	}
+
+	void JudgeAsync(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add, const Record* a_old, bool a_wantSun, Record& a_out)
+	{
+		if (!Timed(a_context)) {
+			JudgeRecord(a_context, a_add, a_old, a_wantSun, a_out);
+			return;
+		}
+		const auto start = __rdtsc();
+		JudgeRecord(a_context, a_add, a_old, a_wantSun, a_out);
+		Bump(kCycles, (__rdtsc() - start) * kTimingStride);  // (the worker's own stats block: "all threads", never the main thread's share)
+	}
+
+	void PrepareContext(FrameContext& a_context) noexcept
+	{
+		SetSunPlanes(a_context);
+		SetLampPlanes(a_context);
 	}
 
 	void SetObserveOnly(bool a_observeOnly)

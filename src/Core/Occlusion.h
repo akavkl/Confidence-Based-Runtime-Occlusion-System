@@ -2,6 +2,12 @@
 
 #include "Core/HiZ.h"
 #include "Core/ShadowGeometry.h"
+#include "Core/Verdict.h"
+
+namespace CBRO::Hooks::CullGroups
+{
+	struct BlockAdd;
+}
 
 // Main-pass occlusion decisions, made inside Block::Add (Hooks/CullGroups) for every entry that
 // DrawWorld's culling groups receive (top-level and child adds). An object is hidden only after it
@@ -87,10 +93,20 @@ namespace CBRO::Core::Occlusion
 		std::uint32_t        blocksW{ 0 };
 		std::uint32_t        blocksH{ 0 };
 		float                angularSlack{ 0.0f };  // radians: tested bounds grow by their depth x this, covering the turn tolerance
+
+		// Asynchronous verdicts (Core/Async): this frame may hide by the worker's map (its camera margins hold).
+		bool                 asyncValid{ false };
 	};
 
 	void Install();
 	void BeginFrame(const FrameContext& a_context);
+
+	// Core/Async's worker: one candidate's record from the frame's context and its last record (or null), exactly as
+	// the walk's own path would judge it (cache reuse, the view test, mesh shapes, lights, the sun when a_wantSun).
+	// Any thread; the object is dereferenced (it must be alive).
+	void JudgeAsync(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add, const Record* a_old, bool a_wantSun, Record& a_out);
+	// Derives a context's sun and lamp receiver planes from its view (BeginFrame does this for the frame's own).
+	void PrepareContext(FrameContext& a_context) noexcept;
 
 	// Once per frame at the cull stage's end (main thread, DrawWorld's jobs done), with the running total of
 	// every accumulator's registrations (Hooks::CullGroups::ReadHookCalls): records how much the culled set

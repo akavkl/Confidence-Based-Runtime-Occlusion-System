@@ -31,6 +31,7 @@ namespace CBRO
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
 		bool          interiors{ false };          // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)
 		bool          setDiff{ true };             // diagnostic: main-view registrations compared between the modes at each A/B location (Core/SetDiff)
+		bool          async{ true };               // verdicts judged by a worker after the cull, looked up by the walk a frame later (Core/Async); 0 = inside the walk
 		std::uint32_t feedAuditInterval{ 600 };    // frames between audits of CBRO's scene-walk replica (0 = off)
 		bool          verdictCache{ true };        // reuse last frame's verdict while nothing it depended on changed
 		float         cacheMove{ 4.0f };           // camera movement (units) a reused verdict tolerates; bounds grow by it
