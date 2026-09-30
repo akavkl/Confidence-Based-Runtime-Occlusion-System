@@ -2064,7 +2064,7 @@ namespace CBRO::Core::Occlusion
 		// this frame's camera; anything else counts as kept (nothing hidden). The walk evaluates nothing.
 		void JudgeOrLookup(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
 		{
-			if (!Async::Enabled()) {
+			if (!Async::Enabled() || !a_context.asyncFrame) {
 				Judge(a_context, a_stream, a_add, a_wantSun, a_out);
 				return;
 			}

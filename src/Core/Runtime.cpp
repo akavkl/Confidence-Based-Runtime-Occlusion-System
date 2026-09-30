@@ -73,6 +73,7 @@ namespace CBRO::Core::Runtime
 			std::uint32_t clock{ 0 };        // advances at every cull stage
 			bool          wantActive{ false };
 			bool          interiorStandby{ false };   // the scene is an interior/override root and bInteriors=0: previs mode regardless of wantActive
+			bool          interiorScene{ false };     // the scene is an interior/override root (the gates), whatever bInteriors says
 			bool          toggleKeyDown{ false };
 			bool          failureHandled{ false };
 			std::atomic<int> previsRequest{ -1 };  // previs to switch at the next cull begin: 0 off, 1 back to the original (-1: none)
@@ -1525,21 +1526,37 @@ namespace CBRO::Core::Runtime
 			ApplyEffective(a_reason);
 		}
 
-		// bInteriors=0: in an interior or an override-root scene CBRO stands by (previs mode, nothing touched) and
-		// resumes in exteriors. Decided at the cull begin from the engine's own gates (Hooks/PrevisFeed), like the
-		// hotkey: the frame's window may still be the previous mode's (Core/Feed handles that switch frame).
-		void SyncInteriorStandby()
+		// Interiors and override-root scenes, decided at the cull begin from the engine's own gates (Hooks/PrevisFeed):
+		//   bInteriors=0: CBRO stands by there (previs mode, nothing touched) and resumes in exteriors;
+		//   bInteriors=1 with bInteriorLegacyPrevis=1: CBRO culls there the way v1.28 did (previs switched off and
+		//     flushed while CBRO is on, judged inside the walk unless bAsyncInteriors), the exterior keeps the windows.
+		// Like the hotkey, the frame's window may still be the previous mode's (Core/Feed handles that switch frame).
+		void SyncInteriorMode()
 		{
-			if (Settings::Get().interiors || !Feed::ManagesPrevis()) {
-				return;
+			const auto& settings = Settings::Get();
+			if (!settings.previsFeed) {
+				return;  // (bPrevisFeed=0: v1.28's switch everywhere already)
 			}
 			const auto gates = Hooks::PrevisFeed::ReadGates();
 			const bool interior = gates.readable && (!gates.exterior || gates.overrideRoot);
-			if (interior == g_state.interiorStandby) {
+			if (interior == g_state.interiorScene) {
 				return;
 			}
-			g_state.interiorStandby = interior;
-			ApplyEffective(interior ? "interior/override root: the engine's previs and rooms cull it (bInteriors=0)" : "exterior: CBRO resumes");
+			g_state.interiorScene = interior;
+			if (!settings.interiors) {
+				g_state.interiorStandby = interior;
+				ApplyEffective(interior ? "interior/override root: the engine's previs and rooms cull it (bInteriors=0)" : "exterior: CBRO resumes");
+				return;
+			}
+			if (!settings.interiorLegacyPrevis) {
+				return;  // (the windows indoors too)
+			}
+			Feed::SetLegacyScene(interior);
+			if (!interior) {
+				// Back outside: previs was switched off for the interior; restore it (the windows take over).
+				g_state.previsRequest.store(1);
+			}
+			ApplyEffective(interior ? "interior: v1.28's previs switch (bInteriorLegacyPrevis=1)" : "exterior: the windows again");
 		}
 
 		// Switches previs where the console's `tpc` does: on the main thread, with no cull reading previs data
@@ -1644,7 +1661,7 @@ namespace CBRO::Core::Runtime
 				ApplyMode(g_state.wantActive, "hi-z unavailable");
 			}
 			// The frame's path (previs / CBRO classic / CBRO feed) and the previs suspension, before the hooks follow.
-			SyncInteriorStandby();
+			SyncInteriorMode();
 			Feed::BeginFrame(Occlusion::Active(), g_state.clock + 1);
 			SyncHooks();
 
@@ -1730,7 +1747,10 @@ namespace CBRO::Core::Runtime
 					frameMove = PoseDistance(pose, g_asyncFrame.last);
 					frameTurn = RotationAngle(pose.rotate, g_asyncFrame.last.rotate);
 				}
-				context.asyncValid = known && context.cull && Async::BeginFrame(pose);
+				// Interiors judge inside the walk (as v1.28) unless bAsyncInteriors.
+				context.asyncFrame = !g_state.interiorScene || settings.asyncInteriors;
+				const bool mapValid = Async::BeginFrame(pose);
+				context.asyncValid = context.asyncFrame && known && context.cull && mapValid;
 				g_asyncFrame.pose = pose;
 				g_asyncFrame.last = pose;
 				g_asyncFrame.lastKnown = known;
@@ -1862,7 +1882,7 @@ namespace CBRO::Core::Runtime
 					}
 					// Asynchronous verdicts: this frame's candidates go to the worker with this frame's context, dilated and
 					// widened for the next frame's camera (the walk is done: every candidate is recorded).
-					if (Async::Enabled() && g_state.cullingThisFrame && g_asyncFrame.context.snapshot) {
+					if (Async::Enabled() && g_state.cullingThisFrame && g_asyncFrame.context.asyncFrame && g_asyncFrame.context.snapshot) {
 						auto worker = g_asyncFrame.context;
 						worker.dilateMove += g_asyncFrame.moveMargin;
 						float wide[4];

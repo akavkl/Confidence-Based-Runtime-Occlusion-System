@@ -94,7 +94,9 @@ namespace CBRO::Core::Occlusion
 		std::uint32_t        blocksH{ 0 };
 		float                angularSlack{ 0.0f };  // radians: tested bounds grow by their depth x this, covering the turn tolerance
 
-		// Asynchronous verdicts (Core/Async): this frame may hide by the worker's map (its camera margins hold).
+		// Asynchronous verdicts (Core/Async): this frame judges through the worker (asyncFrame; else inside the walk as
+		// v1.28 did) and may hide by the worker's map (asyncValid: its camera margins hold).
+		bool                 asyncFrame{ false };
 		bool                 asyncValid{ false };
 	};
 

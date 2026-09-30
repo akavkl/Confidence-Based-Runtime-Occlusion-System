@@ -96,6 +96,8 @@ namespace CBRO::Core::ShadowLights
 			}
 		}
 
+		std::atomic<int> g_spotSamplesLogged{ 0 };
+
 		std::uintptr_t FrustumCullThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
 		{
 			if (Occlusion::Active()) {
@@ -103,6 +105,14 @@ namespace CBRO::Core::ShadowLights
 				float        reach = 0.0f;
 				if (ReadSpotLight(a1, position, reach)) {
 					RecordLamp(position, reach, true);
+					// (the first few, with the camera, so the read layout can be checked against the scene)
+					if (g_spotSamplesLogged.load(std::memory_order_relaxed) < 6 && g_spotSamplesLogged.fetch_add(1) < 6) {
+						const auto root = RE::Main::WorldRootCamera();
+						logger::info(
+							"shadow lights: spot light sample at ({:.0f},{:.0f},{:.0f}) reach {:.0f} | camera at ({:.0f},{:.0f},{:.0f})",
+							position.x, position.y, position.z, reach,
+							root ? root->world.translate.x : 0.0f, root ? root->world.translate.y : 0.0f, root ? root->world.translate.z : 0.0f);
+					}
 				}
 			}
 			return reinterpret_cast<PassFn>(g_originalFrustumCull)(a1, a2, a3, a4);

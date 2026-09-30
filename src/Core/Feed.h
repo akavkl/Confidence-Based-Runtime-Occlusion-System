@@ -41,8 +41,10 @@ namespace CBRO::Core::Feed
 	[[nodiscard]] std::string_view PathName(Path a_path) noexcept;
 	// For the frame-time line: what the engine's previs state is right now ("ACTIVE", "suspended by CBRO", "OFF").
 	[[nodiscard]] std::string_view PrevisState() noexcept;
-	// Whether Feed manages previs (bPrevisFeed=1): Runtime then never switches previs off.
+	// Whether Feed manages previs (bPrevisFeed=1 and not a legacy scene): Runtime then never switches previs off.
 	[[nodiscard]] bool ManagesPrevis() noexcept;
+	// A legacy scene (an interior with bInteriorLegacyPrevis=1): v1.28's switch instead of the windows. Main thread.
+	void SetLegacyScene(bool a_legacy) noexcept;
 
 	void LogStats(std::uint32_t a_frames);
 }

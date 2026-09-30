@@ -22,6 +22,7 @@ namespace CBRO::Core::Feed
 		constexpr std::size_t   kGroupArrayCountOffset = 0x10;
 
 		bool          g_enabled{ false };   // bPrevisFeed
+		bool          g_legacyScene{ false };  // an interior with bInteriorLegacyPrevis: v1.28's switch (Runtime disables and flushes previs) instead of the windows
 		std::uint32_t g_auditInterval{ 0 };
 		Path          g_path{ Path::kPrevis };
 		bool          g_cbroFrame{ false };    // the last cull begin was a CBRO frame (previs suspended inside the windows)
@@ -261,7 +262,12 @@ namespace CBRO::Core::Feed
 
 	Path BeginFrame(bool a_cbroMode, std::uint32_t a_clock)
 	{
-		if (!g_enabled) {
+		if (!g_enabled || g_legacyScene) {
+			// v1.28's way (bPrevisFeed=0, or an interior with bInteriorLegacyPrevis): Runtime switched previs off (and the
+			// engine flushed it) when CBRO went on, so the walk is previs-off without any window.
+			Hooks::PrevisFeed::SetWindow(false);
+			Hooks::PrevisFeed::ReleaseWindow();
+			g_cbroFrame = false;
 			g_path = a_cbroMode ? Path::kClassic : Path::kPrevis;
 			++(a_cbroMode ? g_stats.classicLegacy : g_stats.previs);
 			Hooks::PrevisFeed::SetOwner(Hooks::PrevisFeed::Owner::kPrevis);
@@ -378,7 +384,15 @@ namespace CBRO::Core::Feed
 
 	bool ManagesPrevis() noexcept
 	{
-		return g_enabled;
+		return g_enabled && !g_legacyScene;
+	}
+
+	void SetLegacyScene(bool a_legacy) noexcept
+	{
+		if (g_legacyScene != a_legacy) {
+			g_legacyScene = a_legacy;
+			logger::info("previs feed: {}", a_legacy ? "interior with bInteriorLegacyPrevis=1: v1.28's previs switch (off and flushed while CBRO is on), no windows" : "back to the windows (previs never switched off)");
+		}
 	}
 
 	void LogStats(std::uint32_t a_frames)

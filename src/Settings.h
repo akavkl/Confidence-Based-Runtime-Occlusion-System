@@ -29,7 +29,9 @@ namespace CBRO
 		bool          lampShadowVolumes{ true };   // ... also when their shadow volume misses every visible surface (nearest/farthest depth test)
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
-		bool          interiors{ false };          // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)
+		bool          interiors{ true };           // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)
+		bool          interiorLegacyPrevis{ true }; // interiors: v1.28's previs switch (off and flushed while CBRO is on) instead of the windows
+		bool          asyncInteriors{ false };     // interiors: judge through the worker too (0: inside the walk, as v1.28)
 		bool          setDiff{ true };             // diagnostic: main-view registrations compared between the modes at each A/B location (Core/SetDiff)
 		bool          async{ true };               // verdicts judged by a worker after the cull, looked up by the walk a frame later (Core/Async); 0 = inside the walk
 		bool          lampGroupTrim{ true };       // sun off: group-0 entries the main view doesn't need are left out when no lamp's shadow of them can reach a visible surface
