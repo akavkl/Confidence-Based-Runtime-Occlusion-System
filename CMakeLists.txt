@@ -13,7 +13,7 @@ endif()
 set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "")
 
-project(CBRO VERSION 1.46.0 LANGUAGES CXX)
+project(CBRO VERSION 1.47.0 LANGUAGES CXX)
 
 if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
 	message(FATAL_ERROR "in-source builds are not allowed")

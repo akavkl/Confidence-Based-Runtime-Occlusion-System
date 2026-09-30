@@ -39,6 +39,7 @@ namespace CBRO::Core::ShadowLights
 		std::array<Lamp, kMax>       items{};
 		std::uint32_t                count{ 0 };
 		std::uint32_t                overflow{ 0 };
+		bool                         complete{ false };  // both light kinds recorded (the spot-light hook is in)
 	};
 	// Previs-driven light occlusion (FO4-ENGINE-NOTES 6.7): with previs active the engine marks lights previs deems
 	// unseen as occluded (`BSLight+0x17C`) and unmarks them through the same previs-gated callback (356257:

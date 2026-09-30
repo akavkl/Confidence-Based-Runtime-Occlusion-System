@@ -1854,7 +1854,7 @@ namespace CBRO::Core::Occlusion
 				// spot, ShadowLights) can cast a visible shadow of it: the same shadow-volume test the point-light casters
 				// get, per lamp within reach. Never reused across frames (the lamps and the depth move).
 				const auto& lamps = ShadowLights::Lamps();
-				if (!g_tunables.lampGroupTrim || lamps.count == 0 || lamps.overflow != 0 || !a_out.object) {
+				if (!g_tunables.lampGroupTrim || !lamps.complete || lamps.count == 0 || lamps.overflow != 0 || !a_out.object) {
 					Bump(kSunOff);
 					a_out.sun = SunOutcome::kUnknown;
 					return;

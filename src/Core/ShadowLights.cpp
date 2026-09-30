@@ -45,15 +45,12 @@ namespace CBRO::Core::ShadowLights
 		Util::SwitchableHook g_cameraHook;  // taken out while CBRO is off
 		Util::SwitchableHook g_objectHook;
 
-		// Spot lights: BSShadowFrustumLight (vtable id 67506) slot 9 (1559482) is its cull: it sets the shadow camera's
-		// frustum (far = the NiLight's radius) and runs the group pass (FO4-ENGINE-NOTES 6.2a). The light's NiLight is at
-		// +0xB8 (BSLight), as for the parabolic light; NiLight::spec.r (+0x138) is the radius.
+		// Spot lights: BSShadowFrustumLight (vtable id 67506). Its slot 9 cull (1559482) takes arguments a C++ thunk
+		// cannot forward (XMM registers; the v1.37 hook was never installed), so v1.47 records spot lights from its
+		// slot 14 Update(camera) instead (integer arguments, bool return; hooked by the lamp diagnostic since v1.43).
+		// The light's NiLight is at +0xB8 (BSLight), as for the parabolic light; NiLight::spec.r (+0x138) is the radius.
 		constexpr std::uint64_t kFrustumLightVtableID = 67506;
-		constexpr std::size_t   kFrustumCullSlot = 9;
 		constexpr std::size_t   kLightNiLightOffset = 0xB8;
-		using PassFn = std::uintptr_t (*)(std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t);
-		std::uintptr_t       g_originalFrustumCull{ 0 };
-		Util::SwitchableHook g_frustumHook;
 
 		// ---- the lamps of a frame (main thread: the shadow stage writes, the cull begin publishes) --------------------
 		LampList                   g_lampLists[2];
@@ -98,24 +95,23 @@ namespace CBRO::Core::ShadowLights
 
 		std::atomic<int> g_spotSamplesLogged{ 0 };
 
-		std::uintptr_t FrustumCullThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
+		// A spot light whose Update(camera) passed (it goes on to its shadow map): recorded for the lamp trimming.
+		void RecordSpotLight(std::uintptr_t a_light) noexcept
 		{
-			if (Occlusion::Active()) {
-				RE::NiPoint3 position{};
-				float        reach = 0.0f;
-				if (ReadSpotLight(a1, position, reach)) {
-					RecordLamp(position, reach, true);
-					// (the first few, with the camera, so the read layout can be checked against the scene)
-					if (g_spotSamplesLogged.load(std::memory_order_relaxed) < 6 && g_spotSamplesLogged.fetch_add(1) < 6) {
-						const auto root = RE::Main::WorldRootCamera();
-						logger::info(
-							"shadow lights: spot light sample at ({:.0f},{:.0f},{:.0f}) reach {:.0f} | camera at ({:.0f},{:.0f},{:.0f})",
-							position.x, position.y, position.z, reach,
-							root ? root->world.translate.x : 0.0f, root ? root->world.translate.y : 0.0f, root ? root->world.translate.z : 0.0f);
-					}
-				}
+			RE::NiPoint3 position{};
+			float        reach = 0.0f;
+			if (!ReadSpotLight(a_light, position, reach)) {
+				return;
 			}
-			return reinterpret_cast<PassFn>(g_originalFrustumCull)(a1, a2, a3, a4);
+			RecordLamp(position, reach, true);
+			// (the first few, with the camera, so the read layout can be checked against the scene)
+			if (g_spotSamplesLogged.load(std::memory_order_relaxed) < 6 && g_spotSamplesLogged.fetch_add(1) < 6) {
+				const auto root = RE::Main::WorldRootCamera();
+				logger::info(
+					"shadow lights: spot light sample at ({:.0f},{:.0f},{:.0f}) reach {:.0f} | camera at ({:.0f},{:.0f},{:.0f})",
+					position.x, position.y, position.z, reach,
+					root ? root->world.translate.x : 0.0f, root ? root->world.translate.y : 0.0f, root ? root->world.translate.z : 0.0f);
+			}
 		}
 		std::uint32_t  g_confirmFrames{ 2 };
 		bool           g_casterCulling{ true };
@@ -541,6 +537,9 @@ namespace CBRO::Core::ShadowLights
 		{
 			const bool result = reinterpret_cast<UpdateFn>(g_originalUpdateSpot)(a_light, a_camera);
 			NoteUpdate(a_light, result);
+			if (result && Occlusion::Active()) {
+				RecordSpotLight(a_light);
+			}
 			return result;
 		}
 
@@ -741,26 +740,22 @@ namespace CBRO::Core::ShadowLights
 			logger::error("shadow lights: object hook failed; point-light casters are left to the engine");
 			g_casterCulling = false;
 		}
-		// The spot-light hook (v1.37) is NOT installed: BSShadowFrustumLight's slot 9 is called at mode switches with
-		// arguments a C++ thunk cannot forward (a thunk only passes the integer registers; any floating-point argument
-		// or return value is clobbered by the recording work before the call). Recording spot lights needs a machine-code
-		// stub that preserves the XMM registers, or another source; until then only point lights are recorded and the
-		// lamp trimming stays off by default.
-		(void)kFrustumLightVtableID;
-		(void)kFrustumCullSlot;
-		(void)&FrustumCullThunk;
-		logger::info("shadow lights: spot-light hook not installed (see the comment: XMM arguments); spot lights are not recorded");
+		// Spot lights are recorded from BSShadowFrustumLight's Update(camera) (integer arguments and a bool return, so a
+		// C++ thunk is safe; the lamp diagnostic uses the same hook). Without it the lamp list stays incomplete and the
+		// lamp trimming (bLampGroupTrim) does nothing.
+		g_originalUpdateSpot = Util::WriteVFuncSwitchable(g_updateSpotHook, CBRO::Engine::OG(kFrustumLightVtableID).address(), kUpdateSlot, Util::FnAddr(&UpdateSpotThunk), "shadowlights:BSShadowFrustumLight::Update(cam)");
+		logger::info("shadow lights: spot lights recorded from Update(camera): hook {}", g_originalUpdateSpot ? "in" : "FAILED (lamp trimming off)");
 
-		// The lamp-loop diagnostic: Update(camera) takes only integer arguments and returns a bool, so a C++ thunk is safe.
+		// The lamp-loop diagnostic: the point lights' Update(camera) too.
 		if (Settings::Get().lampDiagnostic) {
 			g_originalUpdatePoint = Util::WriteVFuncSwitchable(g_updatePointHook, CBRO::Engine::OG(kParabolicLightVtableID).address(), kUpdateSlot, Util::FnAddr(&UpdatePointThunk), "shadowlights:BSShadowParabolicLight::Update(cam)");
-			g_originalUpdateSpot = Util::WriteVFuncSwitchable(g_updateSpotHook, CBRO::Engine::OG(kFrustumLightVtableID).address(), kUpdateSlot, Util::FnAddr(&UpdateSpotThunk), "shadowlights:BSShadowFrustumLight::Update(cam)");
 			logger::info("shadow lights: lamp-loop diagnostic on (Update(camera) hooks: point {}, spot {})", g_originalUpdatePoint ? "in" : "FAILED", g_originalUpdateSpot ? "in" : "FAILED");
 		}
 	}
 
 	void PublishLamps() noexcept
 	{
+		g_lampLists[g_lampWrite].complete = g_originalUpdateSpot != 0 && g_updateSpotHook.in;
 		g_lampsPublished.store(&g_lampLists[g_lampWrite], std::memory_order_release);
 		g_lampWrite ^= 1u;
 		g_lampLists[g_lampWrite].count = 0;
@@ -775,7 +770,7 @@ namespace CBRO::Core::ShadowLights
 	bool SetHooksIn(bool a_in)
 	{
 		bool ok = true;
-		for (auto* hook : { &g_cameraHook, &g_objectHook, &g_frustumHook, &g_updatePointHook, &g_updateSpotHook }) {
+		for (auto* hook : { &g_cameraHook, &g_objectHook, &g_updatePointHook, &g_updateSpotHook }) {
 			if (hook->address && !Util::SetHook(*hook, a_in)) {
 				ok = false;
 				logger::warn("hook {}: couldn't be {} (another plugin changed that slot since); left {}", hook->name, a_in ? "put back" : "taken out", hook->in ? "in" : "out");
