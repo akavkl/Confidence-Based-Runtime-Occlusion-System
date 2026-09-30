@@ -1,0 +1,8 @@
+.xmake/
+build/
+vsxmake*/
+.vs/
+# Ignore large backup archives
+*.tar
+*.zip
+*.7zCBRO_banner_*.png
