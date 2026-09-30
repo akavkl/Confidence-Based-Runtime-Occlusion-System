@@ -49,6 +49,14 @@ namespace CBRO::Core::ShadowLights
 	// many it cleared. Main thread.
 	std::uint32_t UnoccludeLights() noexcept;
 
+	// Diagnostic (bLampDiagnostic): what the engine's shadow-light loop (DeferredLightsImpl, FO4-ENGINE-NOTES 6.4/6.8)
+	// decides for each shadow light of a CBRO frame. Begin runs right before the loop (the deferred-lights stage begin):
+	// it replicates the loop's static tests per light (hidden, occluded, culler state, room set against the main camera);
+	// the light's Update(camera) is hooked to record its result; End runs after the loop and reads the queue slot and the
+	// shadow-map slice. LogStats reports the per-frame fates and a few of the lights that did not render. Main thread.
+	void LampLoopBegin() noexcept;
+	void LampLoopEnd() noexcept;
+
 	// Main thread at the cull begin: last frame's lamps become the readable list; this frame's recording starts over.
 	void PublishLamps() noexcept;
 	// The published list (read-only until the next PublishLamps; any thread).

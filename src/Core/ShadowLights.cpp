@@ -355,34 +355,6 @@ namespace CBRO::Core::ShadowLights
 		}
 	}
 
-	void Install()
-	{
-		g_confirmFrames = Settings::Get().confirmFrames;
-		g_casterCulling = Settings::Get().lampShadowCulling;
-		g_volumes = Settings::Get().lampShadowVolumes;
-		const auto vtable = CBRO::Engine::OG(kParabolicVtableID).address();
-		g_original = Util::WriteVFuncSwitchable(g_cameraHook, vtable, kProcessCameraSlot, Util::FnAddr(&ProcessCamera), "shadowlights:BSParabolicCullingProcess::Process(cam)");
-		if (!g_original) {
-			logger::error("shadow lights: hook failed; point-light shadow maps are left to the engine");
-			return;
-		}
-		// Only with the camera hook in place (it sets the region the object hook reads).
-		g_originalObject = Util::WriteVFuncSwitchable(g_objectHook, vtable, kProcessObjectSlot, Util::FnAddr(&ProcessObject), "shadowlights:BSParabolicCullingProcess::Process(obj)");
-		if (!g_originalObject) {
-			logger::error("shadow lights: object hook failed; point-light casters are left to the engine");
-			g_casterCulling = false;
-		}
-		// The spot-light hook (v1.37) is NOT installed: BSShadowFrustumLight's slot 9 is called at mode switches with
-		// arguments a C++ thunk cannot forward (a thunk only passes the integer registers; any floating-point argument
-		// or return value is clobbered by the recording work before the call). Recording spot lights needs a machine-code
-		// stub that preserves the XMM registers, or another source; until then only point lights are recorded and the
-		// lamp trimming stays off by default.
-		(void)kFrustumLightVtableID;
-		(void)kFrustumCullSlot;
-		(void)&FrustumCullThunk;
-		logger::info("shadow lights: spot-light hook not installed (see the comment: XMM arguments); spot lights are not recorded");
-	}
-
 	namespace
 	{
 		// ShadowSceneNode (global 879298 = 0x1467231B0, a pointer): the shadow lights at +0x170 (BSShadowLight* array,
@@ -451,6 +423,322 @@ namespace CBRO::Core::ShadowLights
 		return cleared;
 	}
 
+	// ---- the lamp loop's decisions (diagnostic, bLampDiagnostic) ------------------------------------------------------
+	namespace
+	{
+		// DeferredLightsImpl's loop (0x142855590..0x142855CB0) skips shadow light i when: its NiLight (+0xB8) has flag bit
+		// 0; BSLight::bOccluded (+0x17C); vtable slot 14 Update(camera) returns false; its face records (+0x198) have no
+		// face-0 culler (+0xE0) or that culler has no state (+0x150); 1457421(main culler's state, light's state) is
+		// false (both states "unrestricted" (+0x138) -> true; either room list (+0x18, count +0x28) empty -> false; else
+		// true iff they share a room); after UpdateQueuedLight (222957) the light's queue slot (+0x18) is 0xFF (that
+		// function drops a light whose NiLight fade (+0x144) is below 0.05, or when no slot is free); after slot 9 Cull
+		// the face's slice (+0x54) is -1 (no shadow map). Otherwise the light renders its map and its light pass.
+		constexpr std::uint64_t kMainCullerID = 865470;           // BSCullingProcess* (DrawWorld's main culler)
+		constexpr std::uint64_t kParabolicLightVtableID = 585920; // BSShadowParabolicLight
+		constexpr std::size_t   kUpdateSlot = 14;
+		constexpr std::size_t   kCullerState = 0x150;
+		constexpr std::size_t   kStateRooms = 0x18;
+		constexpr std::size_t   kStateRoomCount = 0x28;
+		constexpr std::size_t   kStateUnrestricted = 0x138;
+		constexpr std::size_t   kLightQueued = 0x18;
+		constexpr std::size_t   kLightFaces = 0x198;
+		constexpr std::size_t   kFaceCuller = 0xE0;
+		constexpr std::size_t   kFaceSlice = 0x54;
+		constexpr std::size_t   kNiLightFade = 0x144;
+		constexpr std::size_t   kNiObjectFlags = 0x108;
+		constexpr float         kFadeThreshold = 0.05f;
+		constexpr std::uint32_t kMaxRooms = 64;
+
+		enum class LampFate : std::uint8_t
+		{
+			kHidden,
+			kOccluded,
+			kNoCuller,
+			kRoomTest,
+			kUnreached,    // passed the static tests, but Update(camera) was never called (a test this replica lacks)
+			kUpdateFalse,
+			kFaded,
+			kNotQueued,
+			kNoSlice,
+			kRendered,
+			kCount
+		};
+		constexpr const char* kFateNames[]{ "hidden", "occluded", "no culler state", "room test failed", "unreached", "Update(camera) false", "faded", "no queue slot", "no shadow-map slice", "rendered" };
+
+		struct LampEntry
+		{
+			std::uintptr_t light{ 0 };
+			LampFate       fate{ LampFate::kUnreached };
+			bool           updated{ false };
+			bool           updateResult{ false };
+			bool           mainFree{ false };
+			bool           lightFree{ false };
+			std::uint32_t  mainRooms{ 0 };
+			std::uint32_t  lightRooms{ 0 };
+			float          x{ 0 }, y{ 0 }, z{ 0 };
+			float          radius{ 0 };
+			float          fade{ 0 };
+		};
+		constexpr std::size_t kMaxEntries = 256;
+		LampEntry            g_entries[kMaxEntries];
+		std::uint32_t        g_entryCount{ 0 };
+		bool                 g_loopOpen{ false };
+		std::uintptr_t       g_mainCuller{ 0 };
+		std::uint64_t        g_fateCounts[static_cast<std::size_t>(LampFate::kCount)]{};
+		std::uint64_t        g_loopFrames{ 0 };
+		std::uint64_t        g_loopLights{ 0 };
+		constexpr std::size_t kMaxDump = 8;
+		LampEntry            g_dump[kMaxDump];
+		std::uint32_t        g_dumpCount{ 0 };
+		Util::SwitchableHook g_updatePointHook;
+		Util::SwitchableHook g_updateSpotHook;
+		std::uintptr_t       g_originalUpdatePoint{ 0 };
+		std::uintptr_t       g_originalUpdateSpot{ 0 };
+		using UpdateFn = bool (*)(std::uintptr_t, std::uintptr_t);
+
+		void NoteUpdate(std::uintptr_t a_light, bool a_result) noexcept
+		{
+			if (!g_loopOpen) {
+				return;
+			}
+			for (std::uint32_t i = 0; i < g_entryCount; ++i) {
+				if (g_entries[i].light == a_light) {
+					g_entries[i].updated = true;
+					g_entries[i].updateResult = a_result;
+					return;
+				}
+			}
+		}
+
+		bool UpdatePointThunk(std::uintptr_t a_light, std::uintptr_t a_camera)
+		{
+			const bool result = reinterpret_cast<UpdateFn>(g_originalUpdatePoint)(a_light, a_camera);
+			NoteUpdate(a_light, result);
+			return result;
+		}
+
+		bool UpdateSpotThunk(std::uintptr_t a_light, std::uintptr_t a_camera)
+		{
+			const bool result = reinterpret_cast<UpdateFn>(g_originalUpdateSpot)(a_light, a_camera);
+			NoteUpdate(a_light, result);
+			return result;
+		}
+
+		// 1457421 replicated.
+		bool RoomTest(std::uintptr_t a_mainState, std::uintptr_t a_lightState, LampEntry& a_entry) noexcept
+		{
+			a_entry.mainFree = *reinterpret_cast<const std::uint8_t*>(a_mainState + kStateUnrestricted) != 0;
+			a_entry.lightFree = *reinterpret_cast<const std::uint8_t*>(a_lightState + kStateUnrestricted) != 0;
+			a_entry.mainRooms = *reinterpret_cast<const std::uint32_t*>(a_mainState + kStateRoomCount);
+			a_entry.lightRooms = *reinterpret_cast<const std::uint32_t*>(a_lightState + kStateRoomCount);
+			if (a_entry.mainFree && a_entry.lightFree) {
+				return true;
+			}
+			if (a_entry.mainRooms == 0 || a_entry.lightRooms == 0) {
+				return false;
+			}
+			const auto mainRooms = *reinterpret_cast<const std::uintptr_t* const*>(a_mainState + kStateRooms);
+			const auto lightRooms = *reinterpret_cast<const std::uintptr_t* const*>(a_lightState + kStateRooms);
+			if (!mainRooms || !lightRooms) {
+				return false;
+			}
+			for (std::uint32_t i = 0; i < std::min(a_entry.mainRooms, kMaxRooms); ++i) {
+				for (std::uint32_t j = 0; j < std::min(a_entry.lightRooms, kMaxRooms); ++j) {
+					if (mainRooms[i] && mainRooms[i] == lightRooms[j]) {
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+
+		// The static tests of the loop for one light; false when nothing could be read.
+		bool ReadLightStatic(std::uintptr_t a_light, std::uintptr_t a_mainState, LampEntry& a_entry) noexcept
+		{
+			__try {
+				a_entry.light = a_light;
+				const auto niLight = *reinterpret_cast<const std::uintptr_t*>(a_light + kLightNiLightOffset);
+				if (niLight) {
+					const auto* object = reinterpret_cast<const RE::NiAVObject*>(niLight);
+					const auto* view = reinterpret_cast<const CBRO::Engine::NiLightView*>(niLight);
+					a_entry.x = object->world.translate.x;
+					a_entry.y = object->world.translate.y;
+					a_entry.z = object->world.translate.z;
+					a_entry.radius = view->spec.r;
+					a_entry.fade = *reinterpret_cast<const float*>(niLight + kNiLightFade);
+				}
+				if (niLight && (*reinterpret_cast<const std::uint64_t*>(niLight + kNiObjectFlags) & 1)) {
+					a_entry.fate = LampFate::kHidden;
+					return true;
+				}
+				if (*reinterpret_cast<const std::uint8_t*>(a_light + kLightOccluded)) {
+					a_entry.fate = LampFate::kOccluded;
+					return true;
+				}
+				const auto faces = *reinterpret_cast<const std::uintptr_t*>(a_light + kLightFaces);
+				const auto culler = faces ? *reinterpret_cast<const std::uintptr_t*>(faces + kFaceCuller) : 0;
+				const auto state = culler ? *reinterpret_cast<const std::uintptr_t*>(culler + kCullerState) : 0;
+				if (!state || !a_mainState) {
+					a_entry.fate = LampFate::kNoCuller;
+					return true;
+				}
+				if (!RoomTest(a_mainState, state, a_entry)) {
+					a_entry.fate = LampFate::kRoomTest;
+					return true;
+				}
+				a_entry.fate = LampFate::kUnreached;
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		// After the loop: the queue slot and the shadow-map slice of a light that passed the static tests.
+		void ReadLightOutcome(LampEntry& a_entry) noexcept
+		{
+			__try {
+				if (!a_entry.updated) {
+					return;  // stays kUnreached
+				}
+				if (!a_entry.updateResult) {
+					a_entry.fate = LampFate::kUpdateFalse;
+					return;
+				}
+				if (*reinterpret_cast<const std::uint32_t*>(a_entry.light + kLightQueued) == 0xFF) {
+					a_entry.fate = a_entry.fade < kFadeThreshold ? LampFate::kFaded : LampFate::kNotQueued;
+					return;
+				}
+				const auto faces = *reinterpret_cast<const std::uintptr_t*>(a_entry.light + kLightFaces);
+				if (faces && *reinterpret_cast<const std::int32_t*>(faces + kFaceSlice) == -1) {
+					a_entry.fate = LampFate::kNoSlice;
+					return;
+				}
+				a_entry.fate = LampFate::kRendered;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+		}
+
+		std::uint32_t ReadShadowLights(std::uintptr_t& a_array) noexcept
+		{
+			__try {
+				const auto node = *reinterpret_cast<const std::uintptr_t*>(g_shadowSceneNode);
+				if (!node) {
+					return 0;
+				}
+				a_array = *reinterpret_cast<const std::uintptr_t*>(node + kShadowLightsArray);
+				const auto count = *reinterpret_cast<const std::uint16_t*>(node + kShadowLightsCount);
+				return a_array ? count : 0;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		std::uintptr_t ReadMainState() noexcept
+		{
+			__try {
+				const auto culler = *reinterpret_cast<const std::uintptr_t*>(g_mainCuller);
+				return culler ? *reinterpret_cast<const std::uintptr_t*>(culler + kCullerState) : 0;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		std::uintptr_t ReadLightAt(std::uintptr_t a_array, std::uint32_t a_index) noexcept
+		{
+			__try {
+				return reinterpret_cast<const std::uintptr_t*>(a_array)[a_index];
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+	}
+
+	void LampLoopBegin() noexcept
+	{
+		if (!g_shadowSceneNode) {
+			g_shadowSceneNode = CBRO::Engine::OG(kShadowSceneNodeID).address();
+		}
+		if (!g_mainCuller) {
+			g_mainCuller = CBRO::Engine::OG(kMainCullerID).address();
+		}
+		g_entryCount = 0;
+		std::uintptr_t array = 0;
+		const auto     count = std::min<std::uint32_t>(ReadShadowLights(array), kMaxEntries);
+		const auto     mainState = ReadMainState();
+		for (std::uint32_t i = 0; i < count; ++i) {
+			const auto light = ReadLightAt(array, i);
+			if (!light) {
+				continue;
+			}
+			LampEntry entry{};
+			if (ReadLightStatic(light, mainState, entry)) {
+				g_entries[g_entryCount++] = entry;
+			}
+		}
+		g_loopOpen = true;
+	}
+
+	void LampLoopEnd() noexcept
+	{
+		if (!g_loopOpen) {
+			return;
+		}
+		g_loopOpen = false;
+		++g_loopFrames;
+		g_loopLights += g_entryCount;
+		for (std::uint32_t i = 0; i < g_entryCount; ++i) {
+			auto& entry = g_entries[i];
+			if (entry.fate == LampFate::kUnreached) {
+				ReadLightOutcome(entry);
+			}
+			++g_fateCounts[static_cast<std::size_t>(entry.fate)];
+			if (entry.fate != LampFate::kRendered && g_dumpCount < kMaxDump) {
+				bool seen = false;
+				for (std::uint32_t j = 0; j < g_dumpCount; ++j) {
+					seen = seen || g_dump[j].light == entry.light;
+				}
+				if (!seen) {
+					g_dump[g_dumpCount++] = entry;
+				}
+			}
+		}
+	}
+
+	void Install()
+	{
+		g_confirmFrames = Settings::Get().confirmFrames;
+		g_casterCulling = Settings::Get().lampShadowCulling;
+		g_volumes = Settings::Get().lampShadowVolumes;
+		const auto vtable = CBRO::Engine::OG(kParabolicVtableID).address();
+		g_original = Util::WriteVFuncSwitchable(g_cameraHook, vtable, kProcessCameraSlot, Util::FnAddr(&ProcessCamera), "shadowlights:BSParabolicCullingProcess::Process(cam)");
+		if (!g_original) {
+			logger::error("shadow lights: hook failed; point-light shadow maps are left to the engine");
+			return;
+		}
+		// Only with the camera hook in place (it sets the region the object hook reads).
+		g_originalObject = Util::WriteVFuncSwitchable(g_objectHook, vtable, kProcessObjectSlot, Util::FnAddr(&ProcessObject), "shadowlights:BSParabolicCullingProcess::Process(obj)");
+		if (!g_originalObject) {
+			logger::error("shadow lights: object hook failed; point-light casters are left to the engine");
+			g_casterCulling = false;
+		}
+		// The spot-light hook (v1.37) is NOT installed: BSShadowFrustumLight's slot 9 is called at mode switches with
+		// arguments a C++ thunk cannot forward (a thunk only passes the integer registers; any floating-point argument
+		// or return value is clobbered by the recording work before the call). Recording spot lights needs a machine-code
+		// stub that preserves the XMM registers, or another source; until then only point lights are recorded and the
+		// lamp trimming stays off by default.
+		(void)kFrustumLightVtableID;
+		(void)kFrustumCullSlot;
+		(void)&FrustumCullThunk;
+		logger::info("shadow lights: spot-light hook not installed (see the comment: XMM arguments); spot lights are not recorded");
+
+		// The lamp-loop diagnostic: Update(camera) takes only integer arguments and returns a bool, so a C++ thunk is safe.
+		if (Settings::Get().lampDiagnostic) {
+			g_originalUpdatePoint = Util::WriteVFuncSwitchable(g_updatePointHook, CBRO::Engine::OG(kParabolicLightVtableID).address(), kUpdateSlot, Util::FnAddr(&UpdatePointThunk), "shadowlights:BSShadowParabolicLight::Update(cam)");
+			g_originalUpdateSpot = Util::WriteVFuncSwitchable(g_updateSpotHook, CBRO::Engine::OG(kFrustumLightVtableID).address(), kUpdateSlot, Util::FnAddr(&UpdateSpotThunk), "shadowlights:BSShadowFrustumLight::Update(cam)");
+			logger::info("shadow lights: lamp-loop diagnostic on (Update(camera) hooks: point {}, spot {})", g_originalUpdatePoint ? "in" : "FAILED", g_originalUpdateSpot ? "in" : "FAILED");
+		}
+	}
+
 	void PublishLamps() noexcept
 	{
 		g_lampsPublished.store(&g_lampLists[g_lampWrite], std::memory_order_release);
@@ -467,7 +755,7 @@ namespace CBRO::Core::ShadowLights
 	bool SetHooksIn(bool a_in)
 	{
 		bool ok = true;
-		for (auto* hook : { &g_cameraHook, &g_objectHook, &g_frustumHook }) {
+		for (auto* hook : { &g_cameraHook, &g_objectHook, &g_frustumHook, &g_updatePointHook, &g_updateSpotHook }) {
 			if (hook->address && !Util::SetHook(*hook, a_in)) {
 				ok = false;
 				logger::warn("hook {}: couldn't be {} (another plugin changed that slot since); left {}", hook->name, a_in ? "put back" : "taken out", hook->in ? "in" : "out");
@@ -507,5 +795,24 @@ namespace CBRO::Core::ShadowLights
 		const auto unoccludeFrames = take(g_unoccludeFrames);
 		const auto unoccluded = take(g_unoccluded);
 		logger::info("lights un-occluded (previs-driven bOccluded cleared before the deferred-lights stage): {:.0f} CBRO frames, {:.2f} lights/frame", unoccludeFrames, unoccludeFrames > 0 ? unoccluded / unoccludeFrames : 0.0);
+		if (g_loopFrames > 0) {
+			const double loopFrames = static_cast<double>(g_loopFrames);
+			std::string  fates;
+			for (std::size_t i = 0; i < static_cast<std::size_t>(LampFate::kCount); ++i) {
+				fates += std::format("{}{} {:.2f}", i ? " | " : "", kFateNames[i], static_cast<double>(g_fateCounts[i]) / loopFrames);
+				g_fateCounts[i] = 0;
+			}
+			logger::info("lamp loop per frame (the engine's shadow-light loop in CBRO frames, {:.0f} frames): shadow lights {:.2f} || {}", loopFrames, static_cast<double>(g_loopLights) / loopFrames, fates);
+			for (std::uint32_t i = 0; i < g_dumpCount; ++i) {
+				const auto& e = g_dump[i];
+				logger::info(
+					"lamp loop: light at ({:.0f},{:.0f},{:.0f}) radius {:.0f} fade {:.2f} -> {} (camera state: {} rooms{}; light state: {} rooms{})",
+					e.x, e.y, e.z, e.radius, e.fade, kFateNames[static_cast<std::size_t>(e.fate)],
+					e.mainRooms, e.mainFree ? ", unrestricted" : "", e.lightRooms, e.lightFree ? ", unrestricted" : "");
+			}
+			g_loopFrames = 0;
+			g_loopLights = 0;
+			g_dumpCount = 0;
+		}
 	}
 }

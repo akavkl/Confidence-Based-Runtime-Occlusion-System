@@ -77,6 +77,7 @@ namespace CBRO
 		async = ReadBool(path, L"Occlusion", L"bAsync", async);
 		lampGroupTrim = ReadBool(path, L"Occlusion", L"bLampGroupTrim", lampGroupTrim);
 		unoccludeLights = ReadBool(path, L"Occlusion", L"bUnoccludeLights", unoccludeLights);
+		lampDiagnostic = ReadBool(path, L"Occlusion", L"bLampDiagnostic", lampDiagnostic);
 		feedAuditInterval = ReadUInt(path, L"Occlusion", L"iFeedAuditInterval", feedAuditInterval);
 		verdictCache = ReadBool(path, L"Occlusion", L"bVerdictCache", verdictCache);
 		cacheMove = std::clamp(ReadFloat(path, L"Occlusion", L"fCacheMove", cacheMove), 0.5f, 64.0f);
@@ -101,8 +102,8 @@ namespace CBRO
 
 		logger::info("settings: {} ({})", path.string(), exists ? "found" : "missing, using defaults");
 		logger::info(
-			"settings: occlusion={} disablePrevis={} previsFeed={} interiors={} interiorLegacyPrevis={} asyncInteriors={} setDiff={} async={} lampGroupTrim={} unoccludeLights={} feedAuditInterval={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} meshShapes={} sunShadowCulling={} lampShadowCulling={} cellNodePruning={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
-			occlusion, disablePrevis, previsFeed, interiors, interiorLegacyPrevis, asyncInteriors, setDiff, async, lampGroupTrim, unoccludeLights, feedAuditInterval, startActive, observeOnly, toggleHotkey, statusHotkey, notify, hiZDownsample, hiZTemporalFrames, confirmFrames, maxSnapshotAge,
+			"settings: occlusion={} disablePrevis={} previsFeed={} interiors={} interiorLegacyPrevis={} asyncInteriors={} setDiff={} async={} lampGroupTrim={} unoccludeLights={} lampDiagnostic={} feedAuditInterval={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} meshShapes={} sunShadowCulling={} lampShadowCulling={} cellNodePruning={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
+			occlusion, disablePrevis, previsFeed, interiors, interiorLegacyPrevis, asyncInteriors, setDiff, async, lampGroupTrim, unoccludeLights, lampDiagnostic, feedAuditInterval, startActive, observeOnly, toggleHotkey, statusHotkey, notify, hiZDownsample, hiZTemporalFrames, confirmFrames, maxSnapshotAge,
 			maxCameraMove, maxCameraAngle, nearDistance, cullActors, meshShapes, sunShadowCulling, lampShadowCulling, cellNodePruning, depthTolerance, depthSlack,
 			worldDepthMin, worldDepthMax);
 		logger::info(

@@ -1862,6 +1862,9 @@ namespace CBRO::Core::Runtime
 					if (Settings::Get().unoccludeLights && Occlusion::Active() && g_state.hooksIn) {
 						ShadowLights::UnoccludeLights();
 					}
+					if (Settings::Get().lampDiagnostic && Occlusion::Active() && g_state.hooksIn) {
+						ShadowLights::LampLoopBegin();
+					}
 					g_timing.marks[5] = Qpc();
 					g_gpu.Mark(5);
 					break;
@@ -1923,6 +1926,7 @@ namespace CBRO::Core::Runtime
 					break;
 				}
 				case Stage::kSunCascades:
+					ShadowLights::LampLoopEnd();  // (nothing unless LampLoopBegin ran this frame)
 					g_timing.marks[6] = Qpc();
 					g_gpu.Mark(6);
 					break;
