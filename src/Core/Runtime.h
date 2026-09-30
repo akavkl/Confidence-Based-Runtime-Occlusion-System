@@ -7,6 +7,7 @@
 
 namespace CBRO::Core::Runtime
 {
-	void Install();       // F4SEPlugin_Load (before the render-stage hooks are installed)
-	void OnGameLoaded();  // new game / save loaded
+	void Install();          // F4SEPlugin_Load (before the render-stage hooks are installed)
+	void OnGameDataReady();  // the game's data loaded (main menu): the loading-screen listener goes in
+	void OnGameLoaded();     // new game / save loaded
 }

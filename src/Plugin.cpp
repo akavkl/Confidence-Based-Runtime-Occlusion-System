@@ -22,6 +22,7 @@ namespace
 			if (probe) {
 				CBRO::Probe::OnGameDataReady();
 			}
+			CBRO::Core::Runtime::OnGameDataReady();
 			break;
 		case F4SE::MessagingInterface::kPostLoadGame:
 		case F4SE::MessagingInterface::kNewGame:

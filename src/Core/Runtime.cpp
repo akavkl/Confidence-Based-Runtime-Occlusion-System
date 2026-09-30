@@ -77,6 +77,9 @@ namespace CBRO::Core::Runtime
 			bool          toggleKeyDown{ false };
 			bool          failureHandled{ false };
 			std::atomic<int> previsRequest{ -1 };  // previs to switch at the next cull begin: 0 off, 1 back to the original (-1: none)
+			bool          loadSwitch{ false };       // previs was switched off at a loading screen (v1.44); the first cull after decides what follows
+			bool          loadSinkRegistered{ false };
+			bool          gameLoaded{ false };
 			int           expectedPrevis{ -1 };  // previs state CBRO last set (-1: not yet)
 			bool          previsThreadLogged{ false };
 			int           viewSpaceLogged{ -1 };
@@ -1542,6 +1545,15 @@ namespace CBRO::Core::Runtime
 			}
 			const auto gates = Hooks::PrevisFeed::ReadGates();
 			const bool interior = gates.readable && (!gates.exterior || gates.overrideRoot);
+			if (g_state.loadSwitch) {
+				// The loading screen switched previs off (v1.44). Interior: the legacy path below (or the unchanged
+				// interior->interior case) keeps it off. Exterior: the windows want it enabled again.
+				g_state.loadSwitch = false;
+				if (!interior && !g_state.interiorScene) {
+					g_state.previsRequest.store(1);
+					logger::info("previs feed: exterior after the load: previs re-enabled (the windows)");
+				}
+			}
 			if (interior == g_state.interiorScene) {
 				return;
 			}
@@ -1586,6 +1598,60 @@ namespace CBRO::Core::Runtime
 				logger::info("previs {}", want ? "re-enabled" : "disabled (CBRO is the visibility authority)");
 			}
 			g_state.expectedPrevis = want ? 1 : 0;
+		}
+
+		// v1.44: a loading screen while CBRO is on, with bPrevisFeed=1 and bInteriorLegacyPrevis=1. v1.28 had previs off
+		// from the game load on, so every cell attached with previs inactive; with the windows previs is active between
+		// culls, so an interior attached with it active and was switched only at its first cull, after the engine had
+		// already done its per-cell setup for the previs-active case (the previs-off setup of rooms and lights is gated
+		// by IsActive(): FO4-ENGINE-NOTES 5.5c, 6.7, 6.8). The lamps of such an interior stayed dark (v1.31-v1.43).
+		// So the switch is made when the loading screen opens, before the cells attach, as v1.28 had it; the first
+		// cull after the load re-enables previs for an exterior (SyncInteriorMode). Main thread (the UI's event source).
+		void OnLoadingScreen()
+		{
+			const auto& settings = Settings::Get();
+			// (Not before a game is loaded: the very first load then behaves as v1.28, previs switched after it; a save
+			// that starts in an interior needs one more load for its lamps.)
+			if (!g_state.installed || !g_state.gameLoaded || !g_state.wantActive || !settings.previsFeed || !settings.interiors || !settings.interiorLegacyPrevis || !settings.disablePrevis) {
+				return;
+			}
+			const auto main = RE::Main::GetSingleton();
+			const bool mainThread = main && main->threadID == GetCurrentThreadId();
+			g_state.previsRequest.store(0);
+			if (mainThread) {
+				ApplyPrevisRequest();
+				g_state.loadSwitch = true;
+				logger::info("loading screen: previs switched off before the cells attach (as v1.28; the first cull after the load decides what follows)");
+			} else {
+				logger::warn("loading screen: not on the main thread; previs switch left for the next cull begin (after the load)");
+			}
+		}
+
+		class LoadSink final : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
+			{
+				if (a_event.opening && a_event.menuName == "LoadingMenu") {
+					OnLoadingScreen();
+				}
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+		LoadSink g_loadSink;
+
+		void RegisterLoadSink()
+		{
+			if (g_state.loadSinkRegistered) {
+				return;
+			}
+			const auto ui = RE::UI::GetSingleton();
+			if (!ui) {
+				return;
+			}
+			ui->RegisterSink<RE::MenuOpenCloseEvent>(&g_loadSink);
+			g_state.loadSinkRegistered = true;
+			logger::info("loading-screen listener registered (previs off before cells attach while CBRO is on: bPrevisFeed=1 with bInteriorLegacyPrevis=1)");
 		}
 
 		// The hooks follow the mode, switched on the main thread before DrawWorld's cull: out while previs has the
@@ -1981,6 +2047,13 @@ namespace CBRO::Core::Runtime
 			std::format("VK 0x{:X}", settings.toggleHotkey));
 	}
 
+	void OnGameDataReady()
+	{
+		if (g_state.installed) {
+			RegisterLoadSink();
+		}
+	}
+
 	void OnGameLoaded()
 	{
 		if (!g_state.installed) {
@@ -1989,6 +2062,8 @@ namespace CBRO::Core::Runtime
 		HiZ::Reset();
 		ResetAB();
 		Feed::OnGameLoaded();
+		RegisterLoadSink();
+		g_state.gameLoaded = true;
 		ApplyMode(g_state.wantActive, "game loaded");
 	}
 }
