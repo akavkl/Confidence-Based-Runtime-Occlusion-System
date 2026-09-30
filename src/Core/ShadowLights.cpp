@@ -372,11 +372,15 @@ namespace CBRO::Core::ShadowLights
 			logger::error("shadow lights: object hook failed; point-light casters are left to the engine");
 			g_casterCulling = false;
 		}
-		const auto frustumVtable = CBRO::Engine::OG(kFrustumLightVtableID).address();
-		g_originalFrustumCull = Util::WriteVFuncSwitchable(g_frustumHook, frustumVtable, kFrustumCullSlot, Util::FnAddr(&FrustumCullThunk), "shadowlights:BSShadowFrustumLight::cull");
-		if (!g_originalFrustumCull) {
-			logger::error("shadow lights: spot-light hook failed; spot lights are not recorded (group 0 keeps every caster with the sun off)");
-		}
+		// The spot-light hook (v1.37) is NOT installed: BSShadowFrustumLight's slot 9 is called at mode switches with
+		// arguments a C++ thunk cannot forward (a thunk only passes the integer registers; any floating-point argument
+		// or return value is clobbered by the recording work before the call). Recording spot lights needs a machine-code
+		// stub that preserves the XMM registers, or another source; until then only point lights are recorded and the
+		// lamp trimming stays off by default.
+		(void)kFrustumLightVtableID;
+		(void)kFrustumCullSlot;
+		(void)&FrustumCullThunk;
+		logger::info("shadow lights: spot-light hook not installed (see the comment: XMM arguments); spot lights are not recorded");
 	}
 
 	void PublishLamps() noexcept
