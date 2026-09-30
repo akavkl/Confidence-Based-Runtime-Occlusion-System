@@ -143,6 +143,8 @@ namespace CBRO::Core::Occlusion
 		kConfirming,  // ... not yet for confirmFrames frames
 	};
 	[[nodiscard]] LampVerdict TestLampCaster(RE::NiAVObject* a_caster, const RE::NiPoint3& a_lamp, float a_reach, const RE::NiBound& a_bound) noexcept;
+	// The same against a given context (the async worker's).
+	[[nodiscard]] LampVerdict TestLampCasterIn(const FrameContext& a_context, RE::NiAVObject* a_caster, const RE::NiPoint3& a_lamp, float a_reach, const RE::NiBound& a_bound) noexcept;
 	void                      CountLampVerdict(LampVerdict a_verdict) noexcept;  // for the stats (per-thread counters)
 
 	[[nodiscard]] std::uint32_t Clock() noexcept;         // advances once per culled frame

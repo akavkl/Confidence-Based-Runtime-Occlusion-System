@@ -1737,6 +1737,7 @@ namespace CBRO::Core::Runtime
 				g_asyncFrame.moveMargin = std::clamp(2.0f * frameMove + 4.0f, 6.0f, 48.0f);
 				g_asyncFrame.turnMargin = std::clamp(2.0f * frameTurn + 0.5f * 3.14159265f / 180.0f, 1.0f * 3.14159265f / 180.0f, 8.0f * 3.14159265f / 180.0f);
 			}
+			ShadowLights::PublishLamps();  // last frame's shadow-casting lamps, for group 0 with the sun off
 			Occlusion::BeginFrame(context);
 			g_asyncFrame.context = context;
 			g_state.cullingThisFrame = context.cull;

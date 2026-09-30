@@ -20,6 +20,7 @@ namespace CBRO::Core::Occlusion
 		kBehind,    // the shadow falls only behind visible surfaces (needs its streak)
 		kNeeded,
 		kUnknown,   // the sun's state couldn't be verified: needed
+		kLampUnneeded,  // sun off: no shadow-casting lamp's shadow of it can reach a visible surface (never reused: re-judged each frame)
 	};
 
 	enum RecordFlags : std::uint8_t

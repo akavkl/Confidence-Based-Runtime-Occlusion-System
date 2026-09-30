@@ -3,6 +3,7 @@
 #include "Core/Async.h"
 #include "Core/DropSet.h"
 #include "Core/MeshProxy.h"
+#include "Core/ShadowLights.h"
 #include "Hooks/CullGroups.h"
 #include "Settings.h"
 #include "Util/Gamebryo.h"
@@ -26,6 +27,7 @@ namespace CBRO::Core::Occlusion
 			bool          observeOnly{ false };
 			bool          cullActors{ false };
 			bool          meshShapes{ true };
+			bool          lampGroupTrim{ true };  // sun off: a group-0 entry the main view doesn't need is left out when no lamp's shadow of it can reach a visible surface
 		};
 		Tunables g_tunables;
 
@@ -101,7 +103,10 @@ namespace CBRO::Core::Occlusion
 			kSunHidden,          // ... shadow only falls behind visible surfaces (confirmed)
 			kSunConfirming,
 			kSunNeeded,
-			kSunOff,             // ... sun shadows off this frame: nothing to test
+			kSunOff,             // ... sun shadows off this frame, and no lamp known (or trimming off): kept in group 0
+			kSunLampUnneeded,    // ... sun off: no recorded lamp's shadow of it can reach a visible surface (left out of group 0)
+			kSunLampNeeded,      // ... sun off: some lamp's shadow of it may (kept)
+			kSunLampTests,       // ... lamp shadow-volume tests run for the above
 			kCasterRejected,     // group-0 entries rejected in every view (neither the main camera nor the sun needs them)
 			kCasterSkipped,      // group-0 top-level objects never filed, for the same reason
 			kCellNodesSeen,       // cells' child node 3 (precombined chunks + static refs) offered by the scene walk
@@ -1814,14 +1819,37 @@ namespace CBRO::Core::Occlusion
 			a_out.sunReadback = a_context.readback;
 			a_out.sunBlocks[0] = 255;
 			switch (a_context.sun.state) {
-			case FrameContext::Sun::State::kOff:
-				// The sun's cascades don't read group 0 this frame, but something else does: in the v1.31 interior run,
-				// leaving hidden and out-of-view entries out of group 0 with the sun off made the lamp shadow maps
-				// vanish (seven "shadowmap PB" accumulators a frame in previs mode, none in CBRO mode). Until that
-				// reader is identified, a sun-off frame removes nothing from group 0 (main-view drops only).
-				Bump(kSunOff);
-				a_out.sun = SunOutcome::kUnknown;
+			case FrameContext::Sun::State::kOff: {
+				// The sun's cascades don't read group 0 this frame; the spot lights' group passes do (FO4-ENGINE-NOTES
+				// 6.2a: the v1.31 interior run lost its lamp shadow maps when hidden entries were simply left out). So
+				// with the sun off an entry the main view doesn't need is left out only when no recorded lamp (point or
+				// spot, ShadowLights) can cast a visible shadow of it: the same shadow-volume test the point-light casters
+				// get, per lamp within reach. Never reused across frames (the lamps and the depth move).
+				const auto& lamps = ShadowLights::Lamps();
+				if (!g_tunables.lampGroupTrim || lamps.count == 0 || lamps.overflow != 0 || !a_out.object) {
+					Bump(kSunOff);
+					a_out.sun = SunOutcome::kUnknown;
+					return;
+				}
+				auto* caster = const_cast<RE::NiAVObject*>(static_cast<const RE::NiAVObject*>(a_out.object));
+				for (std::uint32_t i = 0; i < lamps.count; ++i) {
+					const auto& lamp = lamps.items[i];
+					const float dx = a_bound.center.x - lamp.position.x, dy = a_bound.center.y - lamp.position.y, dz = a_bound.center.z - lamp.position.z;
+					if (dx * dx + dy * dy + dz * dz > (lamp.reach + a_bound.fRadius) * (lamp.reach + a_bound.fRadius)) {
+						continue;  // beyond this lamp's reach
+					}
+					Bump(kSunLampTests);
+					const auto verdict = TestLampCasterIn(a_context, caster, lamp.position, lamp.reach, a_bound);
+					if (verdict != LampVerdict::kOutside && verdict != LampVerdict::kMisses) {
+						Bump(kSunLampNeeded);
+						a_out.sun = SunOutcome::kUnknown;  // (needed: kept in group 0)
+						return;
+					}
+				}
+				Bump(kSunLampUnneeded);
+				a_out.sun = SunOutcome::kLampUnneeded;
 				return;
+			}
 			case FrameContext::Sun::State::kUnknown:
 				a_out.sun = SunOutcome::kUnknown;
 				return;
@@ -1851,7 +1879,8 @@ namespace CBRO::Core::Occlusion
 
 		bool SunUnneededIn(const Record& a_record) noexcept
 		{
-			return a_record.sun == SunOutcome::kUnneeded || (a_record.sun == SunOutcome::kBehind && a_record.sunStreak >= g_tunables.confirmFrames);
+			return a_record.sun == SunOutcome::kUnneeded || a_record.sun == SunOutcome::kLampUnneeded ||
+			       (a_record.sun == SunOutcome::kBehind && a_record.sunStreak >= g_tunables.confirmFrames);
 		}
 
 		enum class Reuse : std::uint8_t
@@ -1919,6 +1948,9 @@ namespace CBRO::Core::Occlusion
 		// read moved since.
 		bool SunValid(const FrameContext& a_context, const Record& a_old) noexcept
 		{
+			if (a_old.sun == SunOutcome::kLampUnneeded) {
+				return false;  // (rests on the lamps and the depth of its frame: re-judged every frame)
+			}
 			if (a_old.sun != SunOutcome::kBehind) {
 				return true;
 			}
@@ -2623,6 +2655,7 @@ namespace CBRO::Core::Occlusion
 		g_tunables.observeOnly = settings.observeOnly;
 		g_tunables.cullActors = settings.cullActors;
 		g_tunables.meshShapes = settings.meshShapes;
+		g_tunables.lampGroupTrim = settings.lampGroupTrim;
 		g_mergedVtable = RE::VTABLE::BSMergeInstancedTriShape[0].address();
 		g_niNodeVtable = RE::VTABLE::NiNode[0].address();
 		MeshProxy::Install();
@@ -2740,7 +2773,16 @@ namespace CBRO::Core::Occlusion
 	LampVerdict TestLampCaster(RE::NiAVObject* a_caster, const RE::NiPoint3& a_lamp, float a_reach, const RE::NiBound& a_bound) noexcept
 	{
 		const auto context = CurrentContext();
-		if (!context || context->lampPlaneCount == 0) {
+		if (!context) {
+			return LampVerdict::kUnknown;
+		}
+		return TestLampCasterIn(*context, a_caster, a_lamp, a_reach, a_bound);
+	}
+
+	LampVerdict TestLampCasterIn(const FrameContext& a_context, RE::NiAVObject* a_caster, const RE::NiPoint3& a_lamp, float a_reach, const RE::NiBound& a_bound) noexcept
+	{
+		const auto context = &a_context;
+		if (!context->snapshot || context->lampPlaneCount == 0) {
 			return LampVerdict::kUnknown;
 		}
 		const auto& snapshot = *context->snapshot;
@@ -3079,8 +3121,8 @@ namespace CBRO::Core::Occlusion
 			"occlusion main view only (groups the sun's shadow cascades read too) per frame: entries {:.0f} | dropped with their parent {:.0f} | registrations {:.0f}, left out {:.0f} | drop table full {:.0f}",
 			per(kShared), per(kDropInherited), per(kRegistered), per(kRegistrationsDropped), per(kDropFull));
 		logger::info(
-			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f} | sun off (kept in group 0 for its other readers) {:.0f} | confirming {:.0f} | needed {:.0f} || objects nothing needs: never filed {:.0f}, rejected {:.0f}",
-			per(kSunTests), per(kSunOutside), per(kSunHidden), per(kSunOff), per(kSunConfirming), per(kSunNeeded), per(kCasterSkipped), per(kCasterRejected));
+			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f} | sun off: kept, no lamp known {:.0f}; lamp tests {:.0f}: no lamp's shadow reaches a visible surface {:.0f} (left out), a lamp's may {:.0f} | confirming {:.0f} | needed {:.0f} || objects nothing needs: never filed {:.0f}, rejected {:.0f}",
+			per(kSunTests), per(kSunOutside), per(kSunHidden), per(kSunOff), per(kSunLampTests), per(kSunLampUnneeded), per(kSunLampNeeded), per(kSunConfirming), per(kSunNeeded), per(kCasterSkipped), per(kCasterRejected));
 		logger::info(
 			"occlusion early skips per frame (main-view-only groups, never filed with the engine): hidden {:.0f} | out of view {:.0f} | top-level adds considered {:.0f}",
 			per(kSkippedHidden), per(kSkippedOutside), static_cast<double>(Hooks::CullGroups::TakeGroupAddsConsidered()) / frames);

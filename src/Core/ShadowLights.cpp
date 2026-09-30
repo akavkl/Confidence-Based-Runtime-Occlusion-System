@@ -44,6 +44,69 @@ namespace CBRO::Core::ShadowLights
 		std::uintptr_t       g_originalObject{ 0 };
 		Util::SwitchableHook g_cameraHook;  // taken out while CBRO is off
 		Util::SwitchableHook g_objectHook;
+
+		// Spot lights: BSShadowFrustumLight (vtable id 67506) slot 9 (1559482) is its cull: it sets the shadow camera's
+		// frustum (far = the NiLight's radius) and runs the group pass (FO4-ENGINE-NOTES 6.2a). The light's NiLight is at
+		// +0xB8 (BSLight), as for the parabolic light; NiLight::spec.r (+0x138) is the radius.
+		constexpr std::uint64_t kFrustumLightVtableID = 67506;
+		constexpr std::size_t   kFrustumCullSlot = 9;
+		constexpr std::size_t   kLightNiLightOffset = 0xB8;
+		using PassFn = std::uintptr_t (*)(std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t);
+		std::uintptr_t       g_originalFrustumCull{ 0 };
+		Util::SwitchableHook g_frustumHook;
+
+		// ---- the lamps of a frame (main thread: the shadow stage writes, the cull begin publishes) --------------------
+		LampList                   g_lampLists[2];
+		std::uint32_t              g_lampWrite{ 0 };
+		std::atomic<const LampList*> g_lampsPublished{ &g_lampLists[1] };
+		std::atomic<std::uint64_t> g_lampsPoint{ 0 };
+		std::atomic<std::uint64_t> g_lampsSpot{ 0 };
+
+		void RecordLamp(const RE::NiPoint3& a_position, float a_reach, bool a_spot) noexcept
+		{
+			auto& list = g_lampLists[g_lampWrite];
+			if (!std::isfinite(a_reach) || a_reach < 16.0f || a_reach > 1.0e6f || !std::isfinite(a_position.x) || !std::isfinite(a_position.y) || !std::isfinite(a_position.z)) {
+				return;
+			}
+			if (list.count >= LampList::kMax) {
+				++list.overflow;
+				return;
+			}
+			list.items[list.count++] = Lamp{ a_position, a_reach, a_spot };
+			(a_spot ? g_lampsSpot : g_lampsPoint).fetch_add(1, std::memory_order_relaxed);
+		}
+
+		// The spot light's NiLight position and radius, read under SEH (the light must be one of the engine's).
+		bool ReadSpotLight(std::uintptr_t a_light, RE::NiPoint3& a_position, float& a_reach) noexcept
+		{
+			__try {
+				const auto niLight = *reinterpret_cast<const std::uintptr_t*>(a_light + kLightNiLightOffset);
+				if (!niLight) {
+					return false;
+				}
+				const auto* object = reinterpret_cast<const RE::NiAVObject*>(niLight);
+				const auto* view = reinterpret_cast<const CBRO::Engine::NiLightView*>(niLight);
+				const float scale = std::isfinite(object->world.scale) && object->world.scale > 0.0f ? object->world.scale : 1.0f;
+				const auto  valid = [](float a_value) { return std::isfinite(a_value) ? a_value : 0.0f; };
+				a_position = object->world.translate;
+				a_reach = std::max({ valid(view->spec.r * scale), valid(view->modelBound.fRadius * scale), valid(object->worldBound.fRadius) });
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		std::uintptr_t FrustumCullThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
+		{
+			if (Occlusion::Active()) {
+				RE::NiPoint3 position{};
+				float        reach = 0.0f;
+				if (ReadSpotLight(a1, position, reach)) {
+					RecordLamp(position, reach, true);
+				}
+			}
+			return reinterpret_cast<PassFn>(g_originalFrustumCull)(a1, a2, a3, a4);
+		}
 		std::uint32_t  g_confirmFrames{ 2 };
 		bool           g_casterCulling{ true };
 
@@ -214,6 +277,12 @@ namespace CBRO::Core::ShadowLights
 				return;
 			}
 			g_calls.fetch_add(1, std::memory_order_relaxed);
+			{
+				// The lamp itself, for the group-0 trimming with the sun off (its culling sphere: center, radius).
+				const auto  base = static_cast<const std::byte*>(a_self);
+				const auto* center = reinterpret_cast<const float*>(base + kSphereCenterOffset);
+				RecordLamp(RE::NiPoint3{ center[0], center[1], center[2] }, *reinterpret_cast<const float*>(base + kSphereRadiusOffset), false);
+			}
 			if (a_camera && a_scene && ShouldEmpty(a_self, a_camera)) {
 				auto&      cullMode = *reinterpret_cast<std::uint32_t*>(static_cast<std::byte*>(a_self) + kCullModeOffset);
 				const auto saved = cullMode;
@@ -293,12 +362,30 @@ namespace CBRO::Core::ShadowLights
 			logger::error("shadow lights: object hook failed; point-light casters are left to the engine");
 			g_casterCulling = false;
 		}
+		const auto frustumVtable = CBRO::Engine::OG(kFrustumLightVtableID).address();
+		g_originalFrustumCull = Util::WriteVFuncSwitchable(g_frustumHook, frustumVtable, kFrustumCullSlot, Util::FnAddr(&FrustumCullThunk), "shadowlights:BSShadowFrustumLight::cull");
+		if (!g_originalFrustumCull) {
+			logger::error("shadow lights: spot-light hook failed; spot lights are not recorded (group 0 keeps every caster with the sun off)");
+		}
+	}
+
+	void PublishLamps() noexcept
+	{
+		g_lampsPublished.store(&g_lampLists[g_lampWrite], std::memory_order_release);
+		g_lampWrite ^= 1u;
+		g_lampLists[g_lampWrite].count = 0;
+		g_lampLists[g_lampWrite].overflow = 0;
+	}
+
+	const LampList& Lamps() noexcept
+	{
+		return *g_lampsPublished.load(std::memory_order_acquire);
 	}
 
 	bool SetHooksIn(bool a_in)
 	{
 		bool ok = true;
-		for (auto* hook : { &g_cameraHook, &g_objectHook }) {
+		for (auto* hook : { &g_cameraHook, &g_objectHook, &g_frustumHook }) {
 			if (hook->address && !Util::SetHook(*hook, a_in)) {
 				ok = false;
 				logger::warn("hook {}: couldn't be {} (another plugin changed that slot since); left {}", hook->name, a_in ? "put back" : "taken out", hook->in ? "in" : "out");
@@ -332,5 +419,8 @@ namespace CBRO::Core::ShadowLights
 		logger::info(
 			"shadow light casters per frame: lights limited to the view {:.1f} (inside it {:.1f}) | objects tested {:.0f} | left out: outside the pushed view cone {:.0f}, shadow volume can't reach a visible surface {:.0f} (with their subtrees)",
 			regions / frames, inside / frames, tests / frames, culled / frames, volume / frames);
+		const auto point = take(g_lampsPoint);
+		const auto spot = take(g_lampsSpot);
+		logger::info("shadow lamps recorded per frame (for group 0 with the sun off): point {:.1f} | spot {:.1f} | list overflow {}", point / frames, spot / frames, Lamps().overflow);
 	}
 }
