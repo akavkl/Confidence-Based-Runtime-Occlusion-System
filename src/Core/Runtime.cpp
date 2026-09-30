@@ -1506,6 +1506,9 @@ namespace CBRO::Core::Runtime
 				} else {
 					Notify(effective ? "CBRO on - working with previs" : !wanted ? "CBRO off - previs only" : standby ? "CBRO standing by (interior) - previs only" : "CBRO unavailable - previs only");
 				}
+				if (effective && Occlusion::Deciding()) {
+					Notify(g_state.diagnostic == 2 ? "CBRO DIAGNOSTIC: decide-only, no depth capture (nothing hidden)" : "CBRO DIAGNOSTIC: decide-only (nothing hidden)");
+				}
 			}
 
 			// With bPrevisFeed=1 previs is never switched off (Core/Feed suspends it without a flush at the cull begin).
