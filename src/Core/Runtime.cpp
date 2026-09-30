@@ -79,6 +79,7 @@ namespace CBRO::Core::Runtime
 			std::atomic<int> previsRequest{ -1 };  // previs to switch at the next cull begin: 0 off, 1 back to the original (-1: none)
 			bool          loadSwitch{ false };       // previs was switched off at a loading screen (v1.44); the first cull after decides what follows
 			bool          loadSinkRegistered{ false };
+			bool          loadSuspended{ false };    // ... by the suspension byte (the UI's thread): cleared after the switch lands
 			bool          gameLoaded{ false };
 			int           expectedPrevis{ -1 };  // previs state CBRO last set (-1: not yet)
 			bool          previsThreadLogged{ false };
@@ -1546,13 +1547,15 @@ namespace CBRO::Core::Runtime
 			const auto gates = Hooks::PrevisFeed::ReadGates();
 			const bool interior = gates.readable && (!gates.exterior || gates.overrideRoot);
 			if (g_state.loadSwitch) {
-				// The loading screen switched previs off (v1.44). Interior: the legacy path below (or the unchanged
-				// interior->interior case) keeps it off. Exterior: the windows want it enabled again.
+				// The loading screen made previs inactive for the attach (v1.44/v1.45: switched off on the main thread,
+				// or suspended by the byte from the UI's thread). The suspension byte goes back before the windows
+				// logic (Core/Feed) reads it; then: interior -> the engine's switch (off and flushed) as the legacy path
+				// wants, whether or not the scene kind changed; exterior -> previs enabled for the windows.
+				// The request lands at the next cull begin (ApplyPrevisRequest runs before this); the suspension byte,
+				// if CBRO set it, stays for this frame's walk and is cleared there, after the switch.
 				g_state.loadSwitch = false;
-				if (!interior && !g_state.interiorScene) {
-					g_state.previsRequest.store(1);
-					logger::info("previs feed: exterior after the load: previs re-enabled (the windows)");
-				}
+				g_state.previsRequest.store(interior ? 0 : 1);
+				logger::info("previs feed: after the load: {}", interior ? "interior: previs switched off (legacy path)" : "exterior: previs enabled (the windows)");
 			}
 			if (interior == g_state.interiorScene) {
 				return;
@@ -1598,6 +1601,11 @@ namespace CBRO::Core::Runtime
 				logger::info("previs {}", want ? "re-enabled" : "disabled (CBRO is the visibility authority)");
 			}
 			g_state.expectedPrevis = want ? 1 : 0;
+			if (g_state.loadSuspended) {
+				// The loading screen's suspension (v1.45) has done its job: the switch above is the real state now.
+				g_state.loadSuspended = false;
+				Hooks::PrevisFeed::ClearSuspension();
+			}
 		}
 
 		// v1.44: a loading screen while CBRO is on, with bPrevisFeed=1 and bInteriorLegacyPrevis=1. v1.28 had previs off
@@ -1617,13 +1625,18 @@ namespace CBRO::Core::Runtime
 			}
 			const auto main = RE::Main::GetSingleton();
 			const bool mainThread = main && main->threadID == GetCurrentThreadId();
-			g_state.previsRequest.store(0);
+			g_state.loadSwitch = true;
 			if (mainThread) {
+				g_state.previsRequest.store(0);
 				ApplyPrevisRequest();
-				g_state.loadSwitch = true;
 				logger::info("loading screen: previs switched off before the cells attach (as v1.28; the first cull after the load decides what follows)");
 			} else {
-				logger::warn("loading screen: not on the main thread; previs switch left for the next cull begin (after the load)");
+				// The UI's event source runs on another thread (seen: the v1.44 run). The engine's switch (a flush) is
+				// not for that thread; its flush-free suspension is a byte write and makes IsActive() false for the
+				// attach just the same. The first cull after the load takes it back and makes the proper switch.
+				Hooks::PrevisFeed::SetSuspended(true);
+				g_state.loadSuspended = true;
+				logger::info("loading screen: previs suspended (flush-free byte) before the cells attach, from thread {}; the first cull after the load decides what follows", GetCurrentThreadId());
 			}
 		}
 
@@ -1827,6 +1840,11 @@ namespace CBRO::Core::Runtime
 				g_asyncFrame.turnMargin = std::clamp(2.0f * frameTurn + 0.5f * 3.14159265f / 180.0f, 1.0f * 3.14159265f / 180.0f, 8.0f * 3.14159265f / 180.0f);
 			}
 			ShadowLights::PublishLamps();  // last frame's shadow-casting lamps, for group 0 with the sun off
+			if (settings.unoccludeLights && Occlusion::Active() && g_state.hooksIn) {
+				// Before the engine walks its light lists this frame (UpdateLightList reads BSLight::bOccluded for the
+				// non-shadow lights; the lamp loop for the shadow lights): previs's marks go, as with previs off (6.7).
+				ShadowLights::UnoccludeLights(true);
+			}
 			Occlusion::BeginFrame(context);
 			g_asyncFrame.context = context;
 			g_state.cullingThisFrame = context.cull;
@@ -1926,7 +1944,7 @@ namespace CBRO::Core::Runtime
 					// The deferred-lights stage follows. In a CBRO frame the walk ran with previs inactive, so a light previs
 					// had marked occluded stays marked and dark (FO4-ENGINE-NOTES 6.7); clear the mark, as previs-off vanilla.
 					if (Settings::Get().unoccludeLights && Occlusion::Active() && g_state.hooksIn) {
-						ShadowLights::UnoccludeLights();
+						ShadowLights::UnoccludeLights(false);  // (again: the cull begin's clear is the frame's main one)
 					}
 					if (Settings::Get().lampDiagnostic && Occlusion::Active() && g_state.hooksIn) {
 						ShadowLights::LampLoopBegin();

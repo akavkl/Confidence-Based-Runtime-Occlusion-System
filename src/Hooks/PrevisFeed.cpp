@@ -500,6 +500,16 @@ namespace CBRO::Hooks::PrevisFeed
 		g_held = false;
 	}
 
+	void ClearSuspension() noexcept
+	{
+		// A suspension CBRO itself set outside the windows (the loading screen, v1.45) is not the engine's state: a
+		// window that opened over it must not keep it. Open window: the release writes the byte back; else now.
+		g_savedByte = 0;
+		if (!g_held) {
+			WriteSuspended(false);
+		}
+	}
+
 	WindowCounts TakeWindowCounts() noexcept
 	{
 		const auto counts = g_windowCounts;

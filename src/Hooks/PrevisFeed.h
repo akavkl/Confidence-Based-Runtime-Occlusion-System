@@ -65,6 +65,7 @@ namespace CBRO::Hooks::PrevisFeed
 	[[nodiscard]] bool Held() noexcept;              // the cull window is open (the pre-cull wrapper or HoldNow opened it)
 	void HoldNow() noexcept;                         // at the cull begin, when the pre-cull wrapper didn't open it (a switch frame): opens it and runs the engine's pre-cull helper
 	void ReleaseWindow() noexcept;                   // at the cull stage's end: closes it (the engine's own byte restored)
+	void ClearSuspension() noexcept;                 // a suspension CBRO set with SetSuspended outside the windows ends (now, or at the open window's release)
 	struct WindowCounts
 	{
 		std::uint32_t preCull{ 0 };    // cull windows opened by the pre-cull wrapper

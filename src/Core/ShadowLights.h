@@ -46,8 +46,9 @@ namespace CBRO::Core::ShadowLights
 	// them, so a lamp marked while previs was active stays dark: DeferredLightsImpl's lamp loop skips every marked
 	// shadow light (no shadow map, no light pass). Vanilla with previs off never marks any. This clears the mark on every
 	// light of the ShadowSceneNode's lists; to run once per CBRO frame before the deferred-lights stage. Returns how
-	// many it cleared. Main thread.
-	std::uint32_t UnoccludeLights() noexcept;
+	// many it cleared. Main thread. a_countFrame: this call counts as the frame's (the stats are per frame; the cull
+	// begin's call counts, the deferred-lights stage's does not).
+	std::uint32_t UnoccludeLights(bool a_countFrame) noexcept;
 
 	// Diagnostic (bLampDiagnostic): what the engine's shadow-light loop (DeferredLightsImpl, FO4-ENGINE-NOTES 6.4/6.8)
 	// decides for each shadow light of a CBRO frame. Begin runs right before the loop (the deferred-lights stage begin):
