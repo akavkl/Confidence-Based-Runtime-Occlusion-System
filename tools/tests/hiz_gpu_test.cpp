@@ -9,7 +9,9 @@
 //     or its nearest nearer, than its reference allows (reset and no-linear captures mark every block); a marked block's
 //     reference is its new depth, an unmarked block's follows the nearest farthest / farthest nearest depth seen since
 //     its mark (v1.27), and marks persist across captures. Blocks within float noise of the threshold may differ
-//     between the GPU's and the CPU's arithmetic and are reported separately.
+//     between the GPU's and the CPU's arithmetic and are reported separately;
+//  5. (v1.57) level 0's farthest drawn depth: the max over the texel's depth pixels where something was drawn (the far
+//     plane and first person left out as 0), merged over the same captures by max; bit-exact.
 // Sizes include odd ones (161x102: partial 8x8 blocks, odd mip sizes), one where the tail pass builds a single level,
 // and one with fewer than 4 levels (no tail pass; the group's level-3 store must stay in bounds).
 // Build: cl /std:c++latest /O2 /EHsc /I src tools\tests\hiz_gpu_test.cpp d3d11.lib d3dcompiler.lib   (VS x64 prompt)
@@ -115,10 +117,11 @@ struct Model
 {
 	std::uint32_t                                srcW, srcH, factor, dstW, dstH, blocksW, blocksH;
 	Layout                                       layout;
-	std::array<std::vector<float>, kRingSize>    ringNear, ringFar;
+	std::array<std::vector<float>, kRingSize>    ringNear, ringFar, ringDrawn;
 	std::vector<float>                           refFar, refNear;
 	std::vector<std::uint32_t>                   changedAt;
 	std::vector<float>                           farPyramid, nearPyramid;
+	std::vector<float>                           drawn;  // level 0's farthest drawn depth (v1.57), merged
 	std::vector<float>                           margin;  // per block: how close the change decision was (for tolerance)
 	std::vector<bool>                            marked;  // per block: marked this capture
 	std::vector<float>                           refFarBefore, refNearBefore;  // the references before this capture (to adopt a borderline GPU decision)
@@ -135,6 +138,8 @@ struct Model
 		const std::size_t level0 = static_cast<std::size_t>(dstW) * dstH;
 		for (auto& r : ringNear) r.assign(level0, 1.0f);
 		for (auto& r : ringFar) r.assign(level0, 0.0f);
+		for (auto& r : ringDrawn) r.assign(level0, 0.0f);
+		drawn.assign(level0, 0.0f);
 		refFar.assign(level0, 0.0f);
 		refNear.assign(level0, 0.0f);
 		changedAt.assign(static_cast<std::size_t>(blocksW) * blocksH, 0);
@@ -149,9 +154,10 @@ struct Model
 		// 1. reduce
 		auto& near0 = ringNear[a_ringCur];
 		auto& far0 = ringFar[a_ringCur];
+		auto& drawn0 = ringDrawn[a_ringCur];
 		for (std::uint32_t y = 0; y < dstH; ++y) {
 			for (std::uint32_t x = 0; x < dstW; ++x) {
-				float farthest = 0.0f, nearest = 1.0f;
+				float farthest = 0.0f, nearest = 1.0f, drawnDepth = 0.0f;
 				for (std::uint32_t dy = 0; dy < factor; ++dy) {
 					for (std::uint32_t dx = 0; dx < factor; ++dx) {
 						const auto px = std::min(x * factor + dx, srcW - 1);
@@ -160,21 +166,25 @@ struct Model
 						const bool  firstPerson = d < kDepthMin;
 						farthest = std::max(farthest, firstPerson ? 1.0f : d);
 						nearest = std::min(nearest, firstPerson ? 0.0f : d);
+						drawnDepth = std::max(drawnDepth, (firstPerson || d >= 0.999999f) ? 0.0f : d);  // (nothing drawn and the sky left out)
 					}
 				}
 				near0[static_cast<std::size_t>(y) * dstW + x] = nearest;
 				far0[static_cast<std::size_t>(y) * dstW + x] = farthest;
+				drawn0[static_cast<std::size_t>(y) * dstW + x] = drawnDepth;
 			}
 		}
 		// 2. merge
 		const std::size_t level0 = static_cast<std::size_t>(dstW) * dstH;
 		std::copy_n(far0.begin(), level0, farPyramid.begin());
 		std::copy_n(near0.begin(), level0, nearPyramid.begin());
+		std::copy_n(drawn0.begin(), level0, drawn.begin());
 		for (std::uint32_t k = 1; k <= a_mergeCount; ++k) {
 			const auto slice = (a_ringCur + kRingSize - k) % kRingSize;
 			for (std::size_t i = 0; i < level0; ++i) {
 				farPyramid[i] = std::max(farPyramid[i], ringFar[slice][i]);
 				nearPyramid[i] = std::min(nearPyramid[i], ringNear[slice][i]);
+				drawn[i] = std::max(drawn[i], ringDrawn[slice][i]);
 			}
 		}
 		// 3. mips (v1.24 BuildMips)
@@ -258,7 +268,7 @@ struct Gpu
 	ComPtr<ID3D11DeviceContext>       context;
 	ComPtr<ID3D11ComputeShader>       build, tail;
 	ComPtr<ID3D11Buffer>              params, out, staging;
-	ComPtr<ID3D11Texture2D>           depth, ringNear, ringFar, refFar, refNear;
+	ComPtr<ID3D11Texture2D>           depth, ringNear, ringFar, refFar, refNear, ringDrawn;
 	ComPtr<ID3D11ShaderResourceView>  depthSRV;
 	ComPtr<ID3D11UnorderedAccessView> uavs[kUAVs];
 	OutputLayout                      output;
@@ -334,7 +344,8 @@ struct Gpu
 			!Texture(a_model.dstW, a_model.dstH, kRingSize, ringNear, &uavs[0]) ||
 			!Texture(a_model.dstW, a_model.dstH, kRingSize, ringFar, &uavs[1]) ||
 			!Texture(a_model.dstW, a_model.dstH, 1, refFar, &uavs[2]) ||
-			!Texture(a_model.dstW, a_model.dstH, 1, refNear, &uavs[3])) {
+			!Texture(a_model.dstW, a_model.dstH, 1, refNear, &uavs[3]) ||
+			!Texture(a_model.dstW, a_model.dstH, kRingSize, ringDrawn, &uavs[5])) {
 			return false;
 		}
 		output = ComputeOutput(a_model.layout, a_model.blocksW * a_model.blocksH);
@@ -387,6 +398,7 @@ struct Gpu
 		p.blocksW = a_model.blocksW;
 		p.nearOffset = output.nearOffset;
 		p.changedOffset = output.changedOffset;
+		p.drawnOffset = output.drawnOffset;
 		for (std::uint32_t level = 0; level < a_model.layout.levels; ++level) {
 			p.dims[level][0] = a_model.layout.width[level];
 			p.dims[level][1] = a_model.layout.height[level];
@@ -454,6 +466,16 @@ static void Compare(Model& a_model, const std::vector<std::uint8_t>& a_bytes, co
 	const auto* farOut = reinterpret_cast<const float*>(a_bytes.data());
 	const auto* nearOut = reinterpret_cast<const float*>(a_bytes.data() + a_out.nearOffset);
 	const auto* changed = reinterpret_cast<const std::uint32_t*>(a_bytes.data() + a_out.changedOffset);
+	const auto* drawnOut = reinterpret_cast<const float*>(a_bytes.data() + a_out.drawnOffset);
+	for (std::uint32_t y = 0; y < a_model.dstH; ++y) {
+		for (std::uint32_t x = 0; x < a_model.dstW; ++x) {
+			const auto i = static_cast<std::size_t>(y) * a_model.dstW + x;
+			++a_totals.texels;
+			const bool ok = drawnOut[i] == a_model.drawn[i];
+			if (!ok) ++a_totals.texelMismatches;
+			CHECK(ok, "%s: level-0 drawn texel (%u,%u): gpu %.7f, cpu %.7f\n", a_what, x, y, drawnOut[i], a_model.drawn[i]);
+		}
+	}
 	for (std::uint32_t level = 0; level < a_model.layout.levels; ++level) {
 		const auto w = a_model.layout.width[level];
 		const auto h = a_model.layout.height[level];

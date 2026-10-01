@@ -11,7 +11,10 @@
 //          and takes the new depths as the reference.
 //   tail:  one group finishing the remaining (tiny) levels from level 3 on.
 // The output is one flat buffer: far pyramid, near pyramid, then the per-block change map (the capture index of each
-// block's last change; it persists across captures, only marked blocks are written). A texel's reference is the
+// block's last change; it persists across captures, only marked blocks are written), then (v1.57) level 0's farthest
+// drawn depth: the farthest of the texel's depth pixels where something was drawn (the far plane, i.e. nothing drawn or
+// the sky, left out; first person counted as nearest), temporally merged like the farthest depth. Lamp tests read it: a
+// texel mixing a wall with a crack into the void then still says no lit surface lies behind the wall. A texel's reference is the
 // nearest farthest depth (and the farthest nearest depth) since its block was last marked, so "unmarked since
 // capture R" means: no texel of the block is farther (or nearer) now than it was at any capture since R, beyond the
 // tolerance.
@@ -32,7 +35,8 @@ RWTexture2DArray<float> g_ringNear : register(u0);  // level 0 of the last few c
 RWTexture2DArray<float> g_ringFar  : register(u1);
 RWTexture2D<float>      g_refFar   : register(u2);  // per texel: linear depth when its block was last marked changed
 RWTexture2D<float>      g_refNear  : register(u3);
-RWByteAddressBuffer     g_out      : register(u4);  // far pyramid | near pyramid | per block: capture index of the last change
+RWByteAddressBuffer     g_out      : register(u4);  // far pyramid | near pyramid | per block: capture index of the last change | level-0 farthest drawn
+RWTexture2DArray<float> g_ringDrawn : register(u5); // level 0's farthest drawn depth of the last few captures (temporal merge)
 
 cbuffer Params : register(b0)
 {
@@ -53,7 +57,7 @@ cbuffer Params : register(b0)
 	uint  g_blocksW;
 	uint  g_nearOffset;     // byte offset of the near pyramid in g_out
 	uint  g_changedOffset;  // byte offset of the change map in g_out
-	uint  g_pad;
+	uint  g_drawnOffset;    // byte offset of level 0's farthest drawn depth in g_out
 	uint4 g_dims[16];       // per level: width, height, texel offset, 0
 };
 
@@ -94,6 +98,8 @@ void build(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : S
 	const bool inside = id.x < g_dstSize.x && id.y < g_dstSize.y;
 	float farthest = 0.0;  // texels outside the image contribute neutral values to the reductions
 	float nearest = 1.0;
+	float drawn = 0.0;     // the farthest pixel something was drawn at (nothing drawn and the sky left out; first person
+	                       // counts as nearest): a texel mixing a wall with a crack into the void keeps the wall's depth
 	bool  changed = false;
 	if (inside) {
 		uint2 base = id.xy * g_factor;
@@ -104,17 +110,21 @@ void build(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : S
 				bool  firstPerson = d < g_nearReject;
 				farthest = max(farthest, firstPerson ? 1.0 : d);
 				nearest = min(nearest, firstPerson ? 0.0 : d);
+				drawn = max(drawn, (firstPerson || d >= 0.999999) ? 0.0 : d);
 			}
 		}
 		g_ringNear[uint3(id.xy, g_ringCur)] = nearest;
 		g_ringFar[uint3(id.xy, g_ringCur)] = farthest;
+		g_ringDrawn[uint3(id.xy, g_ringCur)] = drawn;
 		// (a nearer surface ever seen is conservative for "in front"; a farther one for "hidden")
 		for (uint k = 1; k <= g_mergeCount; ++k) {
 			uint3 slice = uint3(id.xy, (g_ringCur + g_ringSize - k) % g_ringSize);
 			nearest = min(nearest, g_ringNear[slice]);
 			farthest = max(farthest, g_ringFar[slice]);
+			drawn = max(drawn, g_ringDrawn[slice]);
 		}
 		Store(0, id.xy, nearest, farthest);
+		g_out.Store(g_drawnOffset + (id.y * g_dstSize.x + id.x) * 4, asuint(drawn));
 
 		// Changed only in the directions that can invalidate a hidden verdict: the farthest depth getting farther,
 		// the nearest getting nearer (the other directions only make hidden verdicts truer).
@@ -224,14 +234,14 @@ void tail(uint3 tid : SV_GroupThreadID)
 		std::uint32_t blocksW;
 		std::uint32_t nearOffset;
 		std::uint32_t changedOffset;
-		std::uint32_t pad;
+		std::uint32_t drawnOffset;
 		std::uint32_t dims[16][4];
 	};
 	static_assert(sizeof(Params) == 80 + 16 * 16);
 
 	constexpr std::uint32_t kFlagReset = 1;
 	constexpr std::uint32_t kFlagLinear = 2;
-	constexpr std::uint32_t kUAVs = 5;         // ring near, ring far, reference far, reference near, output
+	constexpr std::uint32_t kUAVs = 6;         // ring near, ring far, reference far, reference near, output, ring drawn
 	constexpr std::uint32_t kGroupLevels = 4;  // pyramid levels the 8x8 groups produce (0-3); the tail pass does the rest
 	constexpr std::uint32_t kRingSize = 8;     // recent captures kept on the GPU for the temporal merge (iHiZTemporalFrames <= 8)
 
@@ -272,6 +282,7 @@ void tail(uint3 tid : SV_GroupThreadID)
 	{
 		std::uint32_t nearOffset{ 0 };
 		std::uint32_t changedOffset{ 0 };
+		std::uint32_t drawnOffset{ 0 };  // level 0's farthest drawn depth (v1.57), one float per level-0 texel, row by row
 		std::uint32_t bytes{ 0 };
 	};
 
@@ -280,7 +291,8 @@ void tail(uint3 tid : SV_GroupThreadID)
 		OutputLayout out{};
 		out.nearOffset = a_layout.total * 4;
 		out.changedOffset = a_layout.total * 8;
-		out.bytes = (out.changedOffset + a_blocks * 4 + 15) & ~15u;
+		out.drawnOffset = (out.changedOffset + a_blocks * 4 + 15) & ~15u;
+		out.bytes = (out.drawnOffset + a_layout.width[0] * a_layout.height[0] * 4 + 15) & ~15u;
 		return out;
 	}
 }

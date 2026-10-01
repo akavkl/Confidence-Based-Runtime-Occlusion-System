@@ -57,8 +57,9 @@ namespace CBRO::Core::HiZ
 			ComPtr<ID3D11Texture2D>           ringFar;
 			ComPtr<ID3D11Texture2D>           refFar;
 			ComPtr<ID3D11Texture2D>           refNear;
+			ComPtr<ID3D11Texture2D>           ringDrawn;
 			ComPtr<ID3D11Buffer>              out;
-			ComPtr<ID3D11UnorderedAccessView> uavs[kUAVs];  // ring near, ring far, ref far, ref near, out
+			ComPtr<ID3D11UnorderedAccessView> uavs[kUAVs];  // ring near, ring far, ref far, ref near, out, ring drawn
 			std::array<Slot, kSlots>          slots;
 			Build::Layout                     layout;
 			Build::OutputLayout               output;
@@ -216,6 +217,7 @@ namespace CBRO::Core::HiZ
 			a_snapshot.slot = -1;
 			a_snapshot.texels = nullptr;
 			a_snapshot.nearest = nullptr;
+			a_snapshot.drawn = nullptr;
 		}
 
 		bool CreateTexture(ID3D11Device* a_device, std::uint32_t a_slices, ComPtr<ID3D11Texture2D>& a_texture, ComPtr<ID3D11UnorderedAccessView>& a_uav, std::string_view a_what)
@@ -267,6 +269,7 @@ namespace CBRO::Core::HiZ
 			g_gpu.ringFar.Reset();
 			g_gpu.refFar.Reset();
 			g_gpu.refNear.Reset();
+			g_gpu.ringDrawn.Reset();
 			g_gpu.out.Reset();
 			for (auto& uav : g_gpu.uavs) {
 				uav.Reset();
@@ -297,7 +300,8 @@ namespace CBRO::Core::HiZ
 			if (!CreateTexture(a_device, kRingSize, g_gpu.ringNear, g_gpu.uavs[0], "ring near") ||
 				!CreateTexture(a_device, kRingSize, g_gpu.ringFar, g_gpu.uavs[1], "ring far") ||
 				!CreateTexture(a_device, 1, g_gpu.refFar, g_gpu.uavs[2], "reference far") ||
-				!CreateTexture(a_device, 1, g_gpu.refNear, g_gpu.uavs[3], "reference near")) {
+				!CreateTexture(a_device, 1, g_gpu.refNear, g_gpu.uavs[3], "reference near") ||
+				!CreateTexture(a_device, kRingSize, g_gpu.ringDrawn, g_gpu.uavs[5], "ring drawn")) {
 				return false;
 			}
 
@@ -339,7 +343,7 @@ namespace CBRO::Core::HiZ
 			}
 
 			logger::info(
-				"hi-z: depth {}x{} -> hi-z {}x{} (factor {}; nearest and farthest per texel), {} levels and the {}x{} block map built on the GPU, read from a private copy; readback {} KB x {} slots",
+				"hi-z: depth {}x{} -> hi-z {}x{} (factor {}; nearest and farthest per texel, and level 0's farthest drawn), {} levels and the {}x{} block map built on the GPU, read from a private copy; readback {} KB x {} slots",
 				srcWidth, srcHeight, g_gpu.dstWidth, g_gpu.dstHeight, factor, g_gpu.layout.levels, g_blocksW, g_blocksH, g_gpu.output.bytes / 1024, kSlots);
 			return true;
 		}
@@ -496,6 +500,9 @@ namespace CBRO::Core::HiZ
 				scan.farthest = std::max(scan.farthest, row[x]);
 				if (row[x] >= 0.99999f) {
 					scan.farPlaneNearest = std::min(scan.farPlaneNearest, nearDepth);  // (< 1: something is drawn in that texel too)
+					if (drawn) {
+						scan.farPlaneDrawn = std::max(scan.farPlaneDrawn, drawn[y * w + x]);
+					}
 				}
 			}
 		}
@@ -548,7 +555,7 @@ namespace CBRO::Core::HiZ
 		return true;
 	}
 
-	bool Snapshot::NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept
+	bool Snapshot::NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays, bool a_drawnOnly) const noexcept
 	{
 		auto          span = std::max(a_x1 - a_x0, a_y1 - a_y0);
 		std::uint32_t level = 0;
@@ -556,10 +563,10 @@ namespace CBRO::Core::HiZ
 			span *= 0.5f;
 			++level;
 		}
-		return NoSurfaceBetweenAt(level, a_x0, a_y0, a_x1, a_y1, a_near, a_far, a_refine, a_rays);
+		return NoSurfaceBetweenAt(level, a_x0, a_y0, a_x1, a_y1, a_near, a_far, a_refine, a_rays, a_drawnOnly && drawn);
 	}
 
-	bool Snapshot::NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept
+	bool Snapshot::NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays, bool a_drawnOnly) const noexcept
 	{
 		const float size = static_cast<float>(1u << a_level);
 		const float scale = 1.0f / size;
@@ -572,10 +579,11 @@ namespace CBRO::Core::HiZ
 
 		const auto* farBase = texels + offset[a_level];
 		const auto* nearBase = nearest + offset[a_level];
+		const auto* frontBase = a_drawnOnly && a_level == 0 ? drawn : farBase;  // (the coarse levels keep the farthest depth)
 		for (auto y = y0; y <= y1; ++y) {
 			for (auto x = x0; x <= x1; ++x) {
 				const auto i = y * w + x;
-				if (farBase[i] < a_near || nearBase[i] > a_far) {
+				if (frontBase[i] < a_near || nearBase[i] > a_far) {
 					continue;  // every surface here is in front of the range, or behind it
 				}
 				const float tx0 = static_cast<float>(x) * size;
@@ -591,7 +599,7 @@ namespace CBRO::Core::HiZ
 				if (a_refine == 0 || a_level == 0) {
 					return false;
 				}
-				if (!NoSurfaceBetweenAt(a_level - 1, sx0, sy0, sx1, sy1, a_near, a_far, a_refine - 1, a_rays)) {
+				if (!NoSurfaceBetweenAt(a_level - 1, sx0, sy0, sx1, sy1, a_near, a_far, a_refine - 1, a_rays, a_drawnOnly)) {
 					return false;
 				}
 			}
@@ -686,6 +694,7 @@ namespace CBRO::Core::HiZ
 					params.blocksW = g_blocksW;
 					params.nearOffset = g_gpu.output.nearOffset;
 					params.changedOffset = g_gpu.output.changedOffset;
+					params.drawnOffset = g_gpu.output.drawnOffset;
 					for (std::uint32_t level = 0; level < g_gpu.layout.levels; ++level) {
 						params.dims[level][0] = g_gpu.layout.width[level];
 						params.dims[level][1] = g_gpu.layout.height[level];
@@ -818,6 +827,7 @@ namespace CBRO::Core::HiZ
 		snapshot.offset = g_gpu.layout.offset;
 		snapshot.texels = reinterpret_cast<const float*>(newest->mapped);
 		snapshot.nearest = reinterpret_cast<const float*>(newest->mapped + g_gpu.output.nearOffset);
+		snapshot.drawn = reinterpret_cast<const float*>(newest->mapped + g_gpu.output.drawnOffset);
 		snapshot.slot = static_cast<std::int32_t>(newest - g_gpu.slots.data());
 
 		// The change map: the GPU's per-block capture index of the last change, including changes captures that were

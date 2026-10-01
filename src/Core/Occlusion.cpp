@@ -703,7 +703,9 @@ namespace CBRO::Core::Occlusion
 					const float farThreshold = std::min(g_tunables.depthMin + g_tunables.depthRange * (camera.depthA + camera.depthB / beyond), 0.999999f);
 					// (only texels the reach's own rays pass through, as AllNearer just did: v1.55 scanned the whole screen box,
 					// whose corners hold surfaces outside the sphere, and the rule held in 1 of 426 log intervals)
-					if (beyond > 0.0f && snapshot.NoSurfaceBetween(px0, py0, px1, py1, threshold, farThreshold, a_light->refine, &rays)) {
+					// (and at level 0 the farthest *drawn* depth: v1.56 showed the flickering lamps' texel mixing a wall with
+					// a crack into the void, whose farthest depth is the far plane: v1.57's Hi-Z keeps the wall's depth too)
+					if (beyond > 0.0f && snapshot.NoSurfaceBetween(px0, py0, px1, py1, threshold, farThreshold, a_light->refine, &rays, true)) {
 						a_light->emptyReach = true;
 						return Verdict::kHidden;
 					}
@@ -2962,8 +2964,8 @@ namespace CBRO::Core::Occlusion
 				std::string scan;
 				if (sample.scanned) {
 					scan = sample.scan.texels ?
-					           std::format(" | nearest at depth {:.0f}: level-0 texels beyond it {} (far plane {}, first-person {}; nearest surface in the far-plane texels {:.6f}), farthest {:.6f}, first at ({:.0f},{:.0f})",
-								   sample.nearest, sample.scan.texels, sample.scan.farPlane, sample.scan.firstPerson, sample.scan.farPlaneNearest, sample.scan.farthest, sample.scan.x, sample.scan.y) :
+					           std::format(" | nearest at depth {:.0f}: level-0 texels beyond it {} (far plane {}, first-person {}; in the far-plane texels nearest surface {:.6f}, farthest drawn {:.6f}), farthest {:.6f}, first at ({:.0f},{:.0f})",
+								   sample.nearest, sample.scan.texels, sample.scan.farPlane, sample.scan.firstPerson, sample.scan.farPlaneNearest, sample.scan.farPlaneDrawn, sample.scan.farthest, sample.scan.x, sample.scan.y) :
 					           std::format(" | nearest at depth {:.0f}: no level-0 texel beyond it (a coarse texel alone)", sample.nearest);
 				}
 				logger::info(

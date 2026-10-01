@@ -89,6 +89,9 @@ namespace CBRO::Core::HiZ
 		// which stays mapped until this snapshot has been superseded several times over (Poll).
 		const float*                  texels{ nullptr };   // max-reduced buffer depth (the farthest surface per texel)
 		const float*                  nearest{ nullptr };  // min-reduced (the nearest surface per texel; first-person counts as 0)
+		// Level 0 only (v1.57), width[0] x height[0] row by row: the farthest depth pixel where something was drawn (the
+		// far plane, i.e. nothing drawn or the sky, left out; first person counts as 0), merged over the same captures.
+		const float*                  drawn{ nullptr };
 		std::int32_t                  slot{ -1 };          // the readback slot holding the data (HiZ.cpp)
 
 		// Farthest depth over a level-0 texel-space rectangle, using the level where it spans <= 4 texels.
@@ -102,7 +105,9 @@ namespace CBRO::Core::HiZ
 		// texel the farthest surface is nearer than a_near, or the nearest surface is farther than a_far (a sky
 		// texel, cleared to the far plane, always is). Coarse texels that are mixed are refined like AllNearer.
 		// With a_rays, texels the sphere's rays can't reach are skipped (as AllNearer): a surface seen there lies outside it.
-		[[nodiscard]] bool NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays = nullptr) const noexcept;
+		// With a_drawnOnly (lamp tests), a level-0 texel's "in front" side reads `drawn`: pixels where nothing was drawn
+		// hold no surface, so a wall with a crack into the void still counts as wholly in front.
+		[[nodiscard]] bool NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays = nullptr, bool a_drawnOnly = false) const noexcept;
 
 		// True if every texel covering the rectangle is nearer than a_threshold (buffer depth). Starts
 		// at the level where the rectangle spans <= 4 texels; a texel that fails there is re-checked at
@@ -118,6 +123,7 @@ namespace CBRO::Core::HiZ
 			std::uint32_t farPlane{ 0 };     // ... of them at the far plane: cleared (no surface) or first-person pixels
 			std::uint32_t firstPerson{ 0 };  // ... of those holding first-person geometry (nearest 0)
 			float         farPlaneNearest{ 1.0f };  // the nearest surface in those far-plane texels (below 1: a texel mixing nothing drawn with surfaces)
+			float         farPlaneDrawn{ 0.0f };    // ... and the farthest drawn one (`drawn`; 0: nothing drawn there at all)
 			float         farthest{ 0.0f };
 			float         x{ -1.0f };      // the first one found (level-0 texel coordinates)
 			float         y{ -1.0f };
@@ -127,7 +133,7 @@ namespace CBRO::Core::HiZ
 	private:
 		[[nodiscard]] bool AllNearerAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept;
 		[[nodiscard]] bool AllFartherAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine) const noexcept;
-		[[nodiscard]] bool NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept;
+		[[nodiscard]] bool NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays, bool a_drawnOnly) const noexcept;
 	};
 
 	// Creates GPU resources on first use. Returns false if the device path is unusable.
