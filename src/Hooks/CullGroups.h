@@ -2,8 +2,11 @@
 
 // Detours on the engine's culling-group entry points (OG 1.10.163, verified in Phase 0 runs 2-3):
 //   Group::Add(group, obj, bound, flags)             id 1175493 - DrawWorld's top-level adds (scene walk, previs list)
-//   ChildPush(group, obj, bound, flag, b5, b6, ctx)  id 357475  - a block job adding ONE object (a child of a
-//                                                                 visible node) to a group
+//   ChildPush(group, obj, bound, flag, b5, b6, ctx)  id 357475  - BSCullingGroup::AddP1: the culling-group pass
+//                                                                 adding ONE object (a child of a visible node)
+//                                                                 to a group
+// The pass itself (1147875) runs inline on the calling thread with bCullingBatch 0 (the London default); BSJobs
+// exist only on the batched path (FO4-ENGINE-NOTES §3). 626862 registers a processed group into an accumulator.
 //   Block::Add(block, obj, bound, startIndex)        id 1143206 - every entry into a cull block; only ever called
 //                                                                 from the two above
 // and the main camera's registration: BSShaderAccumulator::RegisterObject (vtable id 357329, slot 45,
@@ -91,7 +94,7 @@ namespace CBRO::Hooks::CullGroups
 	// Consulted for main-pass fresh adds while DrawWorld culls. Return a replacement bound to make the engine
 	// reject the entry in every view of its group (and with it the object's subtree), or nullptr to add it
 	// unchanged. The entry is still added, so the block's group markers and bookkeeping stay intact; the
-	// block jobs' frustum tests (fed from the copied bound) reject it, and no view registers it. Honored for
+	// culling-group pass's frustum tests (fed from the copied bound) reject it, and no view registers it. Honored for
 	// main-only groups, and for group 0 when neither the main camera nor the sun's shadow needs the object;
 	// ignored for unknown groups (a filter records a main-view drop instead, see MainViewFilter). May run on
 	// any thread; must be lock-free. The returned bound must outlive the call.
@@ -149,6 +152,15 @@ namespace CBRO::Hooks::CullGroups
 	void SetDroppedAccumulator(const void* a_accumulator) noexcept;
 	[[nodiscard]] std::uint64_t TakeDroppedRegistrations() noexcept;  // registrations dropped there since the last call (main thread)
 	[[nodiscard]] std::uint64_t ReadDroppedRegistrations() noexcept;  // ... running total since load
+	// Registrations offered to one accumulator, dropped ones included (diagnostic: a spot light's shadow map during its
+	// cull, Core/ShadowLights). Null = none. Set on the main thread.
+	void SetCountedAccumulator(const void* a_accumulator) noexcept;
+	[[nodiscard]] std::uint64_t ReadCountedRegistrations() noexcept;  // running total since load
+	// A shadow map's accumulator whose registrations a filter judges one by one (Core/ShadowLights: a kept spot light's
+	// casters that can't shadow a visible pixel). The filter returns true to leave the geometry out; it runs on the
+	// registering thread (the lamp loop's, inline). Null = none. Set on the main thread around the light's cull.
+	using CasterFilter = bool (*)(const RE::NiAVObject* a_object);
+	void SetFilteredAccumulator(const void* a_accumulator, CasterFilter a_filter) noexcept;
 
 	// Installs the detours and the accumulator hook (idempotent). Returns false unless Block::Add and the
 	// main-view registration are both hooked: without them nothing can be culled without also cutting
@@ -156,7 +168,7 @@ namespace CBRO::Hooks::CullGroups
 	bool Install();
 
 	// True while the main-view filter may drop registrations: the render stage that runs DrawWorld's cull
-	// (the main groups and their jobs finish inside it). Main thread.
+	// (the main groups' culling-group passes finish inside it). Main thread.
 	void SetMainCullActive(bool a_active) noexcept;
 
 	// Takes every hook out (the engine then runs its own code, as without CBRO) or puts them back. Call on

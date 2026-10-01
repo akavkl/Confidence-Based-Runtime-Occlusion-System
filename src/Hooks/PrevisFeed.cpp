@@ -510,6 +510,36 @@ namespace CBRO::Hooks::PrevisFeed
 		}
 	}
 
+	bool BeginLampWindow() noexcept
+	{
+		// Only in a CBRO frame, and only over the engine's own state: an existing suspension is left as found.
+		if (!g_window.load(std::memory_order_relaxed) || ReadSuspendedByte()) {
+			return false;
+		}
+		WriteSuspended(true);
+		++g_windowCounts.lamp;
+		return true;
+	}
+
+	void EndLampWindow(bool a_opened) noexcept
+	{
+		if (a_opened) {
+			WriteSuspended(false);
+		}
+	}
+
+	bool ActiveNow() noexcept
+	{
+		if (!g_enabled || !g_ini || !g_suspended) {
+			return false;
+		}
+		__try {
+			return At<std::uint8_t>(g_enabled) != 0 && At<std::uint8_t>(g_ini) != 0 && At<std::uint8_t>(g_suspended) == 0;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
 	WindowCounts TakeWindowCounts() noexcept
 	{
 		const auto counts = g_windowCounts;

@@ -66,11 +66,21 @@ namespace CBRO::Hooks::PrevisFeed
 	void HoldNow() noexcept;                         // at the cull begin, when the pre-cull wrapper didn't open it (a switch frame): opens it and runs the engine's pre-cull helper
 	void ReleaseWindow() noexcept;                   // at the cull stage's end: closes it (the engine's own byte restored)
 	void ClearSuspension() noexcept;                 // a suspension CBRO set with SetSuspended outside the windows ends (now, or at the open window's release)
+	// The lamp window (v1.52): a spot light's group-0 cull in the deferred-lights stage (BSShadowFrustumLight slot 9,
+	// Core/ShadowLights), previs suspended around it in a CBRO frame. With previs active the culling-group pass (1147875)
+	// skips the frustum test of every block whose +0x3A6F byte is clear, and group 0's blocks have it clear (DrawWorld's
+	// cull filed them inside the cull window); the register loop (962984) then files whatever the last pass left in the
+	// result bytes (the last sun cascade's, or the main view's), not the spot's frustum (FO4-ENGINE-NOTES 6.2a). True =
+	// previs was suspended now: pass it to EndLampWindow. Main thread.
+	[[nodiscard]] bool BeginLampWindow() noexcept;
+	void EndLampWindow(bool a_opened) noexcept;
+	[[nodiscard]] bool ActiveNow() noexcept;  // what the engine's IsActive() returns now (enabled, INI, not suspended)
 	struct WindowCounts
 	{
 		std::uint32_t preCull{ 0 };    // cull windows opened by the pre-cull wrapper
 		std::uint32_t cullBegin{ 0 };  // ... opened at the cull begin instead (switch frames, or no pre-cull wrapper)
 		std::uint32_t cascade{ 0 };    // cascade windows
+		std::uint32_t lamp{ 0 };       // lamp windows (spot-light group-0 culls)
 	};
 	[[nodiscard]] WindowCounts TakeWindowCounts() noexcept;
 	// For CullGroups' sun-path check: the cascade site calls CBRO's wrapper, which chains to this previous target.

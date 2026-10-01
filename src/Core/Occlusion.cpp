@@ -143,6 +143,11 @@ namespace CBRO::Core::Occlusion
 			kCyclesEvaluate,      // ... of which: full view evaluations (sphere tests, mesh shapes, lights)
 			kCyclesShape,         // ... of which: the mesh-shape tests inside those evaluations
 			kCyclesSun,           // ... of which: sun-shadow evaluations
+			kCyclesLookup,        // ... of which: last frame's record looked up (the thread's stream, or the worker's map)
+			kCyclesReuse,         // ... of which: whether a record still holds (epoch, bound, depth blocks, re-check)
+			kCyclesRecheck,       // ... of kCyclesReuse: hidden verdicts' evidence re-checked against the current depth
+			kCyclesRecord,        // ... of which: this frame's record written (the stream, the table's streak backup)
+			kCyclesNodeScan,      // ... of which: cell-node pruning's scans of a node's entries
 			kCounterCount
 		};
 
@@ -968,15 +973,16 @@ namespace CBRO::Core::Occlusion
 			return Verdict::kHidden;
 		}
 
-		// How NiTransform applies its rotation: 0 = rows dot vector (R * v), 1 = columns (R^T * v). Learned
-		// from meshes whose model bound, moved by their world transform, lands on their world bound; settled
-		// only after kRotationVotes agreeing meshes without dissent (dissent restarts the count, and
-		// repeated dissent turns shapes off: the reading can't be trusted).
-		constexpr std::uint32_t    kRotationVotes = 32;
-		constexpr std::uint32_t    kRotationConflicts = 3;
-		std::atomic<int>           g_rotationReading{ -1 };  // -1 learning, 0 rows, 1 columns, 2 off
-		std::atomic<std::uint32_t> g_rotationVotes[2]{};
-		std::atomic<std::uint32_t> g_rotationConflicts{ 0 };
+		// How NiTransform applies its rotation to a point: columns, R^T * v. Read in the engine (2026-10-01): a BSGeometry's
+		// world bound is NiBound::Update(world bound, model bound, world transform) (0x141BB19A0, called by
+		// BSGeometry::UpdateWorldBound 0x141BB0F40), which computes x' = sum_j c_j * R[j][0] (each component from a column of
+		// the stored rows), the skinned path likewise. Up to v1.52 the reading was learned at run time from meshes whose
+		// bound fits one reading only; the v1.52 interior run (precombined chunks with identity rotations) produced no such
+		// mesh in the whole session ("votes 0/0"), so mesh shapes never ran there (~70-95 meshes a frame left to the
+		// sphere). An object whose world bound doesn't land where R^T * c puts it is still left to the sphere; one whose
+		// bound would fit the rows reading alone is counted (a layout misread would show there).
+		std::atomic<std::uint64_t> g_rotationMisfits{ 0 };   // bound off its transform (since load)
+		std::atomic<std::uint64_t> g_rotationRowsOnly{ 0 };  // ... of them, fitting R * v instead (should stay 0)
 
 		bool WorldRotation(const RE::NiAVObject* a_object, const RE::NiBound& a_model, float a_rotate[3][3]) noexcept
 		{
@@ -991,43 +997,27 @@ namespace CBRO::Core::Occlusion
 			const float c[3]{ a_model.center.x * scale, a_model.center.y * scale, a_model.center.z * scale };
 			const float target[3]{ world.center.x - transform.translate.x, world.center.y - transform.translate.y, world.center.z - transform.translate.z };
 			const float tolerance = world.fRadius * 0.01f + 1.0f;
-			const auto  fits = [&](int a_reading) {
+			const auto  fits = [&](bool a_columns) {
 				float error = 0.0f;
 				for (int i = 0; i < 3; ++i) {
 					float v = 0.0f;
 					for (int j = 0; j < 3; ++j) {
-						v += (a_reading == 0 ? transform.rotate.entry[i].pt[j] : transform.rotate.entry[j].pt[i]) * c[j];
+						v += (a_columns ? transform.rotate.entry[j].pt[i] : transform.rotate.entry[i].pt[j]) * c[j];
 					}
 					error = std::max(error, std::abs(v - target[i]));
 				}
 				return error <= tolerance;
 			};
-			const auto reading = g_rotationReading.load(std::memory_order_acquire);
-			if (reading < 0) {
-				const bool rows = fits(0);
-				const bool columns = fits(1);
-				if (rows != columns) {  // both fit for a centered bound or a symmetric rotation: no evidence
-					const int vote = rows ? 0 : 1;
-					if (g_rotationVotes[1 - vote].load(std::memory_order_relaxed) > 0) {
-						g_rotationVotes[0].store(0, std::memory_order_relaxed);
-						g_rotationVotes[1].store(0, std::memory_order_relaxed);
-						if (g_rotationConflicts.fetch_add(1, std::memory_order_relaxed) + 1 >= kRotationConflicts) {
-							int expected = -1;
-							g_rotationReading.compare_exchange_strong(expected, 2, std::memory_order_acq_rel);
-						}
-					} else if (g_rotationVotes[vote].fetch_add(1, std::memory_order_relaxed) + 1 >= kRotationVotes) {
-						int expected = -1;
-						g_rotationReading.compare_exchange_strong(expected, vote, std::memory_order_acq_rel);
-					}
+			if (!fits(true)) {
+				g_rotationMisfits.fetch_add(1, std::memory_order_relaxed);
+				if (fits(false)) {
+					g_rotationRowsOnly.fetch_add(1, std::memory_order_relaxed);
 				}
-				return false;  // no shapes until the reading is settled
-			}
-			if (reading > 1 || !fits(reading)) {
-				return false;  // shapes off, or this object's bound doesn't follow its transform
+				return false;
 			}
 			for (int i = 0; i < 3; ++i) {
 				for (int j = 0; j < 3; ++j) {
-					a_rotate[i][j] = reading == 0 ? transform.rotate.entry[i].pt[j] : transform.rotate.entry[j].pt[i];
+					a_rotate[i][j] = transform.rotate.entry[j].pt[i];
 				}
 			}
 			return true;
@@ -1625,6 +1615,14 @@ namespace CBRO::Core::Occlusion
 			return a_context.clock % kTimingStride == 0;
 		}
 
+		// The split of the per-object time into its parts (record lookups, reuse checks, record writes) is timed on frames
+		// of its own, halfway between the whole-test frames, so the parts' extra clock reads never inflate the whole
+		// (v1.52 timed both on the same frames: most of its "decisions and counters" rest was those reads).
+		bool BucketTimed(const FrameContext& a_context) noexcept
+		{
+			return a_context.clock % kTimingStride == kTimingStride / 2;
+		}
+
 		// The decision made at Group::Add for the object now being added (same thread): the Block::Add
 		// that follows inside the engine's Group::Add reuses it instead of testing again.
 		struct TopDecision
@@ -2139,9 +2137,17 @@ namespace CBRO::Core::Occlusion
 				if (a_old.readback == a_context.readback || !BlocksChanged(a_context, a_old.blocks, a_old.readback)) {
 					return Reuse::kYes;
 				}
-				if (a_context.snapshot->AllNearer(a_old.rect[0], a_old.rect[1], a_old.rect[2], a_old.rect[3], a_old.threshold, kRecheckRefine)) {
-					Bump(kCacheRecheck);
-					return Reuse::kRechecked;
+				{
+					const bool timed = BucketTimed(a_context);
+					const auto start = timed ? __rdtsc() : 0;
+					const bool held = a_context.snapshot->AllNearer(a_old.rect[0], a_old.rect[1], a_old.rect[2], a_old.rect[3], a_old.threshold, kRecheckRefine);
+					if (timed) {
+						Bump(kCyclesRecheck, (__rdtsc() - start) * kTimingStride);
+					}
+					if (held) {
+						Bump(kCacheRecheck);
+						return Reuse::kRechecked;
+					}
 				}
 				Bump(kCacheDepth);
 				return Reuse::kNo;
@@ -2219,9 +2225,15 @@ namespace CBRO::Core::Occlusion
 		{
 			const bool    reusable = a_context.cacheEnabled && a_context.clock != g_dumpClock.load(std::memory_order_relaxed);
 			const bool    timed = Timed(a_context);
+			const bool    parts = BucketTimed(a_context);
 			bool          reused = false;
 			if (old && reusable) {
-				if (const auto reuse = ViewValid(a_context, *old, *a_add.bound); reuse != Reuse::kNo) {
+				const auto validStart = parts ? __rdtsc() : 0;
+				const auto reuse = ViewValid(a_context, *old, *a_add.bound);
+				if (parts) {
+					Bump(kCyclesReuse, (__rdtsc() - validStart) * kTimingStride);
+				}
+				if (reuse != Reuse::kNo) {
 					ReuseView(*old, a_out);
 					if (reuse == Reuse::kRechecked) {
 						a_out.readback = a_context.readback;  // the evidence was verified against this depth
@@ -2229,8 +2241,12 @@ namespace CBRO::Core::Occlusion
 					reused = true;
 					// (the streak backup, kept fresh for a record the stream may lose)
 					if (a_out.outcome == Outcome::kHidden && RefreshTurn(a_add.object, a_context.clock)) {
+						const auto backupStart = parts ? __rdtsc() : 0;
 						if (const auto entry = FindEntry(reinterpret_cast<std::uintptr_t>(a_add.object))) {
 							StoreStreak(*entry, a_context.clock, a_out.streak);
+						}
+						if (parts) {
+							Bump(kCyclesRecord, (__rdtsc() - backupStart) * kTimingStride);
 						}
 					}
 				}
@@ -2268,8 +2284,18 @@ namespace CBRO::Core::Occlusion
 		// The synchronous path: last frame's record comes from the thread's stream, and the new one goes into it.
 		void Judge(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
 		{
-			JudgeRecord(a_context, a_add, a_stream.Find(a_add.object), a_wantSun, a_out);
+			const bool timed = BucketTimed(a_context);
+			const auto lookupStart = timed ? __rdtsc() : 0;
+			const auto old = a_stream.Find(a_add.object);
+			if (timed) {
+				Bump(kCyclesLookup, (__rdtsc() - lookupStart) * kTimingStride);
+			}
+			JudgeRecord(a_context, a_add, old, a_wantSun, a_out);
+			const auto recordStart = timed ? __rdtsc() : 0;
 			a_stream.Push(a_out);
+			if (timed) {
+				Bump(kCyclesRecord, (__rdtsc() - recordStart) * kTimingStride);
+			}
 		}
 
 		// With asynchronous verdicts (Core/Async): the entry is recorded for the worker, and its outcome comes from
@@ -2281,14 +2307,22 @@ namespace CBRO::Core::Occlusion
 				Judge(a_context, a_stream, a_add, a_wantSun, a_out);
 				return;
 			}
+			const bool timed = BucketTimed(a_context);
+			const auto start = timed ? __rdtsc() : 0;
 			Async::Record(a_add.object, *a_add.bound, a_add.kind);
 			a_out = Record{};
 			a_out.object = a_add.object;
 			a_out.outcome = Outcome::kKept;
 			if (!a_context.asyncValid) {
+				if (timed) {
+					Bump(kCyclesLookup, (__rdtsc() - start) * kTimingStride);
+				}
 				return;
 			}
 			const auto record = Async::Find(a_add.object);
+			if (timed) {
+				Bump(kCyclesLookup, (__rdtsc() - start) * kTimingStride);
+			}
 			if (!record || record->bound[0] != a_add.bound->center.x || record->bound[1] != a_add.bound->center.y ||
 				record->bound[2] != a_add.bound->center.z || record->bound[3] != a_add.bound->fRadius) {
 				Bump(record ? kCacheBound : kCacheNew);
@@ -2720,7 +2754,9 @@ namespace CBRO::Core::Occlusion
 				SampleNode(a_node, a_index, contents, outside, entries, unionBound.fRadius);
 			}
 			if (timed) {
-				Bump(kCycles, (__rdtsc() - start) * kTimingStride);
+				const auto cycles = (__rdtsc() - start) * kTimingStride;
+				Bump(kCycles, cycles);
+				Bump(kCyclesNodeScan, cycles);
 			}
 			return skip;
 		}
@@ -3403,9 +3439,14 @@ namespace CBRO::Core::Occlusion
 		const auto   evaluate = part(kCyclesEvaluate);
 		const auto   shape = part(kCyclesShape);
 		const auto   sun = part(kCyclesSun);
+		const auto   lookup = part(kCyclesLookup);
+		const auto   reuse = part(kCyclesReuse);
+		const auto   recheck = part(kCyclesRecheck);
+		const auto   record = part(kCyclesRecord);
+		const auto   nodeScan = part(kCyclesNodeScan);
 		const double perMs = g_calibration.cyclesPerMs;
 		const auto   ms = [perMs](std::uint64_t a_cycles) { return perMs > 0.0 ? static_cast<double>(a_cycles) / perMs : 0.0; };
-		return { ms(delta), ms(mainDelta), ms(evaluate), ms(shape), ms(sun) };
+		return { ms(delta), ms(mainDelta), ms(evaluate), ms(shape), ms(sun), ms(lookup), ms(reuse), ms(recheck), ms(record), ms(nodeScan) };
 	}
 
 	float RejectedPerFrame() noexcept
@@ -3433,7 +3474,8 @@ namespace CBRO::Core::Occlusion
 		const double frames = std::max(1u, a_frames);
 		std::array<double, kCounterCount> delta{};
 		for (std::size_t i = 0; i < kCounterCount; ++i) {
-			if (i == kCycles || i == kCyclesEvaluate || i == kCyclesShape || i == kCyclesSun) {
+			if (i == kCycles || i == kCyclesEvaluate || i == kCyclesShape || i == kCyclesSun || i == kCyclesLookup || i == kCyclesReuse || i == kCyclesRecheck ||
+				i == kCyclesRecord || i == kCyclesNodeScan) {
 				continue;  // reported by TakeTestMilliseconds
 			}
 			const auto total = Total(static_cast<Counter>(i));
@@ -3488,12 +3530,10 @@ namespace CBRO::Core::Occlusion
 		g_spreadOther.Clear();
 		g_spreadRejected.Clear();
 		g_spreadConfirming.Clear();
-		const auto reading = g_rotationReading.load();
 		logger::info(
-			"occlusion by mesh shape per frame: tested {:.0f} (sphere said visible/near/edge) | settled hidden {:.0f} | out of view {:.0f} | cells tested {:.0f} | left to the sphere: moved {:.1f}, swaying {:.1f}, transform unconfirmed {:.1f} | rotation reading {} (votes {}/{}, conflicts {})",
+			"occlusion by mesh shape per frame: tested {:.0f} (sphere said visible/near/edge) | settled hidden {:.0f} | out of view {:.0f} | cells tested {:.0f} | left to the sphere: moved {:.1f}, swaying {:.1f}, transform unconfirmed {:.1f} | rotation: columns (the engine's) | bound off its transform since load {} (fitting rows instead {})",
 			per(kShapeTests), per(kShapeHidden), per(kShapeOutside), per(kShapeCells), per(kShapeMoving), per(kShapeAnimated), per(kShapeNoTransform),
-			reading == 0 ? "rows"sv : reading == 1 ? "columns"sv : reading == 2 ? "CONFLICTING (shapes off)"sv : "not settled yet"sv,
-			g_rotationVotes[0].load(), g_rotationVotes[1].load(), g_rotationConflicts.load());
+			g_rotationMisfits.load(std::memory_order_relaxed), g_rotationRowsOnly.load(std::memory_order_relaxed));
 		MeshProxy::LogStats(a_frames);
 		logger::info(
 			"occlusion frames: culling {:.0f} / blocked {:.0f} (stale depth, camera jump, or inactive) | history {} objects",

@@ -13,7 +13,9 @@
 // reach inside its shadow frustum, the pyramid the engine itself tests the light's visibility by; the whole reach when
 // the frustum's corners lie over 60 degrees off its axis) is hidden behind the main view's depth for confirmFrames
 // frames, no caster is filed and the shadow map draws nothing.
-// Previs does the same job by marking such lights occluded (FO4-ENGINE-NOTES 6.2a/6.7).
+// Previs does the same job by marking such lights occluded (FO4-ENGINE-NOTES 6.2a/6.7). Since v1.53 an emptied spot
+// light's group pass is skipped outright (its output was dropped anyway), and a kept spot light's casters get the
+// per-caster test below as they register into its shadow map (bSpotCasterTrim).
 //
 // For every other light, its traversal's per-object test (Process(object)) also drops casters that can't
 // shadow a visible pixel: the light and every visible point lie in the view cone pushed out until it holds

@@ -96,6 +96,7 @@ namespace CBRO::Core::HiZ
 		std::uint32_t              g_blocksH{ 0 };
 		std::uint32_t              g_captureIndex{ 0 };
 		std::uint32_t              g_blocksChanged{ 0 };  // since the last log
+		BlockChangeKinds           g_blockChangeKinds{};  // ... by what the newest capture holds there (v1.52 diagnostic)
 		bool                       g_refValid{ false };   // the GPU references hold linear depths of the current projection
 		float                      g_refDepthA{ 0.0f };
 		float                      g_refDepthB{ 0.0f };
@@ -814,10 +815,27 @@ namespace CBRO::Core::HiZ
 		// The change map: the GPU's per-block capture index of the last change, including changes captures that were
 		// never published made (the map only ever moves forward).
 		const auto* changed = reinterpret_cast<const std::uint32_t*>(newest->mapped + g_gpu.output.changedOffset);
+		// (what the newest capture holds at each changed block: level 3 has one texel per block)
+		const bool classify = snapshot.levels > 3 && snapshot.width[3] == g_blocksW && snapshot.height[3] == g_blocksH;
 		for (std::size_t i = 0; i < g_blockChangedAt.size(); ++i) {
 			if (changed[i] != g_blockChangedAt[i]) {
 				g_blockChangedAt[i] = changed[i];
 				++g_blocksChanged;
+				if (classify) {
+					const auto  x = static_cast<std::uint32_t>(i % g_blocksW);
+					const auto  y = static_cast<std::uint32_t>(i / g_blocksW);
+					const auto  at = snapshot.offset[3] + y * snapshot.width[3] + x;
+					const float farthest = snapshot.texels[at];
+					const float nearest = snapshot.nearest[at];
+					if (nearest <= 0.0f) {
+						++g_blockChangeKinds.firstPerson;  // (first-person pixels count as nearest 0, farthest 1)
+					} else if (farthest >= 0.99999f) {
+						++g_blockChangeKinds.farPlane;  // (sky: cleared to the far plane)
+					}
+					if (y * 3 >= g_blocksH * 2) {
+						++g_blockChangeKinds.lowerThird;
+					}
+				}
 			}
 		}
 
@@ -838,6 +856,11 @@ namespace CBRO::Core::HiZ
 	std::uint32_t TakeBlocksChanged() noexcept
 	{
 		return std::exchange(g_blocksChanged, 0u);
+	}
+
+	BlockChangeKinds TakeBlockChangeKinds() noexcept
+	{
+		return std::exchange(g_blockChangeKinds, BlockChangeKinds{});
 	}
 
 	const Snapshot* Latest() noexcept

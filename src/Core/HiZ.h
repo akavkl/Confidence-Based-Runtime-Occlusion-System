@@ -152,4 +152,12 @@ namespace CBRO::Core::HiZ
 	};
 	[[nodiscard]] BlockChanges Blocks() noexcept;
 	[[nodiscard]] std::uint32_t TakeBlocksChanged() noexcept;  // blocks marked changed since the last call (for the log)
+	// Of those, what the newest capture holds at the block (diagnostic: where a still view's changes come from).
+	struct BlockChangeKinds
+	{
+		std::uint32_t firstPerson{ 0 };  // first-person pixels in the block (nearest 0)
+		std::uint32_t farPlane{ 0 };     // ... else the far plane (sky) in the block
+		std::uint32_t lowerThird{ 0 };   // blocks in the lower third of the view (any kind)
+	};
+	[[nodiscard]] BlockChangeKinds TakeBlockChangeKinds() noexcept;
 }

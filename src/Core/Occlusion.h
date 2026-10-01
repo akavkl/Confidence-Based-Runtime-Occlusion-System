@@ -182,6 +182,12 @@ namespace CBRO::Core::Occlusion
 		double evaluate{ 0.0 };  // of `all`: full view evaluations (sphere tests, mesh shapes, lights), all threads
 		double shape{ 0.0 };     // of `evaluate`: the mesh-shape tests
 		double sun{ 0.0 };       // of `all`: sun-shadow evaluations
+		// The rest of `all` (v1.52), all threads:
+		double lookup{ 0.0 };    // last frame's record looked up (the thread's stream, or the worker's map)
+		double reuse{ 0.0 };     // whether a record still holds (epoch, bound, depth blocks, re-check)
+		double recheck{ 0.0 };   // of `reuse`: hidden verdicts' evidence re-checked against the current depth
+		double record{ 0.0 };    // this frame's record written (the stream, the table's streak backup)
+		double nodeScan{ 0.0 };  // cell-node pruning's scans of a node's entries
 	};
 	[[nodiscard]] TestTime TakeTestMilliseconds() noexcept;
 

@@ -402,9 +402,9 @@ namespace CBRO::Core::Feed
 		const auto windows = Hooks::PrevisFeed::TakeWindowCounts();
 		const auto gates = Hooks::PrevisFeed::ReadGates();
 		logger::info(
-			"previs feed paths this interval: previs {} | CBRO classic {} (previs suspended inside CBRO's windows {}, already inactive {}, legacy switch {}) | CBRO feed {} | windows: cull {} (opened at the cull begin {}), cascade {}, switch frames {} || gates: A non-zero {} frames, B non-zero {}, interior/override {}, unreadable {} | now: enabled {} ini {} suspended {} A {} B {} exterior {} || feed sites: main previous {} / CBRO {}, sun previous {} / CBRO {}",
+			"previs feed paths this interval: previs {} | CBRO classic {} (previs suspended inside CBRO's windows {}, already inactive {}, legacy switch {}) | CBRO feed {} | windows: cull {} (opened at the cull begin {}), cascade {}, lamp {}, switch frames {} || gates: A non-zero {} frames, B non-zero {}, interior/override {}, unreadable {} | now: enabled {} ini {} suspended {} A {} B {} exterior {} || feed sites: main previous {} / CBRO {}, sun previous {} / CBRO {}",
 			g_stats.previs, g_stats.classicSuspended + g_stats.classicInactive + g_stats.classicLegacy, g_stats.classicSuspended, g_stats.classicInactive, g_stats.classicLegacy,
-			g_stats.feed, windows.preCull + windows.cullBegin, windows.cullBegin, windows.cascade, g_stats.switchFrames,
+			g_stats.feed, windows.preCull + windows.cullBegin, windows.cullBegin, windows.cascade, windows.lamp, g_stats.switchFrames,
 			g_stats.gateA, g_stats.gateB, g_stats.interior, g_stats.unreadable,
 			gates.enabled, gates.ini, gates.suspended, gates.gateA, gates.gateB, gates.exterior,
 			calls.mainPrevious, calls.mainCBRO, calls.sunPrevious, calls.sunCBRO);

@@ -9,8 +9,9 @@
 //   -> Group::Add (1175493) on DrawWorld's culling groups (1117782, 133326, 1328670, array 459440).
 // A culling group is a non-polymorphic 0x170-byte struct: six frustum planes, then node and geometry
 // block lists. Group::Add sorts the object into a 0x3A70-byte block (SoA bounds, up to 0x200 entries)
-// through Block::Add (1143206). Group::Process (626862) runs the blocks as BSJobs, and job workers
-// add visible children back through 357475 -> Block::Add. Each block keeps group+0x158 at +0x3A60.
+// through Block::Add (1143206). The culling-group pass (1147875) tests the blocks (inline on the calling
+// thread with bCullingBatch 0; BSJobs only on the batched path) and adds visible children back through
+// 357475 -> Block::Add; 626862 registers the result into an accumulator. Each block keeps group+0x158 at +0x3A60.
 // This probe observes Group::Add and Block::Add (detoured in Hooks/CullGroups) to measure who feeds
 // which group, on which threads, and how many main-pass entries CBRO dropped.
 

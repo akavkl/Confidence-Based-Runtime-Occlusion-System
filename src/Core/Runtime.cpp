@@ -7,6 +7,7 @@
 #include "Core/Occlusion.h"
 #include "Core/ShadowLights.h"
 #include "Hooks/CullGroups.h"
+#include "Hooks/Precipitation.h"
 #include "Hooks/PrevisFeed.h"
 #include "Hooks/RenderStages.h"
 #include "Settings.h"
@@ -1429,13 +1430,20 @@ namespace CBRO::Core::Runtime
 			const double cbroFrames = std::max(1u, g_timing.cpu[1].frames + g_timing.cpu[2].frames);  // (the tests only run in CBRO mode)
 			const auto tests = Occlusion::TakeTestMilliseconds();
 			logger::info(
-				"cost per frame (ms): CBRO setup {:.3f} | CBRO depth capture {:.3f} | CBRO object tests per CBRO-mode frame {:.3f} CPU on all threads, {:.3f} of it on the main thread: view evaluations {:.3f} (of which mesh shapes {:.3f}), sun evaluations {:.3f}, cache reuse and bookkeeping {:.3f}",
+				"cost per frame (ms): CBRO setup {:.3f} | CBRO depth capture {:.3f} | CBRO object tests per CBRO-mode frame {:.3f} CPU on all threads, {:.3f} of it on the main thread: view evaluations {:.3f} (of which mesh shapes {:.3f}), sun evaluations {:.3f}, cache reuse and bookkeeping {:.3f} (record lookups {:.3f}, reuse checks {:.3f} with depth re-checks {:.3f}, record writes {:.3f}, cell-node scans {:.3f}, decisions and counters {:.3f})",
 				QpcMs(g_timing.setupTicks) / cullFrames, QpcMs(g_timing.captureTicks) / prepassFrames,
 				tests.all / cbroFrames, tests.mainThread / cbroFrames,
-				tests.evaluate / cbroFrames, tests.shape / cbroFrames, tests.sun / cbroFrames, std::max(0.0, tests.all - tests.evaluate - tests.sun) / cbroFrames);
-			logger::info(
-				"verdict cache this interval: camera epochs {} | sun epochs {} | hi-z blocks changed {:.1f} per readback",
-				g_epochs.viewChanges, g_epochs.sunChanges, static_cast<double>(HiZ::TakeBlocksChanged()) / std::max(1.0, static_cast<double>(g_timing.prepassFrames)));
+				tests.evaluate / cbroFrames, tests.shape / cbroFrames, tests.sun / cbroFrames, std::max(0.0, tests.all - tests.evaluate - tests.sun) / cbroFrames,
+				tests.lookup / cbroFrames, tests.reuse / cbroFrames, tests.recheck / cbroFrames, tests.record / cbroFrames, tests.nodeScan / cbroFrames,
+				std::max(0.0, tests.all - tests.evaluate - tests.sun - tests.lookup - tests.reuse - tests.record - tests.nodeScan) / cbroFrames);
+			{
+				const double readbacks = std::max(1.0, static_cast<double>(g_timing.prepassFrames));
+				const auto   kinds = HiZ::TakeBlockChangeKinds();
+				logger::info(
+					"verdict cache this interval: camera epochs {} | sun epochs {} | hi-z blocks changed {:.1f} per readback (holding first-person pixels {:.1f}, else the far plane {:.1f}; in the lower third of the view {:.1f})",
+					g_epochs.viewChanges, g_epochs.sunChanges, static_cast<double>(HiZ::TakeBlocksChanged()) / readbacks,
+					static_cast<double>(kinds.firstPerson) / readbacks, static_cast<double>(kinds.farPlane) / readbacks, static_cast<double>(kinds.lowerThird) / readbacks);
+			}
 			g_epochs.viewChanges = 0;
 			g_epochs.sunChanges = 0;
 			if (g_footprint.lastValid) {
@@ -1865,6 +1873,14 @@ namespace CBRO::Core::Runtime
 				LogSun();
 				ShadowLights::LogStats(g_state.framesSinceLog);
 				Feed::LogStats(g_state.framesSinceLog);
+				if (const auto rain = Hooks::Precipitation::Take(); rain.runs > 0) {
+					const double frames = std::max(1u, g_state.framesSinceLog);
+					const auto   inactive = rain.runs - rain.previsActive;
+					logger::info(
+						"rain occlusion map per frame: runs {:.2f} (previs active at entry {:.2f}: its list; previs off {:.2f}: the whole world node walked) | CPU per run: {:.3f} ms with previs's list, {:.3f} ms walking the world node",
+						static_cast<double>(rain.runs) / frames, static_cast<double>(rain.previsActive) / frames, static_cast<double>(inactive) / frames,
+						rain.previsActive ? rain.msActive / static_cast<double>(rain.previsActive) : 0.0, inactive ? rain.msInactive / static_cast<double>(inactive) : 0.0);
+				}
 				SetDiff::LogStats();
 				Async::LogStats(g_state.framesSinceLog);
 				LogTiming();
@@ -2050,6 +2066,7 @@ namespace CBRO::Core::Runtime
 		Occlusion::Install();
 		ShadowLights::Install();
 		Hooks::PrevisFeed::Install();  // (pass-through wrappers on the engine's two previs feed sites, plus the accessors)
+		Hooks::Precipitation::Install();  // (diagnostic: the rain occlusion pass's runs and cost)
 		Feed::Install();
 		SetDiff::Install(settings.setDiff);
 		Async::Install(settings.async);

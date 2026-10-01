@@ -211,6 +211,10 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<CellNodeFilter>     g_cellNodeFilter{ nullptr };
 		std::atomic<bool>           g_mainCullActive{ false };
 		std::atomic<const void*>    g_droppedAccumulator{ nullptr };
+		std::atomic<const void*>    g_countedAccumulator{ nullptr };
+		std::atomic<std::uint64_t>  g_countedRegistrations{ 0 };
+		std::atomic<const void*>    g_filteredAccumulator{ nullptr };
+		std::atomic<CasterFilter>   g_casterFilter{ nullptr };
 
 		std::atomic<std::uint64_t> g_forcedCleared{ 0 };
 		std::atomic<std::uint64_t> g_groupAddsConsidered{ 0 };
@@ -374,7 +378,7 @@ namespace CBRO::Hooks::CullGroups
 				// With previs active, Block::Add marks entries of some groups (group+0x16A == 0 ->
 				// block+0x3A6F) force-visible, and the finish loop registers them whatever the frustum
 				// test says. A rejected entry loses that mark, and its result byte is cleared in case no
-				// frustum job runs for the block. An object's own always-draw flag (NiAVObject::flags
+				// frustum test runs for the block. An object's own always-draw flag (NiAVObject::flags
 				// bit 11, the other source of the mark) is respected: that entry stays drawn.
 				auto*      bytes = static_cast<std::uint8_t*>(a_block) + kEntryBytesOffset + before * kEntryBytesStride;
 				const bool alwaysDraw = (ReadAt<std::uint64_t>(a_object, kObjectFlagsOffset) >> 11) & 1;
@@ -448,9 +452,17 @@ namespace CBRO::Hooks::CullGroups
 			if ((counts.registrations.load(std::memory_order_relaxed) & 15) == 0) {  // sampled 1 in 16 per thread (the log scales it back)
 				RecordRegistration(reinterpret_cast<std::uintptr_t>(a_accumulator));
 			}
+			if (a_accumulator && a_accumulator == g_countedAccumulator.load(std::memory_order_relaxed)) {
+				g_countedRegistrations.fetch_add(1, std::memory_order_relaxed);  // (offered: dropped ones too)
+			}
 			if (a_accumulator && a_accumulator == g_droppedAccumulator.load(std::memory_order_relaxed)) {
 				Count(counts.dropped);
 				return true;  // an emptied lamp shadow map (callers ignore the result)
+			}
+			if (a_accumulator && a_accumulator == g_filteredAccumulator.load(std::memory_order_relaxed)) {
+				if (const auto filter = g_casterFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
+					return true;  // a caster that can't shadow a visible pixel (callers ignore the result)
+				}
 			}
 			if (const auto observer = g_mainRegistrationObserver.load(std::memory_order_relaxed);
 				observer && a_accumulator && a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
@@ -672,6 +684,23 @@ namespace CBRO::Hooks::CullGroups
 	void SetDroppedAccumulator(const void* a_accumulator) noexcept
 	{
 		g_droppedAccumulator.store(a_accumulator, std::memory_order_release);
+	}
+
+	void SetCountedAccumulator(const void* a_accumulator) noexcept
+	{
+		g_countedAccumulator.store(a_accumulator, std::memory_order_release);
+	}
+
+	std::uint64_t ReadCountedRegistrations() noexcept
+	{
+		return g_countedRegistrations.load(std::memory_order_relaxed);
+	}
+
+	void SetFilteredAccumulator(const void* a_accumulator, CasterFilter a_filter) noexcept
+	{
+		// (the filter first: a reader that sees the accumulator sees its filter, or none)
+		g_casterFilter.store(a_filter, std::memory_order_release);
+		g_filteredAccumulator.store(a_accumulator, std::memory_order_release);
 	}
 
 	std::uint64_t ReadDroppedRegistrations() noexcept
