@@ -141,6 +141,7 @@ namespace CBRO::Core::ShadowLights
 			std::uint32_t        skippedMode{ 0 };         // the culler passes or fails everything (cull mode 1/2): no test
 			std::uint32_t        skippedAlwaysDraw{ 0 };   // flag bit 11: the engine passes it untested
 			std::uint32_t        skippedPreProcessed{ 0 }; // flag bit 26 with the culler's +0x11E clear: bit 39 decides
+			std::uint32_t        outsideReach{ 0 };        // outside the light's culling sphere: the engine's own test fails it
 		};
 		thread_local Region t_region{};
 		bool                g_volumes{ true };  // bLampShadowVolumes
@@ -155,6 +156,11 @@ namespace CBRO::Core::ShadowLights
 		std::atomic<std::uint64_t> g_casterSkippedMode{ 0 };
 		std::atomic<std::uint64_t> g_casterSkippedAlwaysDraw{ 0 };
 		std::atomic<std::uint64_t> g_casterSkippedPreProcessed{ 0 };
+		std::atomic<std::uint64_t> g_casterOutsideReach{ 0 };
+		// The point lights' culls (Process(camera) with the engine's traversal inside), timed (v1.54): limited to the view
+		// (the per-object test runs), emptied (all-fail), and the rest (left to the engine).
+		std::atomic<std::int64_t>  g_cullTicks[3]{};
+		std::atomic<std::uint64_t> g_cullCount[3]{};
 
 		// Confirmation streaks per light, keyed by its position and reach (shadow cameras can be
 		// pooled across lights, so the camera pointer is not an identity).
@@ -519,6 +525,18 @@ namespace CBRO::Core::ShadowLights
 			return a_verdict == Occlusion::LampVerdict::kOutside || a_verdict == Occlusion::LampVerdict::kMisses ? CasterFate::kVolume : CasterFate::kKept;
 		}
 
+		// The engine's first test of a lamp caster (TestParabolicCulling 0x142977950, every branch of slot 0x19 runs it):
+		// the object's sphere must meet the light's culling sphere (centre culler +0x1C0, radius +0x1CC), else it fails
+		// whatever else holds (`sqrt(d^2) - r - reach < 0` passes; NaN fails there and here).
+		bool SphereMeetsLight(const RE::NiBound& a_bound, const RE::NiPoint3& a_light, float a_reach) noexcept
+		{
+			const float dx = a_bound.center.x - a_light.x;
+			const float dy = a_bound.center.y - a_light.y;
+			const float dz = a_bound.center.z - a_light.z;
+			const float limit = a_bound.fRadius + a_reach;
+			return limit > 0.0f && dx * dx + dy * dy + dz * dz < limit * limit;
+		}
+
 		// ---- spot lights: casters that can't shadow a visible pixel are left out (v1.53, bSpotCasterTrim) -----------
 		// A kept spot light's casters reach its shadow map through RegisterObject (its group pass files them), so Hooks::
 		// CullGroups filters that one accumulator during the light's cull: each geometry gets JudgeCaster with the light
@@ -651,11 +669,19 @@ namespace CBRO::Core::ShadowLights
 				const auto* center = reinterpret_cast<const float*>(base + kSphereCenterOffset);
 				RecordLamp(RE::NiPoint3{ center[0], center[1], center[2] }, *reinterpret_cast<const float*>(base + kSphereRadiusOffset), false);
 			}
+			const auto timedCull = [&](std::size_t a_kind) {
+				LARGE_INTEGER start{}, end{};
+				QueryPerformanceCounter(&start);
+				reinterpret_cast<ProcessFn>(g_original)(a_self, a_camera, a_scene, a_visibleSet);
+				QueryPerformanceCounter(&end);
+				g_cullTicks[a_kind].fetch_add(end.QuadPart - start.QuadPart, std::memory_order_relaxed);
+				g_cullCount[a_kind].fetch_add(1, std::memory_order_relaxed);
+			};
 			if (a_camera && a_scene && ShouldEmpty(a_self, a_camera)) {
 				auto&      cullMode = *reinterpret_cast<std::uint32_t*>(static_cast<std::byte*>(a_self) + kCullModeOffset);
 				const auto saved = cullMode;
 				cullMode = kAllFail;
-				reinterpret_cast<ProcessFn>(g_original)(a_self, a_camera, a_scene, a_visibleSet);
+				timedCull(1);
 				cullMode = saved;
 				return;
 			}
@@ -669,7 +695,7 @@ namespace CBRO::Core::ShadowLights
 				const auto mode = *reinterpret_cast<const std::uint32_t*>(static_cast<const std::byte*>(a_self) + kCullModeOffset);
 				g_regionModes[mode == 0 ? 0 : mode == 3 ? 1 : mode == 4 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
 			}
-			reinterpret_cast<ProcessFn>(g_original)(a_self, a_camera, a_scene, a_visibleSet);
+			timedCull(active ? 0 : 2);
 			if (active) {
 				g_casterSeen.fetch_add(t_region.seen, std::memory_order_relaxed);
 				g_casterTests.fetch_add(t_region.tests, std::memory_order_relaxed);
@@ -678,6 +704,7 @@ namespace CBRO::Core::ShadowLights
 				g_casterSkippedMode.fetch_add(t_region.skippedMode, std::memory_order_relaxed);
 				g_casterSkippedAlwaysDraw.fetch_add(t_region.skippedAlwaysDraw, std::memory_order_relaxed);
 				g_casterSkippedPreProcessed.fetch_add(t_region.skippedPreProcessed, std::memory_order_relaxed);
+				g_casterOutsideReach.fetch_add(t_region.outsideReach, std::memory_order_relaxed);
 			}
 			t_region = saved;
 		}
@@ -697,6 +724,10 @@ namespace CBRO::Core::ShadowLights
 					++t_region.skippedAlwaysDraw;
 				} else if ((flags & kPreProcessedFlag) && !*reinterpret_cast<const std::uint8_t*>(base + kTestPreProcessedOffset)) {
 					++t_region.skippedPreProcessed;
+				} else if (const auto& bound = a_object->worldBound; !SphereMeetsLight(bound, t_region.lamp, t_region.reach)) {
+					// The engine's own first test (TestParabolicCulling) fails it: left to the engine, uncounted as CBRO's
+					// (v1.53 ran its own test first, on every object of the scene graph, and counted these as its drops).
+					++t_region.outsideReach;
 				} else {
 					++t_region.tests;
 					bool       volumeRan = false;
@@ -1449,10 +1480,19 @@ namespace CBRO::Core::ShadowLights
 		const auto volume = take(g_casterVolumeCulled);
 		const auto modes = [&](std::size_t a_index) { return take(g_regionModes[a_index]) / frames; };
 		const auto mode0 = modes(0), mode3 = modes(1), mode4 = modes(2), modeOther = modes(3);
+		const auto cullMs = [&](std::size_t a_kind, double& a_count) {
+			a_count = static_cast<double>(g_cullCount[a_kind].exchange(0, std::memory_order_relaxed));
+			const auto ticks = g_cullTicks[a_kind].exchange(0, std::memory_order_relaxed);
+			return g_qpcPerMs > 0.0 ? static_cast<double>(ticks) / g_qpcPerMs : 0.0;
+		};
+		double     limitedCulls = 0.0, emptiedCulls = 0.0, otherCulls = 0.0;
+		const auto limitedMs = cullMs(0, limitedCulls), emptiedMs = cullMs(1, emptiedCulls), otherMs = cullMs(2, otherCulls);
+		const auto each = [](double a_ms, double a_count) { return a_count > 0.0 ? a_ms * 1000.0 / a_count : 0.0; };
 		logger::info(
-			"shadow light casters per frame: lights limited to the view {:.1f} (inside it {:.1f}; by cull mode: 0 {:.1f}, 3 {:.1f}, 4 {:.1f}, other {:.1f}) | objects seen {:.0f}, tested {:.0f} (not tested, as by the engine: all-pass/all-fail mode {:.0f}, always-draw {:.0f}, pre-processed {:.0f}) | left out: outside the pushed view cone {:.0f}, shadow volume can't reach a visible surface {:.0f} (with their subtrees)",
-			regions / frames, inside / frames, mode0, mode3, mode4, modeOther, seen / frames, tests / frames, take(g_casterSkippedMode) / frames,
-			take(g_casterSkippedAlwaysDraw) / frames, take(g_casterSkippedPreProcessed) / frames, culled / frames, volume / frames);
+			"shadow light casters per frame: lights limited to the view {:.1f} (inside it {:.1f}; by cull mode: 0 {:.1f}, 3 {:.1f}, 4 {:.1f}, other {:.1f}) | objects seen {:.0f}: outside the light's reach (the engine's own test) {:.0f}, tested {:.0f}, not tested as by the engine (all-pass/all-fail mode {:.0f}, always-draw {:.0f}, pre-processed {:.0f}) | left out: outside the pushed view cone {:.0f}, shadow volume can't reach a visible surface {:.0f} (with their subtrees) | point-light culls CPU per frame: limited {:.3f} ms ({:.1f} us each), emptied {:.3f} ms ({:.1f} us each), left whole {:.3f} ms ({:.1f} us each)",
+			regions / frames, inside / frames, mode0, mode3, mode4, modeOther, seen / frames, take(g_casterOutsideReach) / frames, tests / frames, take(g_casterSkippedMode) / frames,
+			take(g_casterSkippedAlwaysDraw) / frames, take(g_casterSkippedPreProcessed) / frames, culled / frames, volume / frames,
+			limitedMs / frames, each(limitedMs, limitedCulls), emptiedMs / frames, each(emptiedMs, emptiedCulls), otherMs / frames, each(otherMs, otherCulls));
 		const auto point = take(g_lampsPoint);
 		const auto spot = take(g_lampsSpot);
 		logger::info("shadow lamps recorded per frame (for group 0 with the sun off): point {:.1f} | spot {:.1f} | list overflow {}", point / frames, spot / frames, Lamps().overflow);

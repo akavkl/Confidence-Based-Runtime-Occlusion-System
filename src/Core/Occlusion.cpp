@@ -114,6 +114,9 @@ namespace CBRO::Core::Occlusion
 			kSunLampTests,       // ... lamp shadow-volume tests run for the above
 			kCasterRejected,     // group-0 entries rejected in every view (neither the main camera nor the sun needs them)
 			kCasterSkipped,      // group-0 top-level objects never filed, for the same reason
+			kSpotLampKept,       // group-0 entries the sun doesn't need, kept for a spot lamp within reach (sun up, v1.54)
+			kSpotLampNodesKept,  // ... cell nodes walked though outside the view and the sun's reach, for the same reason
+			kSpotLampsUnknown,   // ... entries kept because the spot lamps weren't all known (hook missing, list overflow)
 			kCellNodesSeen,       // cells' child node 3 (precombined chunks + static refs) offered by the scene walk
 			kCellNodesSkipped,    // ... left out whole: outside the view, sun shadow can't reach it
 			kCellNodesInView,     // ... walked: the node's bound meets the view
@@ -2088,6 +2091,97 @@ namespace CBRO::Core::Occlusion
 			       (a_record.sun == SunOutcome::kBehind && a_record.sunStreak >= g_tunables.confirmFrames);
 		}
 
+		// The spot lamps group 0 also serves with the sun up (v1.54). The sun's test says nothing about a spot lamp's
+		// shadow, yet the spot lights' group passes read group 0 as the cascades do (FO4-ENGINE-NOTES 6.2a), and the night's
+		// moon counts as the sun (every exterior frame of the v1.53 run had the cascades on, and kept spot lights filed
+		// from group 0 in them). So an entry the sun doesn't need stays in group 0 while it lies within a recorded spot
+		// lamp's reach, unless bLampGroupTrim's shadow-volume test shows that no such lamp's shadow of it can reach a
+		// visible surface. Point lamps cull the scene graph itself and never read group 0. With the sun off EvaluateSun
+		// already weighed every lamp. Gathered at each frame's begin from the lamps the shadow stage recorded last frame
+		// (ShadowLights::Lamps); read-only for the rest of the frame.
+		struct SpotLamps
+		{
+			bool                                                    known{ false };  // the list holds every spot lamp
+			std::uint32_t                                           count{ 0 };
+			std::array<ShadowLights::Lamp, ShadowLights::LampList::kMax> items{};
+			float                                                   min[3]{};        // the box around every lamp's reach
+			float                                                   max[3]{};
+		};
+		SpotLamps g_spotLamps;
+
+		void GatherSpotLamps() noexcept
+		{
+			auto&       spots = g_spotLamps;
+			const auto& lamps = ShadowLights::Lamps();
+			spots.known = lamps.complete && lamps.overflow == 0;
+			spots.count = 0;
+			for (std::uint32_t i = 0; i < std::min<std::uint32_t>(lamps.count, ShadowLights::LampList::kMax); ++i) {
+				const auto& lamp = lamps.items[i];
+				if (!lamp.spot) {
+					continue;
+				}
+				const float p[3]{ lamp.position.x, lamp.position.y, lamp.position.z };
+				for (int k = 0; k < 3; ++k) {
+					spots.min[k] = spots.count == 0 ? p[k] - lamp.reach : std::min(spots.min[k], p[k] - lamp.reach);
+					spots.max[k] = spots.count == 0 ? p[k] + lamp.reach : std::max(spots.max[k], p[k] + lamp.reach);
+				}
+				spots.items[spots.count++] = lamp;
+			}
+		}
+
+		// Whether a recorded spot lamp may shadow a visible surface with this group-0 entry (a_object null: within reach
+		// is enough, for a node's whole set of entries).
+		bool SpotLampMayNeed(const FrameContext& a_context, RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			const auto& spots = g_spotLamps;
+			if (!spots.known) {
+				Bump(kSpotLampsUnknown);
+				return true;
+			}
+			if (spots.count == 0) {
+				return false;
+			}
+			const float r = a_bound.fRadius;
+			const float c[3]{ a_bound.center.x, a_bound.center.y, a_bound.center.z };
+			for (int k = 0; k < 3; ++k) {
+				if (c[k] + r < spots.min[k] || c[k] - r > spots.max[k]) {
+					return false;  // (most entries: far from every lamp)
+				}
+			}
+			for (std::uint32_t i = 0; i < spots.count; ++i) {
+				const auto& lamp = spots.items[i];
+				const float dx = c[0] - lamp.position.x, dy = c[1] - lamp.position.y, dz = c[2] - lamp.position.z;
+				const float reach = lamp.reach + r;
+				if (dx * dx + dy * dy + dz * dz > reach * reach) {
+					continue;
+				}
+				if (!g_tunables.lampGroupTrim || !a_object) {
+					return true;
+				}
+				const auto verdict = TestLampCasterIn(a_context, a_object, lamp.position, lamp.reach, a_bound);
+				if (verdict != LampVerdict::kOutside && verdict != LampVerdict::kMisses) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		// Whether group 0 can do without an entry the main view doesn't need: the sun's verdict, then (sun up) the spot lamps.
+		bool GroupZeroUnneeded(const FrameContext& a_context, const Record& a_record, RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			if (!SunUnneededIn(a_record)) {
+				return false;
+			}
+			if (a_record.sun == SunOutcome::kLampUnneeded) {
+				return true;  // (the sun-off verdict already weighed every lamp)
+			}
+			if (SpotLampMayNeed(a_context, a_object, a_bound)) {
+				Bump(kSpotLampKept);
+				return false;
+			}
+			return true;
+		}
+
 		enum class Reuse : std::uint8_t
 		{
 			kNo,
@@ -2405,7 +2499,7 @@ namespace CBRO::Core::Occlusion
 					return nullptr;
 				}
 				const bool hiddenConfirmed = out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames;
-				if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !(out.flags & kRecordLight) && SunUnneededIn(out)) {
+				if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !(out.flags & kRecordLight) && GroupZeroUnneeded(a_context, out, a_add.object, *a_add.bound)) {
 					Bump(kCasterRejected);
 					SampleLeftOutType(a_context, a_add.object);
 					return &a_context.reject;
@@ -2506,7 +2600,7 @@ namespace CBRO::Core::Occlusion
 				const bool light = (out.flags & kRecordLight) != 0;
 				if (!Observing()) {
 					if (group0) {
-						if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !light && SunUnneededIn(out)) {
+						if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !light && GroupZeroUnneeded(*context, out, a_object, *a_bound)) {
 							Bump(kCasterSkipped);
 							SampleLeftOutType(*context, a_object);
 							skip = true;
@@ -2743,12 +2837,14 @@ namespace CBRO::Core::Occlusion
 				Bump(kCellNodesHeld);
 			} else if (!(outside = EntriesOutside(*context, a_node, depth, unionBound, entries))) {
 				Bump(kCellNodesInView);
-			} else if (SunUnneeded(*context, a_node, unionBound)) {
+			} else if (!SunUnneeded(*context, a_node, unionBound)) {
+				Bump(kCellNodesSunNeeded);
+			} else if (SpotLampMayNeed(*context, nullptr, unionBound)) {
+				Bump(kSpotLampNodesKept);  // (a spot lamp's group pass may file its entries: v1.54)
+			} else {
 				Bump(kCellNodesSkipped);
 				Bump(kCellNodeEntriesSkipped, entries);
 				skip = true;
-			} else {
-				Bump(kCellNodesSunNeeded);
 			}
 			if (g_nodeSamples.load(std::memory_order_relaxed) < 8) {
 				SampleNode(a_node, a_index, contents, outside, entries, unionBound.fRadius);
@@ -3065,6 +3161,7 @@ namespace CBRO::Core::Occlusion
 			g_drops.Clear();
 		}
 		MeshProxy::BeginFrame();
+		GatherSpotLamps();  // (Runtime published last frame's lamps just before)
 
 		const auto next = (g_context.load() + 1 + 2) % 2;
 		g_contexts[next] = a_context;
@@ -3508,8 +3605,9 @@ namespace CBRO::Core::Occlusion
 			"occlusion main view only (groups the sun's shadow cascades read too) per frame: entries {:.0f} | dropped with their parent {:.0f} | registrations {:.0f}, left out {:.0f} | drop table full {:.0f}",
 			per(kShared), per(kDropInherited), per(kRegistered), per(kRegistrationsDropped), per(kDropFull));
 		logger::info(
-			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f} | sun off: kept, no lamp known {:.0f}; lamp tests {:.0f}: no lamp's shadow reaches a visible surface {:.0f} (left out), a lamp's may {:.0f} | confirming {:.0f} | needed {:.0f} || objects nothing needs: never filed {:.0f}, rejected {:.0f}",
-			per(kSunTests), per(kSunOutside), per(kSunHidden), per(kSunOff), per(kSunLampTests), per(kSunLampUnneeded), per(kSunLampNeeded), per(kSunConfirming), per(kSunNeeded), per(kCasterSkipped), per(kCasterRejected));
+			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f} | sun off: kept, no lamp known {:.0f}; lamp tests {:.0f}: no lamp's shadow reaches a visible surface {:.0f} (left out), a lamp's may {:.0f} | confirming {:.0f} | needed {:.0f} || objects nothing needs: never filed {:.0f}, rejected {:.0f} | kept for a spot lamp within reach (sun up): entries {:.0f}, cell nodes {:.1f} (spot lamps not all known {:.0f}; {} spot lamps this frame)",
+			per(kSunTests), per(kSunOutside), per(kSunHidden), per(kSunOff), per(kSunLampTests), per(kSunLampUnneeded), per(kSunLampNeeded), per(kSunConfirming), per(kSunNeeded), per(kCasterSkipped), per(kCasterRejected),
+			per(kSpotLampKept), per(kSpotLampNodesKept), per(kSpotLampsUnknown), g_spotLamps.count);
 		logger::info(
 			"occlusion early skips per frame (main-view-only groups, never filed with the engine): hidden {:.0f} | out of view {:.0f} | top-level adds considered {:.0f}",
 			per(kSkippedHidden), per(kSkippedOutside), static_cast<double>(Hooks::CullGroups::TakeGroupAddsConsidered()) / frames);
