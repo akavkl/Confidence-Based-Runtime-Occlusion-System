@@ -490,9 +490,13 @@ namespace CBRO::Core::HiZ
 					scan.x = fx;
 					scan.y = fy;
 				}
+				const float nearDepth = nearest[offset[0] + y * w + x];
 				scan.farPlane += row[x] >= 0.99999f;
-				scan.firstPerson += row[x] >= 0.99999f && nearest[offset[0] + y * w + x] <= 0.0f;
+				scan.firstPerson += row[x] >= 0.99999f && nearDepth <= 0.0f;
 				scan.farthest = std::max(scan.farthest, row[x]);
+				if (row[x] >= 0.99999f) {
+					scan.farPlaneNearest = std::min(scan.farPlaneNearest, nearDepth);  // (< 1: something is drawn in that texel too)
+				}
 			}
 		}
 		return scan;
@@ -544,7 +548,7 @@ namespace CBRO::Core::HiZ
 		return true;
 	}
 
-	bool Snapshot::NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine) const noexcept
+	bool Snapshot::NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept
 	{
 		auto          span = std::max(a_x1 - a_x0, a_y1 - a_y0);
 		std::uint32_t level = 0;
@@ -552,10 +556,10 @@ namespace CBRO::Core::HiZ
 			span *= 0.5f;
 			++level;
 		}
-		return NoSurfaceBetweenAt(level, a_x0, a_y0, a_x1, a_y1, a_near, a_far, a_refine);
+		return NoSurfaceBetweenAt(level, a_x0, a_y0, a_x1, a_y1, a_near, a_far, a_refine, a_rays);
 	}
 
-	bool Snapshot::NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine) const noexcept
+	bool Snapshot::NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept
 	{
 		const float size = static_cast<float>(1u << a_level);
 		const float scale = 1.0f / size;
@@ -580,10 +584,14 @@ namespace CBRO::Core::HiZ
 				const float sy0 = std::max(a_y0, ty0);
 				const float sx1 = std::max(sx0, std::min(a_x1, tx0 + size - 0.001f));
 				const float sy1 = std::max(sy0, std::min(a_y1, ty0 + size - 0.001f));
+				// (a quarter texel of slack covers the render's sub-pixel jitter, as in AllNearerAt)
+				if (a_rays && a_rays->Misses(sx0 - 0.25f, sy0 - 0.25f, sx1 + 0.25f, sy1 + 0.25f)) {
+					continue;  // no ray through this texel meets the sphere: what is seen here lies outside it
+				}
 				if (a_refine == 0 || a_level == 0) {
 					return false;
 				}
-				if (!NoSurfaceBetweenAt(a_level - 1, sx0, sy0, sx1, sy1, a_near, a_far, a_refine - 1)) {
+				if (!NoSurfaceBetweenAt(a_level - 1, sx0, sy0, sx1, sy1, a_near, a_far, a_refine - 1, a_rays)) {
 					return false;
 				}
 			}

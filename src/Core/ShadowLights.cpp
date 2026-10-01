@@ -191,12 +191,16 @@ namespace CBRO::Core::ShadowLights
 			std::atomic<std::uint64_t> edge{ 0 };
 			std::atomic<std::uint64_t> noDepth{ 0 };
 			std::atomic<std::uint64_t> invalid{ 0 };
+			std::atomic<std::uint64_t> emptyReach{ 0 };
 
 			void Count(Occlusion::SphereReason a_reason) noexcept
 			{
 				switch (a_reason) {
 				case Occlusion::SphereReason::kOverhang:
 					overhang.fetch_add(1, std::memory_order_relaxed);
+					break;
+				case Occlusion::SphereReason::kEmptyReach:
+					emptyReach.fetch_add(1, std::memory_order_relaxed);
 					break;
 				case Occlusion::SphereReason::kNear:
 					nearCamera.fetch_add(1, std::memory_order_relaxed);
@@ -219,9 +223,10 @@ namespace CBRO::Core::ShadowLights
 			{
 				const auto per = [&](std::atomic<std::uint64_t>& a_counter) { return static_cast<double>(a_counter.exchange(0)) / a_frames; };
 				const double nearCameraPer = per(nearCamera), edgePer = per(edge), noDepthPer = per(noDepth), invalidPer = per(invalid);
+				const double overhangPer = per(overhang);
 				return std::format(
-					" [reaches the camera {:.2f}, view overhang too wide {:.2f}, no depth {:.2f}, bad bound {:.2f}] | hidden through a thin view overhang {:.2f}",
-					nearCameraPer, edgePer, noDepthPer, invalidPer, per(overhang));
+					" [reaches the camera {:.2f}, view overhang too wide {:.2f}, no depth {:.2f}, bad bound {:.2f}] | hidden through a thin view overhang {:.2f} | hidden with no visible surface in reach (nothing drawn there, or surfaces beyond it) {:.2f}",
+					nearCameraPer, edgePer, noDepthPer, invalidPer, overhangPer, per(emptyReach));
 			}
 		};
 		ReasonCounts g_pointReasons;

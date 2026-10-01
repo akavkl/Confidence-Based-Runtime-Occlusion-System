@@ -143,10 +143,12 @@ namespace CBRO::Core::Occlusion
 		kEdge,      // part of it is in view where the depth frame never rendered (a wider overhang)
 		kNear,      // it reaches in front of the near distance (the camera is at or in it)
 		kInvalid,   // a bad bound
+		kEmptyReach,  // hidden though not behind the depth: no visible surface lies inside it (only nothing drawn, or surfaces beyond it)
 	};
 	// A light's whole reach: unlike an object's test, a thin strip where the current view overhangs the depth frame (a
 	// camera turned a fraction of a degree since the depth was rendered) is taken to hold what the frame's edge holds,
-	// and the Hi-Z is refined down to single texels (a far texel counts only where the light's rays pass).
+	// and the Hi-Z is refined down to single texels (a far texel counts only where the light's rays pass). Since v1.55 a
+	// reach also counts as hidden when no visible surface lies inside it (kEmptyReach): nothing in it can be lit.
 	[[nodiscard]] SphereVerdict TestSphere(const RE::NiPoint3& a_center, float a_radius, SphereReason* a_reason = nullptr) noexcept;
 
 	// Diagnostic (ShadowLights): an emptied lamp shadow map had to be drawn again (its light no longer judged unseen).

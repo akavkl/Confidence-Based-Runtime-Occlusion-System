@@ -618,7 +618,8 @@ namespace CBRO::Core::Occlusion
 		{
 			float         overhang{ kLightOverhang };
 			std::uint32_t refine{ 16 };
-			bool          overhung{ false };  // out: part of it was judged by the frame's edge
+			bool          overhung{ false };    // out: part of it was judged by the frame's edge
+			bool          emptyReach{ false };  // out: hidden though not behind the depth: no visible surface lies inside it
 		};
 
 		Verdict TestViewSpace(const FrameContext& a_context, const RE::NiBound& a_bound, float a_radius, DepthRect* a_rect = nullptr, LightTest* a_light = nullptr, VisibleEvidence* a_evidence = nullptr) noexcept
@@ -690,6 +691,23 @@ namespace CBRO::Core::Occlusion
 			rays.axisX = width * 0.5f;
 			rays.axisY = height * 0.5f;
 			if (!snapshot.AllNearer(px0, py0, px1, py1, threshold, a_light ? a_light->refine : kRefineLevels, &rays)) {
+				// A light's reach (v1.55): what a lamp's shadow map needs is a visible surface inside the reach, not a reach
+				// in front of the depth. A texel where nothing was drawn (the far plane: a crack through an interior's walls,
+				// the sky) holds no surface to light, and neither does one whose surfaces all lie beyond the reach's far
+				// side. Every texel of the rectangle must hold its surfaces in front of the reach's near side or beyond its
+				// far side (the nearest and farthest pyramids, the same test the lamp casters' shadow volumes get). In the
+				// v1.52-v1.54 runs one far-plane texel in an interior made the same lamp "visible" every second or so and its
+				// whole shadow map was drawn again. Objects keep the strict test: one is visible through such a texel.
+				if (a_light) {
+					const float beyond = CacheLimitFar(a_context, (z + a_radius + g_tunables.depthSlack) * (1.0f + g_tunables.depthTolerance));
+					const float farThreshold = std::min(g_tunables.depthMin + g_tunables.depthRange * (camera.depthA + camera.depthB / beyond), 0.999999f);
+					// (only texels the reach's own rays pass through, as AllNearer just did: v1.55 scanned the whole screen box,
+					// whose corners hold surfaces outside the sphere, and the rule held in 1 of 426 log intervals)
+					if (beyond > 0.0f && snapshot.NoSurfaceBetween(px0, py0, px1, py1, threshold, farThreshold, a_light->refine, &rays)) {
+						a_light->emptyReach = true;
+						return Verdict::kHidden;
+					}
+				}
 				if (a_evidence) {
 					*a_evidence = VisibleEvidence{ true, true, px0, py0, px1, py1, threshold, nearest, rays };
 				}
@@ -2944,8 +2962,8 @@ namespace CBRO::Core::Occlusion
 				std::string scan;
 				if (sample.scanned) {
 					scan = sample.scan.texels ?
-					           std::format(" | nearest at depth {:.0f}: level-0 texels beyond it {} (far plane {}, first-person {}), farthest {:.6f}, first at ({:.0f},{:.0f})",
-								   sample.nearest, sample.scan.texels, sample.scan.farPlane, sample.scan.firstPerson, sample.scan.farthest, sample.scan.x, sample.scan.y) :
+					           std::format(" | nearest at depth {:.0f}: level-0 texels beyond it {} (far plane {}, first-person {}; nearest surface in the far-plane texels {:.6f}), farthest {:.6f}, first at ({:.0f},{:.0f})",
+								   sample.nearest, sample.scan.texels, sample.scan.farPlane, sample.scan.firstPerson, sample.scan.farPlaneNearest, sample.scan.farthest, sample.scan.x, sample.scan.y) :
 					           std::format(" | nearest at depth {:.0f}: no level-0 texel beyond it (a coarse texel alone)", sample.nearest);
 				}
 				logger::info(
@@ -3217,7 +3235,7 @@ namespace CBRO::Core::Occlusion
 		LightTest light{};
 		switch (Test(*context, bound, nullptr, &light)) {
 		case Verdict::kHidden:
-			reason(light.overhung ? SphereReason::kOverhang : SphereReason::kNone);
+			reason(light.emptyReach ? SphereReason::kEmptyReach : light.overhung ? SphereReason::kOverhang : SphereReason::kNone);
 			return SphereVerdict::kHidden;
 		case Verdict::kVisible:
 			return SphereVerdict::kVisible;

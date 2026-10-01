@@ -101,7 +101,8 @@ namespace CBRO::Core::HiZ
 		// True if no visible surface over the rectangle lies within the buffer-depth range [a_near, a_far]: at every
 		// texel the farthest surface is nearer than a_near, or the nearest surface is farther than a_far (a sky
 		// texel, cleared to the far plane, always is). Coarse texels that are mixed are refined like AllNearer.
-		[[nodiscard]] bool NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine) const noexcept;
+		// With a_rays, texels the sphere's rays can't reach are skipped (as AllNearer): a surface seen there lies outside it.
+		[[nodiscard]] bool NoSurfaceBetween(float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays = nullptr) const noexcept;
 
 		// True if every texel covering the rectangle is nearer than a_threshold (buffer depth). Starts
 		// at the level where the rectangle spans <= 4 texels; a texel that fails there is re-checked at
@@ -116,6 +117,7 @@ namespace CBRO::Core::HiZ
 			std::uint32_t texels{ 0 };
 			std::uint32_t farPlane{ 0 };     // ... of them at the far plane: cleared (no surface) or first-person pixels
 			std::uint32_t firstPerson{ 0 };  // ... of those holding first-person geometry (nearest 0)
+			float         farPlaneNearest{ 1.0f };  // the nearest surface in those far-plane texels (below 1: a texel mixing nothing drawn with surfaces)
 			float         farthest{ 0.0f };
 			float         x{ -1.0f };      // the first one found (level-0 texel coordinates)
 			float         y{ -1.0f };
@@ -125,7 +127,7 @@ namespace CBRO::Core::HiZ
 	private:
 		[[nodiscard]] bool AllNearerAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept;
 		[[nodiscard]] bool AllFartherAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_threshold, std::uint32_t a_refine) const noexcept;
-		[[nodiscard]] bool NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine) const noexcept;
+		[[nodiscard]] bool NoSurfaceBetweenAt(std::uint32_t a_level, float a_x0, float a_y0, float a_x1, float a_y1, float a_near, float a_far, std::uint32_t a_refine, const SphereRays* a_rays) const noexcept;
 	};
 
 	// Creates GPU resources on first use. Returns false if the device path is unusable.
