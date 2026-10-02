@@ -2624,7 +2624,8 @@ namespace CBRO::Core::Occlusion
 		// object nothing needs is left out entirely, so the engine never files, tests or walks it (with previs
 		// off it would otherwise process every object in the loaded cells). In a main-only group that is an
 		// object out of view or confirmed hidden; in group 0 its sun shadow must also be unneeded. Never for an
-		// object the engine marks always-draw, and never in observe-only mode.
+		// object the engine marks always-draw, nor a sky mesh (previs draws those whatever their bound), and never in
+		// observe-only mode.
 		bool SkipTopLevel(RE::NiAVObject* a_object, const RE::NiBound* a_bound, Hooks::CullGroups::GroupKind a_kind)
 		{
 			const auto context = CurrentContext();
@@ -2635,7 +2636,7 @@ namespace CBRO::Core::Occlusion
 			const auto start = timed ? __rdtsc() : 0;
 
 			bool skip = false;
-			if (!((a_object->GetFlags() >> 11) & 1)) {
+			if (!((a_object->GetFlags() >> 11) & 1) && !Hooks::CullGroups::IsSky(a_object)) {
 				auto&      streams = Streams(*context);
 				const bool group0 = a_kind == Hooks::CullGroups::GroupKind::kSunShared;
 				const Hooks::CullGroups::BlockAdd add{ nullptr, a_object, a_bound, -1, 0, true, a_kind, 0 };
@@ -3643,10 +3644,11 @@ namespace CBRO::Core::Occlusion
 			per(kConfirming), per(kVisible), per(kEdge), per(kNear), per(kOutside), per(kBehind),
 			per(kExemptType), per(kExemptLight), per(kExemptActor),
 			per(kInvalid), per(kNoContext), per(kTableFull), g_tunables.viewOverhang, per(kOverhangHidden), per(kSunOverhang));
+		const auto sky = Hooks::CullGroups::TakeSkyCounts();
 		logger::info(
-			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f}",
+			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f} || sky meshes given previs's force-visible mark {:.2f}, CBRO drops of them ignored {:.2f}",
 			per(kMerged), per(kMergedRejected), per(kMergedConfirming), per(kInstanceTests), per(kInstanceEntries), per(kInstanceEntriesRejected),
-			static_cast<double>(Hooks::CullGroups::TakeForcedCleared()) / frames);
+			static_cast<double>(Hooks::CullGroups::TakeForcedCleared()) / frames, static_cast<double>(sky.forced) / frames, static_cast<double>(sky.kept) / frames);
 		logger::info(
 			"occlusion lights per frame: tested {:.0f} | rejected {:.0f} (point/spot lights whose whole reach is hidden)",
 			per(kLightsTested), per(kLightsRejected));

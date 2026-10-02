@@ -185,6 +185,7 @@ namespace CBRO::Hooks::CullGroups
 		constexpr std::size_t kEntryBytesOffset = 0x3060;
 		constexpr std::size_t kEntryBytesStride = 5;
 		constexpr std::size_t kObjectFlagsOffset = 0x108;  // NiAVObject::flags
+		constexpr std::size_t kShaderPropertyOffset = 0x138;  // BSGeometry::properties[1]
 		// Group::Add's current blocks and the pending group-marker bytes it sets on them.
 		constexpr std::size_t kGroupGeometryBlockOffset = 0x150;
 		constexpr std::size_t kGroupNodeBlockOffset = 0xD0;
@@ -217,9 +218,13 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<CasterFilter>   g_casterFilter{ nullptr };
 
 		std::atomic<std::uint64_t> g_forcedCleared{ 0 };
+		std::atomic<std::uint64_t> g_skyForced{ 0 };   // sky entries given previs's force-visible mark (CBRO frames)
+		std::atomic<std::uint64_t> g_skyKept{ 0 };     // ... and reject bounds CBRO's filter would have given them
 		std::atomic<std::uint64_t> g_groupAddsConsidered{ 0 };
 
 		std::uintptr_t g_mainGroup{ 0 };
+		std::uintptr_t g_triShapeVtable{ 0 };
+		std::uintptr_t g_skyShaderVtable{ 0 };
 		std::uintptr_t g_group1{ 0 };
 		std::uintptr_t g_group2{ 0 };
 		std::uintptr_t g_groupArray{ 0 };
@@ -337,13 +342,52 @@ namespace CBRO::Hooks::CullGroups
 			const void* saved;
 		};
 
+		// Sky meshes (BSSkyShaderProperty: stars, galaxy, moons, cloud layers) reach the main camera through group 1,
+		// whose entries previs's Block::Add marks force-visible: they are drawn whatever their bound says. In a CBRO
+		// frame previs is suspended, so the finish loop tests their bounds instead, and a sky mesh whose bound doesn't
+		// follow the sky (the Visible Galaxy mod's "Galaxy" shape) vanished. Such an entry gets the mark back, and
+		// CBRO's own filter never drops one. The first few are logged once each.
+		void NoteSky(const RE::NiAVObject* a_object, const RE::NiBound* a_bound, GroupKind a_kind, std::uint8_t a_markBefore, std::uintptr_t a_caller) noexcept
+		{
+			static std::array<std::atomic<const void*>, 16> seen{};
+			for (auto& slot : seen) {
+				const void* current = slot.load(std::memory_order_relaxed);
+				if (current == a_object) {
+					return;
+				}
+				if (!current && slot.compare_exchange_strong(current, a_object, std::memory_order_relaxed)) {
+					const char* name = a_object->name.c_str();
+					logger::info(
+						"cullgroups: sky mesh '{}' at Block::Add: group {} | bound ({:.0f},{:.0f},{:.0f}) r={:.1f} | flags 0x{:X} | force-visible mark {} -> {} | caller {:X}",
+						name ? name : "", a_kind == GroupKind::kMainOnly ? "main-only (1/2/array)" : a_kind == GroupKind::kSunShared ? "0 (sun shared)" : "unknown",
+						a_bound->center.x, a_bound->center.y, a_bound->center.z, a_bound->fRadius, ReadAt<std::uint64_t>(a_object, kObjectFlagsOffset),
+						a_markBefore, a_kind == GroupKind::kMainOnly ? 1 : a_markBefore, a_caller - REL::Module::get().base());
+					return;
+				}
+				if (slot.load(std::memory_order_relaxed) == a_object) {
+					return;
+				}
+			}
+		}
+
+		bool IsSkyMesh(const RE::NiAVObject* a_object) noexcept
+		{
+			if (!a_object || !g_skyShaderVtable || ReadAt<std::uintptr_t>(a_object, 0) != g_triShapeVtable) {
+				return false;
+			}
+			const auto shader = ReadAt<std::uintptr_t>(a_object, kShaderPropertyOffset);
+			return shader && ReadAt<std::uintptr_t>(reinterpret_cast<const void*>(shader), 0) == g_skyShaderVtable;
+		}
+
 		std::int32_t BlockAddThunk(void* a_block, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::int32_t a_startIndex)
 		{
 			Count(LocalCounts().blockAdds);
-			// Outside a frame CBRO culls this is a plain pass-through (in previs mode the hook is taken out).
+			// Outside a frame CBRO culls this is a plain pass-through (in previs mode the hook is taken out), but for
+			// the sky's force-visible mark.
 			const bool active = g_mainCullActive.load(std::memory_order_relaxed);
 			const auto observer = g_blockObserver.load(std::memory_order_relaxed);
-			if (!active && !observer) {
+			const bool sky = a_startIndex < 0 && IsSkyMesh(a_object);
+			if (!active && !observer && !sky) {
 				return reinterpret_cast<BlockAddFn>(g_blockAddOriginal)(a_block, a_object, a_bound, a_startIndex);
 			}
 			const auto filter = g_filter.load(std::memory_order_relaxed);
@@ -367,13 +411,27 @@ namespace CBRO::Hooks::CullGroups
 					replacement = nullptr;  // (other readers possible: dropped from the main view only; the filter recorded it)
 				}
 			}
+			if (sky && replacement) {
+				g_skyKept.fetch_add(1, std::memory_order_relaxed);
+				replacement = nullptr;
+			}
+			const bool forceSky = sky && add.mainPass && add.kind == GroupKind::kMainOnly;
 			if (observer) {
 				observer(add, replacement != nullptr);
 			}
 
 			const bool watchInstances = instanceFilter && culling && add.kind == GroupKind::kMainOnly && a_object;
-			const auto before = (watchInstances || replacement) ? ReadAt<std::uint32_t>(a_block, kBlockCountOffset) : 0u;
+			const auto before = (watchInstances || replacement || sky) ? ReadAt<std::uint32_t>(a_block, kBlockCountOffset) : 0u;
 			const auto result = reinterpret_cast<BlockAddFn>(g_blockAddOriginal)(a_block, a_object, replacement ? replacement : a_bound, a_startIndex);
+			if (sky && add.mainPass && before < 0x200 && ReadAt<std::uint32_t>(a_block, kBlockCountOffset) > before) {
+				auto*      bytes = static_cast<std::uint8_t*>(a_block) + kEntryBytesOffset + before * kEntryBytesStride;
+				const auto mark = bytes[1];
+				if (forceSky && !mark) {
+					bytes[1] = 1;  // force-visible, as previs's Block::Add sets it for group 1/2 entries
+					g_skyForced.fetch_add(1, std::memory_order_relaxed);
+				}
+				NoteSky(a_object, a_bound, add.kind, mark, add.returnAddress);
+			}
 			if (replacement && before < 0x200) {
 				// With previs active, Block::Add marks entries of some groups (group+0x16A == 0 ->
 				// block+0x3A6F) force-visible, and the finish loop registers them whatever the frustum
@@ -404,6 +462,7 @@ namespace CBRO::Hooks::CullGroups
 			const bool active = g_mainCullActive.load(std::memory_order_relaxed);
 			const auto observer = g_groupObserver.load(std::memory_order_relaxed);
 			if (!active && !observer && !g_blockObserver.load(std::memory_order_relaxed)) {
+				GroupScope scope(a_group);  // (the sky's force-visible mark needs the group: BlockAddThunk)
 				reinterpret_cast<GroupAddFn>(g_groupAddOriginal)(a_group, a_object, a_bound, a_flags);
 				return;
 			}
@@ -438,10 +497,7 @@ namespace CBRO::Hooks::CullGroups
 		std::uint64_t ChildPushThunk(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint64_t a_flag, std::uint64_t a_arg5, std::uint64_t a_arg6, void* a_context)
 		{
 			Count(LocalCounts().childPushes);
-			if (!g_mainCullActive.load(std::memory_order_relaxed) && !g_blockObserver.load(std::memory_order_relaxed)) {
-				return reinterpret_cast<ChildPushFn>(g_childPushOriginal)(a_group, a_object, a_bound, a_flag, a_arg5, a_arg6, a_context);
-			}
-			GroupScope scope(a_group);
+			GroupScope scope(a_group);  // (also outside culled frames: the sky's force-visible mark needs the group)
 			return reinterpret_cast<ChildPushFn>(g_childPushOriginal)(a_group, a_object, a_bound, a_flag, a_arg5, a_arg6, a_context);
 		}
 
@@ -796,6 +852,8 @@ namespace CBRO::Hooks::CullGroups
 		g_installed = true;
 
 		g_mainGroup = CBRO::Engine::OG(kMainGroupID).address();
+		g_triShapeVtable = RE::VTABLE::BSTriShape[0].address();
+		g_skyShaderVtable = RE::VTABLE::BSSkyShaderProperty[0].address();
 		g_group1 = CBRO::Engine::OG(kGroup1ID).address();
 		g_group2 = CBRO::Engine::OG(kGroup2ID).address();
 		g_groupArray = CBRO::Engine::OG(kGroupArrayID).address();
@@ -904,6 +962,16 @@ namespace CBRO::Hooks::CullGroups
 	std::uint64_t TakeForcedCleared() noexcept
 	{
 		return g_forcedCleared.exchange(0);
+	}
+
+	SkyCounts TakeSkyCounts() noexcept
+	{
+		return { g_skyForced.exchange(0), g_skyKept.exchange(0) };
+	}
+
+	bool IsSky(const RE::NiAVObject* a_object) noexcept
+	{
+		return IsSkyMesh(a_object);
 	}
 
 	bool AddDirect(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags) noexcept

@@ -221,6 +221,16 @@ namespace CBRO::Hooks::CullGroups
 	// Rejected entries that had been marked force-visible (previs active) since the last call.
 	[[nodiscard]] std::uint64_t TakeForcedCleared() noexcept;
 
+	// Sky meshes (BSSkyShaderProperty) at the main pass's Block::Add in CBRO frames: given the force-visible mark previs
+	// gives group 1/2 entries (forced), and reject bounds from CBRO's filter ignored (kept). Taken per summary.
+	struct SkyCounts
+	{
+		std::uint64_t forced{ 0 };
+		std::uint64_t kept{ 0 };
+	};
+	[[nodiscard]] SkyCounts TakeSkyCounts() noexcept;
+	[[nodiscard]] bool      IsSky(const RE::NiAVObject* a_object) noexcept;
+
 	// Block entry bounds (SoA: groups of 4 entries, x[4] y[4] z[4] radius[4], at block + 0x60).
 	[[nodiscard]] RE::NiBound ReadEntryBound(const void* a_block, std::uint32_t a_index) noexcept;
 	void WriteEntryBound(void* a_block, std::uint32_t a_index, const RE::NiBound& a_bound) noexcept;
