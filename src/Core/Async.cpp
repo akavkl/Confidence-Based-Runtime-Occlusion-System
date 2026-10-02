@@ -133,7 +133,7 @@ namespace CBRO::Core::Async
 		Index                      g_indices[2];
 		std::atomic<std::uint32_t> g_parity{ 0 };       // this frame's lanes = g_frames[parity]; records read = g_frames[parity ^ 1]
 		std::atomic<std::uint32_t> g_frameStamp{ 0 };   // bumped at each cull begin: the threads reset their cursors
-		std::atomic<bool>          g_readValid{ false }; // the records of g_frames[parity ^ 1] hold for this frame's camera
+		std::atomic<bool>          g_readFilled{ false };  // g_frames[parity ^ 1] holds last frame's records (held for this camera or not)
 		std::atomic<std::uint32_t> g_nextSlot{ 0 };
 
 		std::thread             g_thread;
@@ -371,13 +371,13 @@ namespace CBRO::Core::Async
 			++g_stats.framesValid;
 			valid = true;
 		}
-		g_readValid.store(valid, std::memory_order_release);
+		g_readFilled.store(read.filled, std::memory_order_release);
 		return valid;
 	}
 
 	const Occlusion::Record* Find(const void* a_object) noexcept
 	{
-		if (!g_readValid.load(std::memory_order_acquire)) {
+		if (!g_readFilled.load(std::memory_order_acquire)) {
 			return nullptr;
 		}
 		const auto slot = Slot();
@@ -496,7 +496,7 @@ namespace CBRO::Core::Async
 		for (auto& index : g_indices) {
 			index.Begin();
 		}
-		g_readValid.store(false, std::memory_order_release);
+		g_readFilled.store(false, std::memory_order_release);
 	}
 
 	void LogStats(std::uint32_t a_frames)

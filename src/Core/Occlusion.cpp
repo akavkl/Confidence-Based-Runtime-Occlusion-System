@@ -28,6 +28,7 @@ namespace CBRO::Core::Occlusion
 			bool          cullActors{ false };
 			bool          meshShapes{ true };
 			bool          lampGroupTrim{ true };  // sun off: a group-0 entry the main view doesn't need is left out when no lamp's shadow of it can reach a visible surface
+			float         viewOverhang{ 0.03f };  // objects and sun shadows: how far (NDC) the view may overhang the depth frame and still be judged by its edge
 		};
 		Tunables g_tunables;
 
@@ -36,10 +37,13 @@ namespace CBRO::Core::Occlusion
 		// ... and when a cached hidden verdict's evidence is re-checked against a newer depth (ViewValid): fewer, since a
 		// failure only means the full test runs.
 		constexpr std::uint32_t kRecheckRefine = 2;
-		// Light tests only (TestSphere): how far (NDC) the current view may overhang the depth frame and still be judged,
+		// Light tests (TestSphere): how far (NDC) the current view may overhang the depth frame and still be judged,
 		// the overhang taken to hold what the frame's adjacent edge holds. A camera swaying by a fraction of a degree
 		// (first-person idle motion) leaves such a strip every few frames; judged unknown, every lamp crossing it
 		// dropped out of its emptied state and re-drew its whole shadow map for two frames. 0.03 is ~38 px at 2560.
+		// Objects and sun shadows take fViewOverhang (v1.61, default the same): in the v1.60 wobble runs every object
+		// and shadow crossing the strip stayed drawn (edge ~700-1,100 a frame, sun "needed" 2,600-4,100 against ~400),
+		// then re-confirmed, so the draw count swung by thousands with each small turn.
 		constexpr float kLightOverhang = 0.03f;
 		// A cached kept (drawn) verdict is re-evaluated every this many frames (staggered by object), never sooner: no
 		// depth change can make drawing an object unsafe, so this only bounds how long a newly hidden one stays drawn.
@@ -142,7 +146,10 @@ namespace CBRO::Core::Occlusion
 			kCacheKeptRecheck,    // kept (drawn) verdicts re-evaluated on their periodic turn (never because the depth changed)
 			kCacheSunDepth,       // sun outcomes re-evaluated under a reused view outcome (the blocks their shadow test read changed)
 			kStreakFromBackup,    // hidden verdicts without last frame's record whose streak the table's backup continued
-			kCycles,              // TSC cycles in the per-object tests (sampled frames, scaled)
+			kOverhangHidden,      // objects hidden with part of them in a thin overhang of the view, judged by the depth frame's edge (fViewOverhang)
+			kSunOverhang,         // sun shadows found behind surfaces the same way
+			kWalkJudged,          // async frames: entries the worker's map couldn't answer, judged in the walk (counted twice: the worker judges them too)
+			kCycles,             // TSC cycles in the per-object tests (sampled frames, scaled)
 			kCyclesEvaluate,      // ... of which: full view evaluations (sphere tests, mesh shapes, lights)
 			kCyclesShape,         // ... of which: the mesh-shape tests inside those evaluations
 			kCyclesSun,           // ... of which: sun-shadow evaluations
@@ -481,8 +488,9 @@ namespace CBRO::Core::Occlusion
 		using ShadowGeometry::SphereExtent;
 
 		// Clips an NDC rectangle of the depth frame to the part the current camera can see.
-		// kHidden here means "judge it": the clipped rectangle lies within the depth frame. With a_overhang (light tests
-		// only), a part in view beyond the frame by at most that much is judged by the frame's edge (*a_overhung set).
+		// kHidden here means "judge it": the clipped rectangle lies within the depth frame. With a_overhang (lights:
+		// kLightOverhang; objects and sun shadows: fViewOverhang), a part in view beyond the frame by at most that much
+		// is judged by the frame's edge (*a_overhung set). Lamp casters' shadow volumes stay strict.
 		Verdict ClipToView(const FrameContext& a_context, float& a_x0, float& a_x1, float& a_y0, float& a_y1, float a_overhang = 0.0f, bool* a_overhung = nullptr) noexcept
 		{
 			a_x0 = std::max(a_x0, a_context.view[0]);
@@ -657,8 +665,12 @@ namespace CBRO::Core::Occlusion
 			x1 *= camera.scaleX;
 			y0 *= camera.scaleY;
 			y1 *= camera.scaleY;
-			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1, a_light ? a_light->overhang : 0.0f, a_light ? &a_light->overhung : nullptr); clip != Verdict::kHidden) {
+			bool overhung = false;
+			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1, a_light ? a_light->overhang : g_tunables.viewOverhang, &overhung); clip != Verdict::kHidden) {
 				return clip;
+			}
+			if (a_light) {
+				a_light->overhung = overhung;
 			}
 
 			const float width = static_cast<float>(snapshot.width[0]);
@@ -718,6 +730,9 @@ namespace CBRO::Core::Occlusion
 			if (a_rect) {
 				a_rect->AddHidden(px0, py0, px1, py1, threshold);
 			}
+			if (overhung && !a_light) {
+				Bump(kOverhangHidden);
+			}
 			return Verdict::kHidden;
 		}
 
@@ -748,8 +763,12 @@ namespace CBRO::Core::Occlusion
 				ymax = std::max(ymax, (px * m[0][1] + py * m[1][1] + pz * m[2][1] + m[3][1]) * inv);
 				zmin = std::min(zmin, (px * m[0][2] + py * m[1][2] + pz * m[2][2] + m[3][2]) * inv);
 			}
-			if (const auto clip = ClipToView(a_context, xmin, xmax, ymin, ymax, a_light ? a_light->overhang : 0.0f, a_light ? &a_light->overhung : nullptr); clip != Verdict::kHidden) {
+			bool overhung = false;
+			if (const auto clip = ClipToView(a_context, xmin, xmax, ymin, ymax, a_light ? a_light->overhang : g_tunables.viewOverhang, &overhung); clip != Verdict::kHidden) {
 				return clip;
+			}
+			if (a_light) {
+				a_light->overhung = overhung;
 			}
 
 			const float depth = g_tunables.depthMin + g_tunables.depthRange * std::clamp(zmin, 0.0f, 1.0f);
@@ -765,6 +784,9 @@ namespace CBRO::Core::Occlusion
 			}
 			if (a_rect) {
 				a_rect->AddHidden(px0, py0, px1, py1, threshold);
+			}
+			if (overhung && !a_light) {
+				Bump(kOverhangHidden);
 			}
 			return Verdict::kHidden;
 		}
@@ -835,7 +857,8 @@ namespace CBRO::Core::Occlusion
 			x1 = std::max(x1, u1) * camera.scaleX;
 			y0 = std::min(y0, v0) * camera.scaleY;
 			y1 = std::max(y1, v1) * camera.scaleY;
-			switch (ClipToView(a_context, x0, x1, y0, y1)) {
+			bool overhung = false;
+			switch (ClipToView(a_context, x0, x1, y0, y1, g_tunables.viewOverhang, &overhung)) {
 			case Verdict::kOutside:
 				return SunVerdict::kOutside;
 			case Verdict::kEdge:
@@ -858,12 +881,16 @@ namespace CBRO::Core::Occlusion
 			// No visible surface inside the capsule's depth range over its screen box: at every texel the surfaces are
 			// all in front of it or all behind it (the sky, cleared to the far plane, counts as behind: nothing there
 			// receives a shadow).
-			return snapshot.NoSurfaceBetween(
-					   (x0 * 0.5f + 0.5f) * width - 0.25f, (0.5f - y1 * 0.5f) * height - 0.25f,
-					   (x1 * 0.5f + 0.5f) * width + 0.25f, (0.5f - y0 * 0.5f) * height + 0.25f,
-					   bufferDepth(limit), bufferDepth(limitFar), kRefineLevels) ?
-			           SunVerdict::kHidden :
-			           SunVerdict::kNeeded;
+			if (!snapshot.NoSurfaceBetween(
+					(x0 * 0.5f + 0.5f) * width - 0.25f, (0.5f - y1 * 0.5f) * height - 0.25f,
+					(x1 * 0.5f + 0.5f) * width + 0.25f, (0.5f - y0 * 0.5f) * height + 0.25f,
+					bufferDepth(limit), bufferDepth(limitFar), kRefineLevels)) {
+				return SunVerdict::kNeeded;
+			}
+			if (overhung) {
+				Bump(kSunOverhang);
+			}
+			return SunVerdict::kHidden;
 		}
 
 		// Where sun-shadow receivers can be this frame (TestSun clips each caster's sweep to it): in front of the
@@ -972,7 +999,7 @@ namespace CBRO::Core::Occlusion
 					y1 = std::max(y1, y);
 				}
 			}
-			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1); clip != Verdict::kHidden) {
+			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1, g_tunables.viewOverhang); clip != Verdict::kHidden) {
 				return clip;
 			}
 			const float limit = CacheLimit(a_context, (zNearest - g_tunables.depthSlack) / (1.0f + g_tunables.depthTolerance));
@@ -2414,7 +2441,10 @@ namespace CBRO::Core::Occlusion
 
 		// With asynchronous verdicts (Core/Async): the entry is recorded for the worker, and its outcome comes from
 		// the worker's map (last frame's judgement of the same object with the same bound) when the map holds for
-		// this frame's camera; anything else counts as kept (nothing hidden). The walk evaluates nothing.
+		// this frame's camera. What the map can't answer is judged here, as the synchronous path does, last frame's
+		// record (if any) continuing the streaks: an object new to the walk or whose bound moved (animated, swaying),
+		// and every object when the camera turned or moved past the map's margins. Up to v1.59 all of those were
+		// simply kept: with a wobbling camera 4% of frames drew everything (~25,000 registrations against ~6,000).
 		void JudgeOrLookup(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
 		{
 			if (!Async::Enabled() || !a_context.asyncFrame) {
@@ -2424,26 +2454,24 @@ namespace CBRO::Core::Occlusion
 			const bool timed = BucketTimed(a_context);
 			const auto start = timed ? __rdtsc() : 0;
 			Async::Record(a_add.object, *a_add.bound, a_add.kind);
-			a_out = Record{};
-			a_out.object = a_add.object;
-			a_out.outcome = Outcome::kKept;
-			if (!a_context.asyncValid) {
-				if (timed) {
-					Bump(kCyclesLookup, (__rdtsc() - start) * kTimingStride);
-				}
-				return;
-			}
 			const auto record = Async::Find(a_add.object);
 			if (timed) {
 				Bump(kCyclesLookup, (__rdtsc() - start) * kTimingStride);
 			}
-			if (!record || record->bound[0] != a_add.bound->center.x || record->bound[1] != a_add.bound->center.y ||
-				record->bound[2] != a_add.bound->center.z || record->bound[3] != a_add.bound->fRadius) {
-				Bump(record ? kCacheBound : kCacheNew);
+			if (a_context.asyncValid && record && record->bound[0] == a_add.bound->center.x && record->bound[1] == a_add.bound->center.y &&
+				record->bound[2] == a_add.bound->center.z && record->bound[3] == a_add.bound->fRadius) {
+				a_out = *record;
+				Bump(kCacheHits);
 				return;
 			}
-			a_out = *record;
-			Bump(kCacheHits);
+			if (!a_context.cull) {
+				a_out = Record{};
+				a_out.object = a_add.object;
+				a_out.outcome = Outcome::kKept;
+				return;
+			}
+			Bump(kWalkJudged);
+			JudgeRecord(a_context, a_add, record, a_wantSun, a_out);
 		}
 
 		// Whether the sun's cascades can do without a caster (node pruning, on a node's entries' sphere). "Outside"
@@ -3105,6 +3133,7 @@ namespace CBRO::Core::Occlusion
 		g_tunables.cullActors = settings.cullActors;
 		g_tunables.meshShapes = settings.meshShapes;
 		g_tunables.lampGroupTrim = settings.lampGroupTrim;
+		g_tunables.viewOverhang = settings.viewOverhang;
 		g_mergedVtable = RE::VTABLE::BSMergeInstancedTriShape[0].address();
 		g_niNodeVtable = RE::VTABLE::NiNode[0].address();
 		MeshProxy::Install();
@@ -3608,12 +3637,12 @@ namespace CBRO::Core::Occlusion
 		g_lastLightsRejected.store(static_cast<float>(per(kLightsRejected)));
 
 		logger::info(
-			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f}",
+			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f} | judged by the depth frame's edge through a view overhang of up to {:.3f}: hidden objects {:.0f}, sun shadows behind surfaces {:.0f} (evaluations, not reuses)",
 			per(kTested), per(kRejected),
 			observing ? std::format(" (decide-only: would reject {:.0f})", per(kWouldReject)) : std::string{},
 			per(kConfirming), per(kVisible), per(kEdge), per(kNear), per(kOutside), per(kBehind),
 			per(kExemptType), per(kExemptLight), per(kExemptActor),
-			per(kInvalid), per(kNoContext), per(kTableFull));
+			per(kInvalid), per(kNoContext), per(kTableFull), g_tunables.viewOverhang, per(kOverhangHidden), per(kSunOverhang));
 		logger::info(
 			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f}",
 			per(kMerged), per(kMergedRejected), per(kMergedConfirming), per(kInstanceTests), per(kInstanceEntries), per(kInstanceEntriesRejected),
@@ -3639,8 +3668,8 @@ namespace CBRO::Core::Occlusion
 			"occlusion lamp shadow volumes per frame (casters of point lights): outside the view {:.0f} | misses every visible surface {:.0f} | confirming {:.0f} | needed {:.0f} | unknown {:.0f}",
 			per(kLampVolumeOutside), per(kLampVolumeMisses), per(kLampVolumeConfirming), per(kLampVolumeNeeded), per(kLampVolumeUnknown));
 		logger::info(
-			"verdict cache per frame: reused {:.0f} (hidden re-checked against the depth {:.0f}) | evaluated: new {:.0f}, camera epoch {:.0f}, bound changed {:.0f}, depth changed {:.0f}, kept on its turn {:.0f}, never-reuse {:.0f} | sun re-evaluated under a reused view {:.0f} | hidden streaks continued from the backup {:.1f}",
-			per(kCacheHits), per(kCacheRecheck), per(kCacheNew), per(kCacheEpoch), per(kCacheBound), per(kCacheDepth), per(kCacheKeptRecheck), per(kCacheNoCache), per(kCacheSunDepth), per(kStreakFromBackup));
+			"verdict cache per frame: reused {:.0f} (hidden re-checked against the depth {:.0f}) | evaluated: new {:.0f}, camera epoch {:.0f}, bound changed {:.0f}, depth changed {:.0f}, kept on its turn {:.0f}, never-reuse {:.0f} | sun re-evaluated under a reused view {:.0f} | hidden streaks continued from the backup {:.1f} | async: judged in the walk {:.0f} (no record with this bound, or the map's margins passed; the worker judges them again, so they count twice above)",
+			per(kCacheHits), per(kCacheRecheck), per(kCacheNew), per(kCacheEpoch), per(kCacheBound), per(kCacheDepth), per(kCacheKeptRecheck), per(kCacheNoCache), per(kCacheSunDepth), per(kStreakFromBackup), per(kWalkJudged));
 		logger::info(
 			"per-frame spread over culled frames (min/avg/max, sd, avg change between consecutive frames): main view kept {} | other views' registrations {} | rejected {} | confirming (verdict flips) {}",
 			g_spreadKept.Describe(), g_spreadOther.Describe(), g_spreadRejected.Describe(), g_spreadConfirming.Describe());

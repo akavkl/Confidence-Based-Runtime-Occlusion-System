@@ -43,6 +43,7 @@ namespace CBRO::Core::HiZ
 		// later frame's view can be placed on this depth frame.
 		bool         footprint{ false };
 		bool         looseFit{ false };  // the rotation matches the render basis only within ~5.7 deg (e.g. caught mid-turn)
+		bool         sameOrientation{ false };  // ... within ~0.1 deg: drawn from the NiCamera's own orientation, not a frame behind it
 		std::uint8_t axisReadings{ 0 };
 		std::int8_t  axisIndex[2][3]{};
 		std::int8_t  axisSign[2][3]{};

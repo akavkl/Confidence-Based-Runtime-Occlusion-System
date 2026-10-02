@@ -424,6 +424,7 @@ namespace CBRO::Core::Runtime
 			float         rotate[3][3]{};
 			bool          known{ false };
 			std::uint32_t frames{ 0 };
+			float         lastTurn{ 0.0f };  // radians the NiCamera turned since the previous frame's cull
 		};
 		Stillness g_stillness;
 
@@ -446,6 +447,7 @@ namespace CBRO::Core::Runtime
 			// Same threshold as the still view: ||dR|| ~ sqrt(2) * angle for small turns.
 			const bool still = g_stillness.known && squared < 2.0f * 0.0002f * 0.0002f;
 			g_stillness.frames = still ? g_stillness.frames + 1 : 0;
+			g_stillness.lastTurn = g_stillness.known ? 2.0f * std::asin(std::min(1.0f, std::sqrt(squared) / 2.8284271f)) : 0.0f;
 			g_stillness.known = true;
 		}
 
@@ -464,6 +466,7 @@ namespace CBRO::Core::Runtime
 			bool  columns{ true };
 			int   index[3]{};  // viewDir, viewRight, viewUp
 			float sign[3]{};
+			float fit{ 0.0f };  // the worst axis' |dot| with the render basis
 		};
 
 		enum class FrustumUnits
@@ -479,10 +482,14 @@ namespace CBRO::Core::Runtime
 			kStill,              // used: camera still, same zoom
 			kTurned,             // used: turned camera, one reading of its rotation fits
 			kTurnedBoth,         // used: turned camera, union of both readings (facing along a world axis)
+			kTrailing,           // capture: drawn from the previous frame's orientation (mid-turn), off by that turn
+			kTrailingBeyond,     // capture: mid-turn, but off by more than the NiCamera's last turn (counted only)
 			kAxesNoFit,          // capture: no reading of the rotation matches the render basis
+			kOffsetStill,        // capture: the NiCamera still, yet the render basis off it (no footprint)
 			kUnitsUnknown,       // capture: frustum values don't match the projection in any known unit
 			kTangentMismatch,    // capture: frustum and projection disagree this frame
 			kNoMapping,          // frame: turned, but the depth frame's capture had no usable mapping
+			kCheckFailed,        // frame: the self-check refused the placed view
 			kTurnedOff,          // frame: turned, and turned views were switched off by the self-check
 			kSideways,           // frame: turned so far the view leaves the depth frame's hemisphere
 			kImplausible,        // frame: frustum values out of range
@@ -491,12 +498,14 @@ namespace CBRO::Core::Runtime
 
 		struct Footprint
 		{
-			FrustumUnits units{ FrustumUnits::kUnknown };
-			bool         disabled{ false };
-			bool         announced{ false };
-			float        lastView[4]{};
-			float        lastAngle{ 0.0f };
-			bool         lastValid{ false };
+			FrustumUnits  units{ FrustumUnits::kUnknown };
+			bool          disabled{ false };
+			bool          announced{ false };
+			float         lastView[4]{};
+			float         lastAngle{ 0.0f };
+			bool          lastValid{ false };
+			std::uint32_t strikes{ 0 };        // depth frames in a row whose view failed the self-check
+			std::uint64_t strikeCapture{ 0 };  // the last of them
 			std::array<std::uint32_t, kReasonCount> reasons{};
 		};
 		Footprint g_footprint;
@@ -521,9 +530,11 @@ namespace CBRO::Core::Runtime
 			return a_columns ? a_rotate[a_component][a_axis] : a_rotate[a_axis][a_component];
 		}
 
-		// Rotation vs render basis agreement: strict (~0.8 deg) means the NiCamera and the render camera
-		// describe the same orientation; loose (~5.7 deg) only that they are close, e.g. one of them a
-		// frame behind while turning.
+		// Rotation vs render basis agreement: same (~0.1 deg) means the depth was drawn from the NiCamera's
+		// own orientation; strict (~0.8 deg) that the reading is right, though the render camera may be a
+		// frame behind a turning NiCamera (FO4-ENGINE-NOTES); loose (~5.7 deg) only that they are close.
+		constexpr float kSameFit = 0.9999985f;
+		constexpr float kSameAngle = 0.0017453f;  // (the same ~0.1 deg, in radians)
 		constexpr float kStrictFit = 0.9999f;
 		constexpr float kLooseFit = 0.995f;
 
@@ -532,6 +543,7 @@ namespace CBRO::Core::Runtime
 			const float* basis[3]{ a_camera.viewDir, a_camera.viewRight, a_camera.viewUp };
 			AxisMap      map{};
 			map.columns = a_columns;
+			map.fit = 1.0f;
 			for (int b = 0; b < 3; ++b) {
 				float best = 0.0f;
 				for (int k = 0; k < 3; ++k) {
@@ -548,6 +560,7 @@ namespace CBRO::Core::Runtime
 				if (best < a_threshold) {
 					return false;
 				}
+				map.fit = std::min(map.fit, best);
 			}
 			if (map.index[0] == map.index[1] || map.index[0] == map.index[2] || map.index[1] == map.index[2]) {
 				return false;
@@ -579,6 +592,7 @@ namespace CBRO::Core::Runtime
 		{
 			a_camera.footprint = false;
 			a_camera.looseFit = false;
+			a_camera.sameOrientation = false;
 			a_camera.axisReadings = 0;
 			const auto root = RE::Main::WorldRootCamera();
 			if (!root) {
@@ -592,9 +606,10 @@ namespace CBRO::Core::Runtime
 			AxisMap loose{};
 			a_camera.looseFit = MatchAxes(a_camera, true, kLooseFit, loose) || MatchAxes(a_camera, false, kLooseFit, loose);
 
-			// Which readings of the rotation reproduce the render basis exactly this frame (both when
-			// facing along a world axis); each fitting one is kept with the depth frame.
+			// Which readings of the rotation reproduce the render basis this frame (both when facing
+			// along a world axis); each fitting one is kept with the depth frame.
 			AxisMap first{};
+			float   fit = 0.0f;
 			for (int reading = 0; reading < 2; ++reading) {
 				AxisMap map{};
 				if (!MatchAxes(a_camera, reading == 0, kStrictFit, map)) {
@@ -608,10 +623,23 @@ namespace CBRO::Core::Runtime
 				if (!first.valid) {
 					first = map;
 				}
+				fit = std::max(fit, map.fit);
 			}
 			if (!a_camera.axisReadings) {
 				++g_footprint.reasons[kAxesNoFit];
 				return;
+			}
+			// Caught mid-turn, the depth was drawn from the previous frame's orientation (the render camera
+			// trails the NiCamera by a frame): the footprint, which maps the NiCamera, then places a still view
+			// off the frame by that turn, rightly. An offset with the NiCamera still for frames can't be that
+			// lag, and would misplace every view placed from this capture.
+			a_camera.sameOrientation = fit >= kSameFit;
+			if (!a_camera.sameOrientation) {
+				if (g_stillness.frames >= 3) {
+					++g_footprint.reasons[kOffsetStill];
+					return;
+				}
+				++g_footprint.reasons[std::acos(fit) <= g_stillness.lastTurn + kSameAngle ? kTrailing : kTrailingBeyond];
 			}
 
 			const auto close = [](float a_value) { return std::abs(a_value - 1.0f) < 0.03f; };
@@ -649,8 +677,9 @@ namespace CBRO::Core::Runtime
 		}
 
 		// At cull time: where the current view lands on the depth frame (NDC box), or false if unknown.
-		// a_stillFrames: consecutive frames the NiCamera hasn't turned; a_age: frames since the capture.
-		bool CurrentView(const HiZ::Camera& a_then, float a_angle, std::uint32_t a_stillFrames, std::uint64_t a_age, float a_out[4])
+		// a_stillFrames: consecutive frames the NiCamera hasn't turned; a_age: frames since the capture
+		// (a_capture: its frame).
+		bool CurrentView(const HiZ::Camera& a_then, float a_angle, std::uint32_t a_stillFrames, std::uint64_t a_age, std::uint64_t a_capture, float a_out[4])
 		{
 			const auto root = RE::Main::WorldRootCamera();
 			if (!root) {
@@ -666,11 +695,12 @@ namespace CBRO::Core::Runtime
 
 			// Not turned (well under a pixel) and not zoomed: the view is the depth frame itself, provided
 			// the depth frame was rendered from this orientation too. That holds if the render camera
-			// matched the NiCamera exactly at capture, or if the camera had already been still for longer
-			// than the capture is old (covers a render camera trailing the NiCamera by a frame).
+			// matched the NiCamera at capture (same orientation, not merely the strict fit: caught mid-turn
+			// it trails by up to the fit's ~0.8 deg, and its view is placed below), or if the camera had
+			// already been still for longer than the capture is old.
 			constexpr float kStillAngle = 0.0002f;  // radians, ~0.01 degrees
 			const bool      sameZoom = std::abs(fx / a_then.frustumX - 1.0f) < 0.002f && std::abs(fy / a_then.frustumY - 1.0f) < 0.002f;
-			const bool      renderedHere = a_then.axisReadings != 0 || (a_then.looseFit && a_stillFrames >= a_age + 2);
+			const bool      renderedHere = a_then.sameOrientation || (a_then.looseFit && a_stillFrames >= a_age + 2);
 			if (a_angle < kStillAngle && sameZoom && renderedHere) {
 				a_out[0] = -1.0f;
 				a_out[1] = 1.0f;
@@ -736,15 +766,31 @@ namespace CBRO::Core::Runtime
 			}
 
 			// Self-check: barely turned at the same zoom, a single-reading view must sit on the depth frame.
-			// (With both readings the box is the union of two mirrored guesses and is wide on purpose.)
+			// (With both readings the box is the union of two mirrored guesses and is wide on purpose.) Only
+			// from a capture drawn from the NiCamera's own orientation: one caught mid-turn is off the frame by
+			// that turn, rightly. v1.58 checked those too: one failed (0.049 deg turned, view [-1.008,0.996] x
+			// [-1.034,0.969]) and switched turned views off for the session, which left the async worker no
+			// view at all (every object crossing the screen edge kept, nothing out of view: exteriors drew up
+			// to 10x previs's main view, and their sun shadows). A failure now refuses this frame's view; only
+			// depth frames failing in a row switch turned views off.
+			constexpr std::uint32_t kStrikes = 3;
+			if (g_footprint.strikes > 0 && a_capture == g_footprint.strikeCapture) {
+				++g_footprint.reasons[kCheckFailed];
+				return false;  // (this depth frame failed on an earlier frame)
+			}
 			const bool single = a_then.axisReadings == 1 || a_then.axisReadings == 2;
-			if (single && a_angle < 0.002f && sameZoom &&
-				(std::abs(x0 + 1.0f) > 0.03f || std::abs(x1 - 1.0f) > 0.03f || std::abs(y0 + 1.0f) > 0.03f || std::abs(y1 - 1.0f) > 0.03f)) {
-				g_footprint.disabled = true;
-				logger::error(
-					"view footprint: self-check failed (camera turned {:.3f} deg, view [{:.3f},{:.3f}]x[{:.3f},{:.3f}] instead of ~[-1,1]); turned views are no longer placed (a still camera still judges edge objects)",
-					a_angle * 180.0f / 3.14159265f, x0, x1, y0, y1);
-				return false;
+			if (single && a_then.sameOrientation && a_angle < 0.002f && sameZoom) {
+				if (std::abs(x0 + 1.0f) > 0.03f || std::abs(x1 - 1.0f) > 0.03f || std::abs(y0 + 1.0f) > 0.03f || std::abs(y1 - 1.0f) > 0.03f) {
+					++g_footprint.reasons[kCheckFailed];
+					g_footprint.strikeCapture = a_capture;
+					g_footprint.disabled = ++g_footprint.strikes >= kStrikes;
+					logger::warn(
+						"view footprint: self-check failed on depth frame {} ({}/{} in a row: camera turned {:.3f} deg, view [{:.3f},{:.3f}]x[{:.3f},{:.3f}] instead of ~[-1,1]); {}",
+						a_capture, g_footprint.strikes, kStrikes, a_angle * 180.0f / 3.14159265f, x0, x1, y0, y1,
+						g_footprint.disabled ? "turned views are no longer placed (a still camera still judges edge objects)" : "no view placed from it");
+					return false;
+				}
+				g_footprint.strikes = 0;
 			}
 
 			// A small numeric margin, but never past a frame edge the view doesn't really cross (a margin
@@ -1202,8 +1248,6 @@ namespace CBRO::Core::Runtime
 		{
 			Occlusion::FrameContext context{};   // this frame's (as given to Occlusion::BeginFrame)
 			Async::Pose             pose{};      // the camera at this frame's cull begin
-			float                   angle{ 0.0f };  // turn since the depth frame (for the widened view box)
-			std::uint64_t           age{ 0 };
 			bool                    lastKnown{ false };
 			Async::Pose             last{};      // last frame's camera (the frame's own motion)
 			float                   moveMargin{ 0.0f };
@@ -1456,8 +1500,8 @@ namespace CBRO::Core::Runtime
 			}
 			const auto& r = g_footprint.reasons;
 			logger::info(
-				"view footprint per interval: still {} | turned {} | turned (both readings) {} || unusable: capture no exact fit {} / frustum units {} / frustum mismatch {} | frame no mapping {} / turned views off {} / sideways {} / implausible {}",
-				r[kStill], r[kTurned], r[kTurnedBoth], r[kAxesNoFit], r[kUnitsUnknown], r[kTangentMismatch], r[kNoMapping], r[kTurnedOff], r[kSideways], r[kImplausible]);
+				"view footprint per interval: still {} | turned {} | turned (both readings) {} || captures drawn a frame behind the NiCamera (mid-turn) {}, off by more than its last turn {} || unusable: capture no axis fit {} / offset with the camera still {} / frustum units {} / frustum mismatch {} | frame no mapping {} / self-check failed {} / turned views off {} / sideways {} / implausible {}",
+				r[kStill], r[kTurned], r[kTurnedBoth], r[kTrailing], r[kTrailingBeyond], r[kAxesNoFit], r[kOffsetStill], r[kUnitsUnknown], r[kTangentMismatch], r[kNoMapping], r[kCheckFailed], r[kTurnedOff], r[kSideways], r[kImplausible]);
 			g_footprint.reasons = {};
 			Timing next{};
 			next.marks = g_timing.marks;
@@ -1794,9 +1838,7 @@ namespace CBRO::Core::Runtime
 					context.blocksW = blocks.width;
 					context.blocksH = blocks.height;
 				}
-				g_footprint.lastValid = CurrentView(snapshot->camera, angle, g_stillness.frames, age, context.view);
-				g_asyncFrame.angle = angle;
-				g_asyncFrame.age = age;
+				g_footprint.lastValid = CurrentView(snapshot->camera, angle, g_stillness.frames, age, snapshot->frame, context.view);
 				if (g_footprint.lastValid) {
 					std::copy_n(context.view, 4, g_footprint.lastView);
 					g_footprint.lastAngle = angle;
@@ -1995,21 +2037,15 @@ namespace CBRO::Core::Runtime
 						const auto root = RE::Main::WorldRootCamera();
 						SetDiff::EndCull(CurrentMode(), settled, root ? root->world.translate : RE::NiPoint3{});
 					}
-					// Asynchronous verdicts: this frame's candidates go to the worker with this frame's context, dilated and
-					// widened for the next frame's camera (the walk is done: every candidate is recorded).
+					// Asynchronous verdicts: this frame's candidates go to the worker with this frame's context, dilated for
+					// the next frame's camera (the walk is done: every candidate is recorded). The view stays this frame's,
+					// placed once at the cull begin, still or turned. (Up to v1.58 the worker placed its own, always as a
+					// turned view: it never took the still path, so with turned views switched off it had none, and every
+					// object crossing the screen edge stayed drawn. Nor is the view widened by the turn margin: that would
+					// leave every such object unjudged with the camera still.)
 					if (Async::Enabled() && g_state.cullingThisFrame && g_asyncFrame.context.asyncFrame && g_asyncFrame.context.snapshot) {
 						auto worker = g_asyncFrame.context;
 						worker.dilateMove += g_asyncFrame.moveMargin;
-						float wide[4];
-						if (CurrentView(worker.snapshot->camera, g_asyncFrame.angle + g_asyncFrame.turnMargin, 0, g_asyncFrame.age, wide)) {
-							std::copy_n(wide, 4, worker.view);
-						} else {
-							constexpr float inf = std::numeric_limits<float>::infinity();
-							worker.view[0] = -inf;
-							worker.view[1] = inf;
-							worker.view[2] = -inf;
-							worker.view[3] = inf;
-						}
 						worker.asyncValid = false;
 						Occlusion::PrepareContext(worker);
 						Async::Submit(worker, g_asyncFrame.pose, g_asyncFrame.moveMargin, g_asyncFrame.turnMargin);
