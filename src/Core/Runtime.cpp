@@ -259,13 +259,20 @@ namespace CBRO::Core::Runtime
 			// cubemaps) overwrite cameraState, so take the world camera's own cache entry (unjittered
 			// preferred), as the Upscaling mod does. No entry: skip this capture.
 			const CBRO::Engine::BSGraphics::CameraStateData* selected = nullptr;
+			std::uint8_t                                     entries = 0;
 			for (const auto& candidate : state->cameraDataCache) {
-				if (candidate.referenceCamera == root && (!selected || (selected->useJitter && !candidate.useJitter))) {
-					selected = std::addressof(candidate);
+				if (candidate.referenceCamera == root) {
+					entries = static_cast<std::uint8_t>(std::min(entries + 1, 255));
+					if (!selected || (selected->useJitter && !candidate.useJitter)) {
+						selected = std::addressof(candidate);
+					}
 				}
 			}
+			a_camera.cameraEntries = entries;
+			a_camera.cameraSource = selected ? (selected->useJitter ? 2 : 1) : 0;
 			if (!selected && state->cameraState.referenceCamera == root) {
 				selected = std::addressof(state->cameraState);
+				a_camera.cameraSource = 3;
 			}
 			if (!selected) {
 				return false;
@@ -350,6 +357,7 @@ namespace CBRO::Core::Runtime
 			bool          viewKnown{ false };
 			float         eye[3]{};
 			float         rotate[3][3]{};
+			float         zoom[2]{};  // the frustum half-extents (zoom) of the depth frame's camera when the epoch began
 			std::uint32_t viewEpoch{ 1 };
 			int           sunState{ -1 };
 			float         sunDir[3]{};
@@ -379,9 +387,15 @@ namespace CBRO::Core::Runtime
 			return std::sqrt(dx * dx + dy * dy + dz * dz);
 		}
 
-		void UpdateViewEpoch(const HiZ::Camera& a_camera, float a_tolMove, float a_tolAngle)
+		// a_zoom: the NiCamera's frustum half-extents now. A zoom change ends the epoch too (v1.65): up to v1.64 the
+		// verdicts judged in a scope's narrow view were reused after zooming out with the camera still, so objects
+		// "out of view" there (left out of the walk, or out of group 0) could stay undrawn.
+		void UpdateViewEpoch(const HiZ::Camera& a_camera, const float a_zoom[2], float a_tolMove, float a_tolAngle)
 		{
-			bool  same = g_epochs.viewKnown && Distance3(a_camera.eye, g_epochs.eye) <= a_tolMove && RotationAngle(a_camera.rotate, g_epochs.rotate) <= a_tolAngle;
+			const auto sameZoom = [](float a_a, float a_b) { return std::abs(a_a - a_b) <= 0.002f * std::abs(a_b); };
+			bool       same = g_epochs.viewKnown && Distance3(a_camera.eye, g_epochs.eye) <= a_tolMove && RotationAngle(a_camera.rotate, g_epochs.rotate) <= a_tolAngle &&
+			            sameZoom(a_camera.frustumX, g_epochs.zoom[0]) && sameZoom(a_camera.frustumY, g_epochs.zoom[1]) && sameZoom(a_zoom[0], g_epochs.zoom[0]) &&
+			            sameZoom(a_zoom[1], g_epochs.zoom[1]);
 			if (same) {
 				if (const auto root = RE::Main::WorldRootCamera()) {
 					const float eye[3]{ root->world.translate.x, root->world.translate.y, root->world.translate.z };
@@ -399,6 +413,8 @@ namespace CBRO::Core::Runtime
 				++g_epochs.viewChanges;
 				std::copy_n(a_camera.eye, 3, g_epochs.eye);
 				std::memcpy(g_epochs.rotate, a_camera.rotate, sizeof(g_epochs.rotate));
+				g_epochs.zoom[0] = a_camera.frustumX;
+				g_epochs.zoom[1] = a_camera.frustumY;
 				g_epochs.viewKnown = true;
 			}
 		}
@@ -506,6 +522,7 @@ namespace CBRO::Core::Runtime
 			bool          lastValid{ false };
 			std::uint32_t strikes{ 0 };        // depth frames in a row whose view failed the self-check
 			std::uint64_t strikeCapture{ 0 };  // the last of them
+			bool          baselineLogged{ false };
 			std::array<std::uint32_t, kReasonCount> reasons{};
 		};
 		Footprint g_footprint;
@@ -586,6 +603,139 @@ namespace CBRO::Core::Runtime
 			a_y = std::max(std::abs(a_frustum.top), std::abs(a_frustum.bottom));
 		}
 
+		// The player camera's state and FOVs, read raw under SEH (PlayerCamera: currentState +0x28 ->
+		// TESCameraState::id +0x20; worldFOV +0x168, firstPersonFOV +0x16C, fovAdjustCurrent +0x170).
+		struct PlayerCameraView
+		{
+			std::uint8_t state{ 0xFF };
+			float        worldFOV{ 0.0f };
+			float        firstPersonFOV{ 0.0f };
+			float        fovAdjust{ 0.0f };
+
+			static PlayerCameraView Read() noexcept
+			{
+				PlayerCameraView view{};
+				const auto       camera = reinterpret_cast<const std::byte*>(RE::PlayerCamera::GetSingleton());
+				if (!camera) {
+					return view;
+				}
+				__try {
+					const auto state = *reinterpret_cast<const std::byte* const*>(camera + 0x28);
+					view.state = state ? static_cast<std::uint8_t>(*reinterpret_cast<const std::uint32_t*>(state + 0x20)) : 0xFF;
+					view.worldFOV = *reinterpret_cast<const float*>(camera + 0x168);
+					view.firstPersonFOV = *reinterpret_cast<const float*>(camera + 0x16C);
+					view.fovAdjust = *reinterpret_cast<const float*>(camera + 0x170);
+				} __except (EXCEPTION_EXECUTE_HANDLER) {
+					view = {};
+				}
+				return view;
+			}
+		};
+
+		std::string_view CameraStateName(std::uint8_t a_state) noexcept
+		{
+			static constexpr std::array kNames{
+				"first person"sv, "auto vanity"sv, "VATS"sv, "free"sv, "iron sights"sv, "PC transition"sv, "tween"sv,
+				"animated"sv, "third person"sv, "furniture"sv, "mount"sv, "bleedout"sv, "dialogue"sv
+			};
+			return a_state < kNames.size() ? kNames[a_state] : "unknown"sv;
+		}
+
+		// A NiCamera rotation's dir, right, up in the render basis' sense, under one reading of a capture's axis map.
+		void MappedBasis(const HiZ::Camera& a_then, int a_reading, const float a_rotate[3][3], float a_basis[3][3]) noexcept
+		{
+			for (int b = 0; b < 3; ++b) {
+				for (int c = 0; c < 3; ++c) {
+					a_basis[b][c] = a_then.axisSign[a_reading][b] * AxisComponent(a_rotate, a_reading == 0, a_then.axisIndex[a_reading][b], c);
+				}
+			}
+		}
+
+		// Where a frustum (tangents a_tx, a_ty) of that basis lands on the depth frame: the box is grown to cover its
+		// corner rays. False when a corner ray reaches sideways past the depth frame's image plane.
+		bool PlaceView(const HiZ::Camera& a_then, const float a_basis[3][3], float a_tx, float a_ty, float& a_x0, float& a_x1, float& a_y0, float& a_y1) noexcept
+		{
+			for (int corner = 0; corner < 4; ++corner) {
+				const float sx = (corner & 1) ? a_tx : -a_tx;
+				const float sy = (corner & 2) ? a_ty : -a_ty;
+				float       d[3];
+				for (int c = 0; c < 3; ++c) {
+					d[c] = a_basis[0][c] + a_basis[1][c] * sx + a_basis[2][c] * sy;
+				}
+				const float length = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+				const float z = d[0] * a_then.viewDir[0] + d[1] * a_then.viewDir[1] + d[2] * a_then.viewDir[2];
+				if (z < 0.05f * length) {
+					return false;
+				}
+				const float x = d[0] * a_then.viewRight[0] + d[1] * a_then.viewRight[1] + d[2] * a_then.viewRight[2];
+				const float y = d[0] * a_then.viewUp[0] + d[1] * a_then.viewUp[1] + d[2] * a_then.viewUp[2];
+				a_x0 = std::min(a_x0, a_then.scaleX * x / z);
+				a_x1 = std::max(a_x1, a_then.scaleX * x / z);
+				a_y0 = std::min(a_y0, a_then.scaleY * y / z);
+				a_y1 = std::max(a_y1, a_then.scaleY * y / z);
+			}
+			return true;
+		}
+
+		// Yaw, pitch, roll (degrees) of basis a_b against basis a_a, both {dir, right, up}.
+		void TurnBetween(const float a_a[3][3], const float a_b[3][3], float a_out[3]) noexcept
+		{
+			const auto dot = [](const float* a_u, const float* a_v) { return a_u[0] * a_v[0] + a_u[1] * a_v[1] + a_u[2] * a_v[2]; };
+			constexpr float toDegrees = 180.0f / 3.14159265f;
+			a_out[0] = std::atan2(dot(a_b[0], a_a[1]), dot(a_b[0], a_a[0])) * toDegrees;
+			a_out[1] = std::atan2(dot(a_b[0], a_a[2]), dot(a_b[0], a_a[0])) * toDegrees;
+			a_out[2] = std::atan2(dot(a_b[1], a_a[2]), dot(a_b[1], a_a[1])) * toDegrees;
+		}
+
+		// What a self-check saw (its failures, and the first pass of the session as a baseline): enough to tell a
+		// wrong axis map, an off-centre or asymmetric frustum, a camera state, or a stale camera entry apart.
+		void LogCheckDetail(const char* a_what, const HiZ::Camera& a_then, const float a_rotate[3][3], const Frustum& a_frustum, float a_tx, float a_ty,
+			std::uint32_t a_stillFrames, std::uint64_t a_age, std::uint64_t a_capture) noexcept
+		{
+			const int reading = (a_then.axisReadings & 1) ? 0 : 1;
+			float     now[3][3], then[3][3];
+			MappedBasis(a_then, reading, a_rotate, now);
+			MappedBasis(a_then, reading, a_then.rotate, then);
+			const float render[3][3]{
+				{ a_then.viewDir[0], a_then.viewDir[1], a_then.viewDir[2] },
+				{ a_then.viewRight[0], a_then.viewRight[1], a_then.viewRight[2] },
+				{ a_then.viewUp[0], a_then.viewUp[1], a_then.viewUp[2] }
+			};
+			float sinceCapture[3], captureVsRender[3], nowVsRender[3];
+			TurnBetween(then, now, sinceCapture);
+			TurnBetween(render, then, captureVsRender);
+			TurnBetween(render, now, nowVsRender);
+
+			// The capture's own NiCamera placed the same way: with this frame's tangents, and with the capture's.
+			constexpr float inf = std::numeric_limits<float>::infinity();
+			float           own[4]{ inf, -inf, inf, -inf }, ownThen[4]{ inf, -inf, inf, -inf };
+			const bool      ownOk = PlaceView(a_then, then, a_tx, a_ty, own[0], own[1], own[2], own[3]);
+			float           ttx = std::max(std::abs(a_then.frustumRaw[0]), std::abs(a_then.frustumRaw[1]));
+			float           tty = std::max(std::abs(a_then.frustumRaw[2]), std::abs(a_then.frustumRaw[3]));
+			if (g_footprint.units == FrustumUnits::kNearPlane && a_frustum.nearPlane > 0.0f) {
+				ttx /= a_frustum.nearPlane;  // (the capture's near plane isn't kept; it doesn't change with the FOV)
+				tty /= a_frustum.nearPlane;
+			}
+			const bool ownThenOk = PlaceView(a_then, then, ttx, tty, ownThen[0], ownThen[1], ownThen[2], ownThen[3]);
+			const auto player = PlayerCameraView::Read();
+			logger::info(
+				"view footprint self-check {} on depth frame {} (age {}, NiCamera still {} frames, last turn {:.3f} deg): capture fit {:.3f} deg ({} reading{}, map dir {}{} right {}{} up {}{}), "
+				"camera data {} ({} entries for the world camera), view axis at NDC ({:.4f},{:.4f}), scale ({:.4f},{:.4f}) | frustum l/r/t/b then ({:.4f},{:.4f},{:.4f},{:.4f}) now ({:.4f},{:.4f},{:.4f},{:.4f}) near {:.2f} | "
+				"capture's own NiCamera on its depth frame: [{:.3f},{:.3f}]x[{:.3f},{:.3f}]{} with today's frustum, [{:.3f},{:.3f}]x[{:.3f},{:.3f}]{} with its own | "
+				"turn yaw/pitch/roll (deg): NiCamera since capture ({:.3f},{:.3f},{:.3f}), capture NiCamera vs render ({:.3f},{:.3f},{:.3f}), NiCamera now vs render ({:.3f},{:.3f},{:.3f}) | "
+				"player camera: {} then, {} now, FOV world {:.2f} first person {:.2f} adjust {:.3f}",
+				a_what, a_capture, a_age, a_stillFrames, g_stillness.lastTurn * 180.0f / 3.14159265f, a_then.fitAngle,
+				reading == 0 ? "columns" : "rows", a_then.axisReadings == 3 ? " (both fit)" : "",
+				a_then.axisSign[reading][0] < 0 ? "-" : "+", a_then.axisIndex[reading][0], a_then.axisSign[reading][1] < 0 ? "-" : "+", a_then.axisIndex[reading][1],
+				a_then.axisSign[reading][2] < 0 ? "-" : "+", a_then.axisIndex[reading][2],
+				a_then.cameraSource == 1 ? "cache entry (unjittered)" : a_then.cameraSource == 2 ? "cache entry (jittered)" : a_then.cameraSource == 3 ? "cameraState" : "?",
+				a_then.cameraEntries, a_then.axisNdc[0], a_then.axisNdc[1], a_then.scaleX, a_then.scaleY,
+				a_then.frustumRaw[0], a_then.frustumRaw[1], a_then.frustumRaw[2], a_then.frustumRaw[3], a_frustum.left, a_frustum.right, a_frustum.top, a_frustum.bottom, a_frustum.nearPlane,
+				own[0], own[1], own[2], own[3], ownOk ? "" : " (sideways)", ownThen[0], ownThen[1], ownThen[2], ownThen[3], ownThenOk ? "" : " (sideways)",
+				sinceCapture[0], sinceCapture[1], sinceCapture[2], captureVsRender[0], captureVsRender[1], captureVsRender[2], nowVsRender[0], nowVsRender[1], nowVsRender[2],
+				CameraStateName(a_then.cameraState), CameraStateName(player.state), player.worldFOV, player.firstPersonFOV, player.fovAdjust);
+		}
+
 		// At capture: record the zoom, and check whether the WorldRoot camera's rotation can be mapped
 		// onto the render camera this depth was drawn with.
 		void CheckFootprint(HiZ::Camera& a_camera)
@@ -600,8 +750,21 @@ namespace CBRO::Core::Runtime
 			}
 			const auto frustum = ReadFrustum(root);
 			FrustumExtents(frustum, a_camera.frustumX, a_camera.frustumY);
+			a_camera.frustumRaw[0] = frustum.left;
+			a_camera.frustumRaw[1] = frustum.right;
+			a_camera.frustumRaw[2] = frustum.top;
+			a_camera.frustumRaw[3] = frustum.bottom;
+			a_camera.cameraState = PlayerCameraView::Read().state;
 			if (!a_camera.viewSpace) {
 				return;
+			}
+			{
+				const float ahead[3]{ a_camera.origin[0] + a_camera.viewDir[0] * 1000.0f, a_camera.origin[1] + a_camera.viewDir[1] * 1000.0f,
+					a_camera.origin[2] + a_camera.viewDir[2] * 1000.0f };
+				float clip[4];
+				ProjectBaked(a_camera, ahead, clip);
+				a_camera.axisNdc[0] = clip[3] != 0.0f ? clip[0] / clip[3] : 0.0f;
+				a_camera.axisNdc[1] = clip[3] != 0.0f ? clip[1] / clip[3] : 0.0f;
 			}
 			AxisMap loose{};
 			a_camera.looseFit = MatchAxes(a_camera, true, kLooseFit, loose) || MatchAxes(a_camera, false, kLooseFit, loose);
@@ -634,6 +797,7 @@ namespace CBRO::Core::Runtime
 			// off the frame by that turn, rightly. An offset with the NiCamera still for frames can't be that
 			// lag, and would misplace every view placed from this capture.
 			a_camera.sameOrientation = fit >= kSameFit;
+			a_camera.fitAngle = std::acos(std::min(fit, 1.0f)) * 180.0f / 3.14159265f;
 			if (!a_camera.sameOrientation) {
 				if (g_stillness.frames >= 3) {
 					++g_footprint.reasons[kOffsetStill];
@@ -697,11 +861,14 @@ namespace CBRO::Core::Runtime
 			// the depth frame was rendered from this orientation too. That holds if the render camera
 			// matched the NiCamera at capture (same orientation, not merely the strict fit: caught mid-turn
 			// it trails by up to the fit's ~0.8 deg, and its view is placed below), or if the camera had
-			// already been still for longer than the capture is old.
-			constexpr float kStillAngle = 0.0002f;  // radians, ~0.01 degrees
+			// already been still for longer than the capture is old. Turns count by how far they move the view
+			// (NDC) at this zoom: a scope's ~5-degree view (scale ~40) moves 0.04 NDC for a 0.1-degree turn.
+			constexpr float kStillShift = 0.0005f;  // NDC: ~0.013 degrees at the default FOV
+			const float     maxScale = std::max(a_then.scaleX, a_then.scaleY);
+			const float     shift = a_angle * maxScale;
 			const bool      sameZoom = std::abs(fx / a_then.frustumX - 1.0f) < 0.002f && std::abs(fy / a_then.frustumY - 1.0f) < 0.002f;
 			const bool      renderedHere = a_then.sameOrientation || (a_then.looseFit && a_stillFrames >= a_age + 2);
-			if (a_angle < kStillAngle && sameZoom && renderedHere) {
+			if (shift < kStillShift && sameZoom && renderedHere) {
 				a_out[0] = -1.0f;
 				a_out[1] = 1.0f;
 				a_out[2] = -1.0f;
@@ -738,30 +905,10 @@ namespace CBRO::Core::Runtime
 					continue;
 				}
 				float basis[3][3];  // dir, right, up of the current camera, in the render basis' sense
-				for (int b = 0; b < 3; ++b) {
-					for (int c = 0; c < 3; ++c) {
-						basis[b][c] = a_then.axisSign[reading][b] * AxisComponent(rotate, reading == 0, a_then.axisIndex[reading][b], c);
-					}
-				}
-				for (int corner = 0; corner < 4; ++corner) {
-					const float sx = (corner & 1) ? tx : -tx;
-					const float sy = (corner & 2) ? ty : -ty;
-					float       d[3];
-					for (int c = 0; c < 3; ++c) {
-						d[c] = basis[0][c] + basis[1][c] * sx + basis[2][c] * sy;
-					}
-					const float length = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-					const float z = d[0] * a_then.viewDir[0] + d[1] * a_then.viewDir[1] + d[2] * a_then.viewDir[2];
-					if (z < 0.05f * length) {
-						++g_footprint.reasons[kSideways];
-						return false;  // the view reaches sideways past the depth frame's image plane
-					}
-					const float x = d[0] * a_then.viewRight[0] + d[1] * a_then.viewRight[1] + d[2] * a_then.viewRight[2];
-					const float y = d[0] * a_then.viewUp[0] + d[1] * a_then.viewUp[1] + d[2] * a_then.viewUp[2];
-					x0 = std::min(x0, a_then.scaleX * x / z);
-					x1 = std::max(x1, a_then.scaleX * x / z);
-					y0 = std::min(y0, a_then.scaleY * y / z);
-					y1 = std::max(y1, a_then.scaleY * y / z);
+				MappedBasis(a_then, reading, rotate, basis);
+				if (!PlaceView(a_then, basis, tx, ty, x0, x1, y0, y1)) {
+					++g_footprint.reasons[kSideways];
+					return false;  // the view reaches sideways past the depth frame's image plane
 				}
 			}
 
@@ -772,15 +919,20 @@ namespace CBRO::Core::Runtime
 			// [-1.034,0.969]) and switched turned views off for the session, which left the async worker no
 			// view at all (every object crossing the screen edge kept, nothing out of view: exteriors drew up
 			// to 10x previs's main view, and their sun shadows). A failure now refuses this frame's view; only
-			// depth frames failing in a row switch turned views off.
+			// depth frames failing in a row switch turned views off. "Barely turned" and the tolerance are in
+			// NDC at this zoom (the turn and the capture's fit, times the projection scale; 1.5 covers the
+			// edges' stretch): v1.61-v1.63 measured them in degrees, and a zoomed third-person view (world FOV
+			// 5, scale 25 x 40) that turned 0.1 deg moved the view 0.043 NDC, rightly, but failed three depth
+			// frames in a row and switched turned views off.
 			constexpr std::uint32_t kStrikes = 3;
 			if (g_footprint.strikes > 0 && a_capture == g_footprint.strikeCapture) {
 				++g_footprint.reasons[kCheckFailed];
 				return false;  // (this depth frame failed on an earlier frame)
 			}
-			const bool single = a_then.axisReadings == 1 || a_then.axisReadings == 2;
-			if (single && a_then.sameOrientation && a_angle < 0.002f && sameZoom) {
-				if (std::abs(x0 + 1.0f) > 0.03f || std::abs(x1 - 1.0f) > 0.03f || std::abs(y0 + 1.0f) > 0.03f || std::abs(y1 - 1.0f) > 0.03f) {
+			const bool  single = a_then.axisReadings == 1 || a_then.axisReadings == 2;
+			const float tolerance = 0.03f + 1.5f * (a_angle + a_then.fitAngle * 3.14159265f / 180.0f) * maxScale;
+			if (single && a_then.sameOrientation && shift < 0.004f && sameZoom) {
+				if (std::abs(x0 + 1.0f) > tolerance || std::abs(x1 - 1.0f) > tolerance || std::abs(y0 + 1.0f) > tolerance || std::abs(y1 - 1.0f) > tolerance) {
 					++g_footprint.reasons[kCheckFailed];
 					g_footprint.strikeCapture = a_capture;
 					g_footprint.disabled = ++g_footprint.strikes >= kStrikes;
@@ -788,9 +940,14 @@ namespace CBRO::Core::Runtime
 						"view footprint: self-check failed on depth frame {} ({}/{} in a row: camera turned {:.3f} deg, view [{:.3f},{:.3f}]x[{:.3f},{:.3f}] instead of ~[-1,1]); {}",
 						a_capture, g_footprint.strikes, kStrikes, a_angle * 180.0f / 3.14159265f, x0, x1, y0, y1,
 						g_footprint.disabled ? "turned views are no longer placed (a still camera still judges edge objects)" : "no view placed from it");
+					LogCheckDetail("failed", a_then, rotate, frustum, tx, ty, a_stillFrames, a_age, a_capture);
 					return false;
 				}
 				g_footprint.strikes = 0;
+				if (!g_footprint.baselineLogged) {
+					g_footprint.baselineLogged = true;
+					LogCheckDetail("passed (first of the session, for comparison)", a_then, rotate, frustum, tx, ty, a_stillFrames, a_age, a_capture);
+				}
 			}
 
 			// A small numeric margin, but never past a frame edge the view doesn't really cross (a margin
@@ -1276,6 +1433,7 @@ namespace CBRO::Core::Runtime
 					a_out.rotate[r][c] = root->world.rotate.entry[r].pt[c];
 				}
 			}
+			FrustumExtents(ReadFrustum(root), a_out.zoom[0], a_out.zoom[1]);
 			return true;
 		}
 
@@ -1825,7 +1983,11 @@ namespace CBRO::Core::Runtime
 				context.dilateMove = move + snapshot->mergeMove + 1.0f;  // (older merged frames' cameras lie within mergeMove of this one)
 				if (settings.verdictCache) {
 					const float toRadians = 3.14159265f / 180.0f;
-					UpdateViewEpoch(snapshot->camera, settings.cacheMove * 0.5f, settings.cacheAngle * 0.5f * toRadians);
+					float zoom[2]{};
+					if (const auto root = RE::Main::WorldRootCamera()) {
+						FrustumExtents(ReadFrustum(root), zoom[0], zoom[1]);
+					}
+					UpdateViewEpoch(snapshot->camera, zoom, settings.cacheMove * 0.5f, settings.cacheAngle * 0.5f * toRadians);
 					context.cacheEnabled = true;
 					context.viewEpoch = g_epochs.viewEpoch;
 					// Bounds grow by the whole tolerance (and by depth x the turn tolerance in the tests) so a verdict
@@ -1891,6 +2053,16 @@ namespace CBRO::Core::Runtime
 				g_asyncFrame.lastKnown = known;
 				g_asyncFrame.moveMargin = std::clamp(2.0f * frameMove + 4.0f, 6.0f, 48.0f);
 				g_asyncFrame.turnMargin = std::clamp(2.0f * frameTurn + 0.5f * 3.14159265f / 180.0f, 1.0f * 3.14159265f / 180.0f, 8.0f * 3.14159265f / 180.0f);
+				// Zoomed in (scopes, a zoomed third-person view), a degree moves the view much farther across the screen:
+				// the margin shrinks with the zoom, so a map is reused only for as much on-screen motion as at the
+				// default FOV (projection scale ~2.1 there; a 5-degree view has ~40, where 1 degree is half the screen).
+				if (snapshot && snapshot->camera.viewSpace) {
+					constexpr float kDefaultScale = 2.2f;
+					const float     scale = std::max(snapshot->camera.scaleX, snapshot->camera.scaleY);
+					if (scale > kDefaultScale) {
+						g_asyncFrame.turnMargin *= kDefaultScale / scale;
+					}
+				}
 			}
 			ShadowLights::PublishLamps();  // last frame's shadow-casting lamps, for group 0 with the sun off
 			if (settings.unoccludeLights && Occlusion::Active() && g_state.hooksIn) {

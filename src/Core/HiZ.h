@@ -49,6 +49,14 @@ namespace CBRO::Core::HiZ
 		std::int8_t  axisSign[2][3]{};
 		float        frustumX{ 0.0f };  // WorldRoot NiCamera frustum half-extents at capture (raw units), to detect zoom
 		float        frustumY{ 0.0f };
+
+		// Diagnostics for the footprint self-check (Runtime logs them when it fails).
+		float        fitAngle{ 0.0f };     // degrees: the best fitting reading's worst axis against the render basis
+		float        frustumRaw[4]{};      // NiCamera frustum left, right, top, bottom at capture
+		float        axisNdc[2]{};         // where the render camera's view axis lands (0,0 for a centred projection)
+		std::uint8_t cameraState{ 0xFF };  // PlayerCamera state at capture (0xFF unknown)
+		std::uint8_t cameraSource{ 0 };    // the camera data read: 1 cache entry (unjittered), 2 cache entry (jittered), 3 cameraState
+		std::uint8_t cameraEntries{ 0 };   // cache entries for the WorldRoot camera that frame
 	};
 
 	// A sphere seen from the depth frame's camera, in level-0 Hi-Z texel coordinates. Lets a test skip

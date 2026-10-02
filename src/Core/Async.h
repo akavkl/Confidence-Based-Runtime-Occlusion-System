@@ -27,6 +27,7 @@ namespace CBRO::Core::Async
 	{
 		float eye[3]{};
 		float rotate[3][3]{};
+		float zoom[2]{};  // the NiCamera frustum's half-extents: a map holds only at the zoom it was judged at
 	};
 
 	void Install(bool a_enabled);

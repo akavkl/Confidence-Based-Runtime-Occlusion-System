@@ -169,6 +169,7 @@ namespace CBRO::Core::Async
 			std::uint32_t framesValid{ 0 };
 			std::uint32_t framesInvalidMoved{ 0 };
 			std::uint32_t framesInvalidTurned{ 0 };
+			std::uint32_t framesInvalidZoom{ 0 };
 			std::uint32_t framesNoMap{ 0 };
 			std::uint32_t submitted{ 0 };
 			std::uint32_t skippedBusy{ 0 };
@@ -367,6 +368,10 @@ namespace CBRO::Core::Async
 			++g_stats.framesInvalidMoved;
 		} else if (RotationAngle(a_pose.rotate, read.pose.rotate) > read.turnMargin) {
 			++g_stats.framesInvalidTurned;
+		} else if (std::abs(a_pose.zoom[0] - read.pose.zoom[0]) > 0.002f * read.pose.zoom[0] || std::abs(a_pose.zoom[1] - read.pose.zoom[1]) > 0.002f * read.pose.zoom[1]) {
+			// Zoomed out, the view reaches past what the worker judged (its "out of view" verdicts no longer hold);
+			// zoomed in, its edge objects were clipped to a wider view. Either way the walk judges this frame.
+			++g_stats.framesInvalidZoom;
 		} else {
 			++g_stats.framesValid;
 			valid = true;
@@ -512,8 +517,8 @@ namespace CBRO::Core::Async
 		const auto&  s = g_stats;
 		const double jobs = std::max(1u, s.submitted);
 		logger::info(
-			"async per interval: map valid {} frames | not used: no map {}, camera moved past the margin {}, turned past it {} | jobs {} (skipped: worker busy {}) | candidates {:.0f}/job on {} threads, overflow {} | worker {:.2f} ms/job (max {:.2f}) | main thread waited {} times, {:.2f} ms avg (max {:.2f}) | lookups {:.0f}/frame: in sequence {:.0f}, by look-ahead {:.0f}, by index {:.0f}, missing {:.0f} | index full {} | margins: move {:.1f} units, turn {:.2f} deg",
-			s.framesValid, s.framesNoMap, s.framesInvalidMoved, s.framesInvalidTurned, s.submitted, s.skippedBusy,
+			"async per interval: map valid {} frames | not used: no map {}, camera moved past the margin {}, turned past it {}, zoom changed {} | jobs {} (skipped: worker busy {}) | candidates {:.0f}/job on {} threads, overflow {} | worker {:.2f} ms/job (max {:.2f}) | main thread waited {} times, {:.2f} ms avg (max {:.2f}) | lookups {:.0f}/frame: in sequence {:.0f}, by look-ahead {:.0f}, by index {:.0f}, missing {:.0f} | index full {} | margins: move {:.1f} units, turn {:.2f} deg",
+			s.framesValid, s.framesNoMap, s.framesInvalidMoved, s.framesInvalidTurned, s.framesInvalidZoom, s.submitted, s.skippedBusy,
 			static_cast<double>(s.candidates) / jobs, s.threadsSeen, s.overflow, s.workerMs / jobs, s.workerMaxMs,
 			s.waits, s.waits ? s.waitMs / s.waits : 0.0, s.waitMaxMs,
 			static_cast<double>(lookups) / frames, static_cast<double>(sequential) / frames, static_cast<double>(ahead) / frames, static_cast<double>(indexed) / frames,
