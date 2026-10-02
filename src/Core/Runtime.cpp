@@ -1473,7 +1473,10 @@ namespace CBRO::Core::Runtime
 			}
 			if (const auto tasks = F4SE::GetTaskInterface()) {
 				tasks->AddTask([text = std::move(a_text)]() {
-					RE::SendHUDMessage::ShowHUDMessage(text.c_str(), "", false, false);
+					// No sound: nullptr, as the engine's own callers pass. "" is not "no sound": the HUD plays
+					// UIUtils::PlayMenuSound(""), which looks the sound up by the CRC of its editor ID, and a sound
+					// form keyed by the empty name (a Fallout London looping water sound) played and never stopped.
+					RE::SendHUDMessage::ShowHUDMessage(text.c_str(), nullptr, false, false);
 				});
 			}
 		}
