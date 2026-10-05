@@ -1,6 +1,7 @@
 #include "Core/Feed.h"
 
 #include "Hooks/CullGroups.h"
+#include "Hooks/Precipitation.h"
 #include "Hooks/PrevisFeed.h"
 #include "Settings.h"
 #include "Util/Gamebryo.h"
@@ -253,6 +254,15 @@ namespace CBRO::Core::Feed
 			"previs feed: {}; audit every {} frames",
 			g_enabled ? "previs is never switched off: in CBRO frames it is suspended (without flush) only inside the cull and cascade windows" : "off (bPrevisFeed=0: v1.28 previs switching)",
 			g_auditInterval);
+		// The query skip needs both windows (the walk and the cascades must not read previs's lists) and the rain pass's
+		// detour (its window), else the query keeps running.
+		if (g_enabled && settings.skipPrevisQuery) {
+			if (Hooks::PrevisFeed::WindowsAvailable() && Hooks::Precipitation::Hooked()) {
+				Hooks::PrevisFeed::InstallQuerySkip();
+			} else {
+				logger::warn("previs feed: previs query skip not installed (a suspension window or the rain pass hook is missing); the query keeps running");
+			}
+		}
 	}
 
 	void OnGameLoaded()
@@ -408,6 +418,9 @@ namespace CBRO::Core::Feed
 			g_stats.gateA, g_stats.gateB, g_stats.interior, g_stats.unreadable,
 			gates.enabled, gates.ini, gates.suspended, gates.gateA, gates.gateB, gates.exterior,
 			calls.mainPrevious, calls.mainCBRO, calls.sunPrevious, calls.sunCBRO);
+		logger::info(
+			"previs query this interval: skipped {} frames (rain windows {}) | collected {} times with previs active, {:.3f} ms per collect on the main thread",
+			windows.querySkips, windows.rain, windows.queryRuns, windows.queryRuns ? windows.queryMs / windows.queryRuns : 0.0);
 		if (g_auditInterval) {
 			logger::info(
 				"feed audits this interval: {} run, {} not replicable (interior/override) | totals: missing {} | route mismatch {} | extra {}",

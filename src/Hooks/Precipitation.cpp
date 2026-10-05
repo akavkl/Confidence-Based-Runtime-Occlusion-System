@@ -24,11 +24,13 @@ namespace CBRO::Hooks::Precipitation
 
 		void PassThunk(std::uintptr_t a_precipitation, std::uintptr_t a_extra)
 		{
+			const bool    window = PrevisFeed::BeginRainWindow();  // (this frame's previs query skipped: its list is empty)
 			const bool    active = PrevisFeed::ActiveNow();
 			LARGE_INTEGER start{}, end{};
 			QueryPerformanceCounter(&start);
 			reinterpret_cast<PassFn>(g_original)(a_precipitation, a_extra);
 			QueryPerformanceCounter(&end);
+			PrevisFeed::EndRainWindow(window);
 			g_runs.fetch_add(1, std::memory_order_relaxed);
 			if (active) {
 				g_previsActive.fetch_add(1, std::memory_order_relaxed);
@@ -44,6 +46,11 @@ namespace CBRO::Hooks::Precipitation
 		g_qpcPerMs = static_cast<double>(frequency.QuadPart) / 1000.0;
 		g_original = Util::DetourSwitchable(g_hook, CBRO::Engine::OG(kRainPassID).address(), Util::FnAddr(&PassThunk), kRainPassPrologue, "precipitation:rain occlusion pass");
 		logger::info("precipitation: rain occlusion pass {} (diagnostic: runs, previs state, CPU time)", g_original ? "hooked" : "NOT hooked");
+	}
+
+	bool Hooked() noexcept
+	{
+		return g_original != 0;
 	}
 
 	Stats Take() noexcept

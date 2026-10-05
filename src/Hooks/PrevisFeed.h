@@ -81,8 +81,23 @@ namespace CBRO::Hooks::PrevisFeed
 		std::uint32_t cullBegin{ 0 };  // ... opened at the cull begin instead (switch frames, or no pre-cull wrapper)
 		std::uint32_t cascade{ 0 };    // cascade windows
 		std::uint32_t lamp{ 0 };       // lamp windows (spot-light group-0 culls)
+		std::uint32_t rain{ 0 };       // rain windows (the rain map in a frame whose query was skipped)
+		std::uint32_t querySkips{ 0 }; // frames whose previs query was skipped (launch and collect)
+		std::uint32_t queryRuns{ 0 };  // collects run with previs active
+		double        queryMs{ 0.0 };  // main-thread time of those collects
 	};
 	[[nodiscard]] WindowCounts TakeWindowCounts() noexcept;
+
+	// The previs query skip (v1.66; FO4-ENGINE-NOTES 5.5e). The engine launches previs's background Umbra query in
+	// Main::StartOfFrameUpdate and collects it at Render_PreUI+0x80 (the three views' lists, the dynamic objects'
+	// fades and bit 42), whatever the mode. In a CBRO frame nothing reads the main and sun lists (the walk and the
+	// cascades run inside CBRO's windows) and the light-visibility callbacks only fire at the end of the main feed, so
+	// both are skipped; the rain map, the one reader left, then walks the world node with previs suspended (the
+	// engine's previs-off path), and so does the cascade cull of a switch frame back to previs. A query launched is
+	// always collected. Pass-through until installed; main thread.
+	bool InstallQuerySkip();
+	[[nodiscard]] bool BeginRainWindow() noexcept;  // true = previs was suspended now: pass it to EndRainWindow
+	void EndRainWindow(bool a_opened) noexcept;
 	// For CullGroups' sun-path check: the cascade site calls CBRO's wrapper, which chains to this previous target.
 	[[nodiscard]] std::uintptr_t CascadeCullThunkAddress() noexcept;
 	[[nodiscard]] std::uintptr_t CascadeCullPrevious() noexcept;

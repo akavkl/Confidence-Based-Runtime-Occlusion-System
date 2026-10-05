@@ -33,6 +33,7 @@ namespace CBRO
 		bool          spotCasterTrim{ true };      // kept spot lights: casters that can't shadow a visible pixel are left out of the shadow map (as point lights' are)
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
+		bool          skipPrevisQuery{ true };     // CBRO frames: previs's per-frame query is neither launched nor collected (Hooks/PrevisFeed)
 		bool          interiors{ true };           // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)
 		bool          interiorLegacyPrevis{ true }; // interiors: v1.28's previs switch (off and flushed while CBRO is on) instead of the windows
 		bool          asyncInteriors{ false };     // interiors: judge through the worker too (0: inside the walk, as v1.28)

@@ -5,11 +5,14 @@
 // object, extra), which renders a top-down camera's depth into render target 86. With previs active it files previs's
 // third list into a stack culling group; with previs inactive it runs BSShaderUtil::AccumulateScene over the whole world
 // node (the scene root's child 3) every frame it rains. In a CBRO frame the pass runs after the cull window has closed,
-// so it should see previs active, as vanilla. The detour on 856638 only counts the runs, the previs state at entry and
-// the CPU time; it changes nothing and stays in in both modes.
+// so it should see previs active, as vanilla. The detour on 856638 counts the runs, the previs state at entry and the
+// CPU time, and stays in in both modes. Since v1.66 it changes one thing: in a frame whose previs query CBRO skipped
+// (PrevisFeed::InstallQuerySkip), previs's list is empty, so the pass runs inside a rain window (previs suspended) and
+// walks the world node, the engine's previs-off path.
 namespace CBRO::Hooks::Precipitation
 {
 	void Install();
+	[[nodiscard]] bool Hooked() noexcept;  // the pass is detoured
 
 	struct Stats
 	{

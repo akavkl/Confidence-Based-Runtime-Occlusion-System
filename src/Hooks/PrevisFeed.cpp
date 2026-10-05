@@ -42,6 +42,17 @@ namespace CBRO::Hooks::PrevisFeed
 		constexpr std::uint64_t kUnbatchedStageID = 1108521;
 		constexpr std::size_t   kCascadeCullSiteOffset = 0xE49;  // 1108521: call 1390075 (kCascadeCullID)
 
+		// ---- the previs query (FO4-ENGINE-NOTES 5.5e) ---------------------------------------------------------------
+		// Main::StartOfFrameUpdate (826184) +0x28A: `call 1276848` (MultiCellVisibilityData::LaunchQuery(camera): the
+		// background Umbra query, behind its own IsActive() test). Render_PreUI+0x80: `call 1264353` (if IsActive(),
+		// 903843 collects it into the three views' lists and walks the dynamic objects). Runtime Combiner wraps the +0x80
+		// call site and checks that it still calls 1264353, so the collect is detoured at its entry instead.
+		constexpr std::uint64_t                kStartOfFrameUpdateID = 826184;
+		constexpr std::size_t                  kLaunchSiteOffset = 0x28A;
+		constexpr std::uint64_t                kLaunchQueryID = 1276848;
+		constexpr std::uint64_t                kCollectQueryID = 1264353;
+		constexpr std::array<std::uint8_t, 7> kCollectPrologue{ 0x48, 0x81, 0xEC, 0x98, 0x00, 0x00, 0x00 };  // sub rsp, 0x98
+
 		// ---- layouts (OG; RE::NiAVObject: worldBound +0xB0, flags +0x108; RE::NiNode::children is a NiTObjectArray at
 		// +0x120: data +8, u16 count +0x12; NiObject vtable: 2 GetRTTI, 4 IsNode, 6 IsFadeNode) -------------------------
 		constexpr std::size_t kWorldBound = 0xB0;
@@ -104,6 +115,23 @@ namespace CBRO::Hooks::PrevisFeed
 		std::uint8_t      g_savedByte{ 0 };
 		std::uintptr_t    g_preCullHelper{ 0 };
 		WindowCounts      g_windowCounts{};
+
+		// The query skip (main thread). `g_launch` is this frame's launch as the wrapper saw it, read and reset by the
+		// collect; `g_querySkipped` is the frame's collect skipped (read later in the frame by the cascade and rain
+		// windows). The policy can't change in between: `g_window` is only written at the cull begin, after +0x80.
+		enum class Launch : std::uint8_t
+		{
+			kNone,      // the launch site wasn't reached (StartOfFrameUpdate's own gates)
+			kLaunched,  // passed to the engine
+			kSkipped,
+		};
+		FeedSite             g_launchSite;
+		Util::SwitchableHook g_collectHook;
+		std::uintptr_t       g_collectOriginal{ 0 };
+		bool                 g_skipQuery{ false };
+		Launch               g_launch{ Launch::kNone };
+		bool                 g_querySkipped{ false };
+		double               g_qpcPerMs{ 0.0 };
 
 		std::atomic<Owner>         g_owner{ Owner::kPrevis };
 		std::atomic<MainFeedFn>    g_mainFn{ nullptr };
@@ -195,10 +223,11 @@ namespace CBRO::Hooks::PrevisFeed
 			return result;
 		}
 
-		// 1108521+0xE49: the cascade cull with previs suspended around it (a CBRO frame), so it takes its group-0 path.
+		// 1108521+0xE49: the cascade cull with previs suspended around it (a CBRO frame, or a switch frame whose query was
+		// skipped: previs's sun list is empty and the walk filed group 0), so it takes its group-0 path.
 		std::uintptr_t CascadeCullThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
 		{
-			if (!g_window.load(std::memory_order_relaxed)) {
+			if (!g_window.load(std::memory_order_relaxed) && !g_querySkipped) {
 				return reinterpret_cast<PassFn>(g_cascadeSite.previous)(a1, a2, a3, a4);
 			}
 			const auto saved = ReadSuspendedByte();
@@ -211,6 +240,39 @@ namespace CBRO::Hooks::PrevisFeed
 				WriteSuspended(false);
 			}
 			return result;
+		}
+
+		// StartOfFrameUpdate+0x28A: in a CBRO frame the background query isn't launched.
+		std::uintptr_t LaunchThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
+		{
+			if (g_skipQuery && g_window.load(std::memory_order_relaxed)) {
+				g_launch = Launch::kSkipped;
+				return 0;  // (void at the site: StartOfFrameUpdate returns right after)
+			}
+			g_launch = Launch::kLaunched;
+			return reinterpret_cast<PassFn>(g_launchSite.previous)(a1, a2, a3, a4);
+		}
+
+		// 1264353's entry (Render_PreUI+0x80): a query launched this frame is always collected; with none launched, a
+		// CBRO frame skips the collect, and with it the lists, the fade advance and bit 42 of the dynamic objects (5.5e).
+		void CollectThunk()
+		{
+			const auto launch = std::exchange(g_launch, Launch::kNone);
+			if (launch != Launch::kLaunched && g_skipQuery && g_window.load(std::memory_order_relaxed)) {
+				g_querySkipped = true;
+				++g_windowCounts.querySkips;
+				return;
+			}
+			g_querySkipped = false;
+			const bool    active = ActiveNow();
+			LARGE_INTEGER start{}, end{};
+			QueryPerformanceCounter(&start);
+			reinterpret_cast<void (*)()>(g_collectOriginal)();
+			QueryPerformanceCounter(&end);
+			if (active && g_qpcPerMs > 0.0) {
+				++g_windowCounts.queryRuns;
+				g_windowCounts.queryMs += static_cast<double>(end.QuadPart - start.QuadPart) / g_qpcPerMs;
+			}
 		}
 
 		bool InstallSite(FeedSite& a_site, std::uint64_t a_functionID, std::size_t a_offset, std::uint64_t a_feedID, std::uintptr_t a_thunk, const char* a_name)
@@ -522,6 +584,40 @@ namespace CBRO::Hooks::PrevisFeed
 	}
 
 	void EndLampWindow(bool a_opened) noexcept
+	{
+		if (a_opened) {
+			WriteSuspended(false);
+		}
+	}
+
+	bool InstallQuerySkip()
+	{
+		LARGE_INTEGER frequency{};
+		QueryPerformanceFrequency(&frequency);
+		g_qpcPerMs = static_cast<double>(frequency.QuadPart) / 1000.0;
+		// Both or neither: a launched query must be collected, and a collect skipped needs the launch skipped too.
+		g_collectOriginal = Util::DetourSwitchable(g_collectHook, CBRO::Engine::OG(kCollectQueryID).address(), Util::FnAddr(&CollectThunk), kCollectPrologue, "previsfeed:previs query collect");
+		const bool launch = g_collectOriginal && InstallSite(g_launchSite, kStartOfFrameUpdateID, kLaunchSiteOffset, kLaunchQueryID, Util::FnAddr(&LaunchThunk), "previsfeed:previs query launch");
+		g_skipQuery = launch;
+		logger::info(
+			"previs feed: previs query skip {} (CBRO frames: no launch at StartOfFrameUpdate+0x{:X}, no collect at Render_PreUI+0x80; the rain map then walks the world node with previs suspended)",
+			g_skipQuery ? "installed" : (g_collectOriginal ? "NOT installed: the launch site isn't a call rel32; the query keeps running" : "NOT installed: 1264353's entry isn't the expected code; the query keeps running"),
+			kLaunchSiteOffset);
+		return g_skipQuery;
+	}
+
+	bool BeginRainWindow() noexcept
+	{
+		// Only when this frame's query was skipped (previs's rain list is empty), over the engine's own state.
+		if (!g_querySkipped || ReadSuspendedByte()) {
+			return false;
+		}
+		WriteSuspended(true);
+		++g_windowCounts.rain;
+		return true;
+	}
+
+	void EndRainWindow(bool a_opened) noexcept
 	{
 		if (a_opened) {
 			WriteSuspended(false);
