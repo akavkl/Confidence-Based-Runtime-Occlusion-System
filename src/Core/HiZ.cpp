@@ -40,6 +40,7 @@ namespace CBRO::Core::HiZ
 			std::uint32_t        captureIndex{ 0 };
 			std::uint32_t        mergedFrames{ 1 };
 			float                mergeMove{ 0.0f };
+			bool                 firstPersonAfter{ false };
 			State                state{ State::kFree };
 			const std::uint8_t*  mapped{ nullptr };
 		};
@@ -607,7 +608,7 @@ namespace CBRO::Core::HiZ
 		return true;
 	}
 
-	bool Capture(std::uint64_t a_frame, const Camera& a_camera)
+	bool Capture(std::uint64_t a_frame, const Camera& a_camera, bool a_firstPersonAfter)
 	{
 		if (g_gpu.failed) {
 			return false;
@@ -745,6 +746,7 @@ namespace CBRO::Core::HiZ
 					slot->captureIndex = captureIndex;
 					slot->mergedFrames = 1 + mergeCount;
 					slot->mergeMove = mergeMove;
+					slot->firstPersonAfter = a_firstPersonAfter;
 					slot->state = Slot::State::kPending;
 					++g_counters.captures;
 					ok = true;
@@ -820,6 +822,7 @@ namespace CBRO::Core::HiZ
 		snapshot.camera = newest->camera;
 		snapshot.mergedFrames = newest->mergedFrames;
 		snapshot.mergeMove = newest->mergeMove;
+		snapshot.firstPersonAfter = newest->firstPersonAfter;
 		snapshot.readbackIndex = newest->captureIndex;
 		snapshot.levels = g_gpu.layout.levels;
 		snapshot.width = g_gpu.layout.width;

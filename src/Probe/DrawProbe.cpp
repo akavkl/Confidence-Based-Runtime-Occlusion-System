@@ -1,5 +1,6 @@
 #include "Probe/ProbeInternal.h"
 
+#include "Hooks/FirstPersonOrder.h"
 #include "Util/D3D.h"
 #include "Util/Hooking.h"
 
@@ -25,6 +26,7 @@ namespace CBRO::Probe::Draw
 
 		// FO4 draws first-person geometry with viewport depth [0, 0.01] and the world with [0.01, 1].
 		constexpr float kFirstPersonMaxDepth = 0.0101f;
+		constexpr float kWorldMinDepth = 0.0099f;  // (the world's viewport starts at 0.01)
 
 		constexpr std::size_t kStages = static_cast<std::size_t>(Stage::kCount);
 
@@ -68,7 +70,65 @@ namespace CBRO::Probe::Draw
 		std::size_t                    g_dsvCount{ 0 };
 		std::atomic<std::size_t>       g_currentDsv{ kNoDsv };
 
+		// v1.69: first-person-range work in the pre-pass by Hooks::FirstPersonOrder::Phase() (0 before its first-person
+		// block, 1 the world block with first person held back, 2 the held block, 3 after it), the same for viewports that
+		// reach below the world's depth range without being first person's ("wide"), and the call stacks of the switches
+		// into either that come before the depth capture (phases 0 and 1). Main thread only.
+		constexpr std::size_t kPhases = 4;
+		struct StackRecord
+		{
+			std::uint32_t                  phase{ 0 };
+			bool                           firstPerson{ true };  // first person's range, else a wide one
+			std::array<std::uintptr_t, 12> frames{};  // return addresses in any module (CBRO's own skipped), innermost first
+			std::uint64_t                  count{ 0 };
+		};
+		constexpr std::size_t                 kMaxStacks = 12;
+		std::array<std::uint64_t, kPhases>    g_prepassFirstDraws{};
+		std::array<std::uint64_t, kPhases>    g_prepassFirstSwitches{};
+		std::array<std::uint64_t, kPhases>    g_prepassWideDraws{};
+		std::array<std::uint64_t, kPhases>    g_prepassWideSwitches{};
+		std::array<StackRecord, kMaxStacks>   g_stacks{};
+		std::size_t                           g_stackCount{ 0 };
+		std::uint64_t                         g_stacksDropped{ 0 };
+
+		void RecordStack(std::uint32_t a_phase, bool a_firstPerson)
+		{
+			static const auto self = [] {
+				HMODULE module = nullptr;
+				GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&RecordStack), &module);
+				const auto base = reinterpret_cast<std::uintptr_t>(module);
+				const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+				const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+				return std::pair{ base, base + nt->OptionalHeader.SizeOfImage };
+			}();
+			void*       raw[48]{};
+			const auto  count = RtlCaptureStackBackTrace(1, static_cast<DWORD>(std::size(raw)), raw, nullptr);
+			StackRecord record{};
+			std::size_t kept = 0;
+			record.phase = a_phase;
+			record.firstPerson = a_firstPerson;
+			for (USHORT i = 0; i < count && kept < record.frames.size(); ++i) {
+				const auto address = reinterpret_cast<std::uintptr_t>(raw[i]);
+				if (address < self.first || address >= self.second) {
+					record.frames[kept++] = address;
+				}
+			}
+			for (std::size_t i = 0; i < g_stackCount; ++i) {
+				if (g_stacks[i].phase == record.phase && g_stacks[i].firstPerson == record.firstPerson && g_stacks[i].frames == record.frames) {
+					++g_stacks[i].count;
+					return;
+				}
+			}
+			if (g_stackCount == g_stacks.size()) {
+				++g_stacksDropped;
+				return;
+			}
+			record.count = 1;
+			g_stacks[g_stackCount++] = record;
+		}
+
 		std::atomic<bool> g_firstPersonViewport{ false };
+		std::atomic<bool> g_nearViewport{ false };  // the bound viewport reaches below the world's range
 		std::atomic<bool> g_viewportSampled{ false };
 		D3D11_VIEWPORT    g_prepassViewport{};
 		UINT              g_prepassViewportCount{ 0 };
@@ -168,6 +228,11 @@ namespace CBRO::Probe::Draw
 			g_immediateThisFrame.fetch_add(1, std::memory_order_relaxed);
 			if (g_firstPersonViewport.load(std::memory_order_relaxed)) {
 				g_frame.firstPerson[stage].fetch_add(1, std::memory_order_relaxed);
+				if (stage == static_cast<std::size_t>(Stage::kPrePass)) {
+					++g_prepassFirstDraws[std::min<std::size_t>(Hooks::FirstPersonOrder::Phase(), kPhases - 1)];
+				}
+			} else if (g_nearViewport.load(std::memory_order_relaxed) && stage == static_cast<std::size_t>(Stage::kPrePass)) {
+				++g_prepassWideDraws[std::min<std::size_t>(Hooks::FirstPersonOrder::Phase(), kPhases - 1)];
 			}
 			if (GetCurrentThreadId() != State().renderThreadId.load(std::memory_order_relaxed)) {
 				g_frame.offRenderThread.fetch_add(1, std::memory_order_relaxed);
@@ -275,7 +340,17 @@ namespace CBRO::Probe::Draw
 		void STDMETHODCALLTYPE RSSetViewports(ID3D11DeviceContext* a_self, UINT a_count, const D3D11_VIEWPORT* a_viewports)
 		{
 			if (a_self == g_immediate.load(std::memory_order_relaxed) && a_count > 0 && a_viewports) {
-				g_firstPersonViewport.store(a_viewports[0].MaxDepth <= kFirstPersonMaxDepth, std::memory_order_relaxed);
+				const bool firstPerson = a_viewports[0].MaxDepth <= kFirstPersonMaxDepth;
+				const bool nearRange = a_viewports[0].MinDepth < kWorldMinDepth;  // (first person's range, or one reaching below the world's)
+				const bool was = g_firstPersonViewport.exchange(firstPerson, std::memory_order_relaxed);
+				const bool wasNear = g_nearViewport.exchange(nearRange, std::memory_order_relaxed);
+				if (nearRange && (!wasNear || firstPerson != was) && CurrentStage() == Stage::kPrePass) {
+					const auto phase = std::min<std::uint32_t>(Hooks::FirstPersonOrder::Phase(), kPhases - 1);
+					++(firstPerson ? g_prepassFirstSwitches : g_prepassWideSwitches)[phase];
+					if (phase <= 1) {
+						RecordStack(phase, firstPerson);
+					}
+				}
 			}
 			g_rsSetViewports(a_self, a_count, a_viewports);
 		}
@@ -388,6 +463,34 @@ namespace CBRO::Probe::Draw
 		logger::info(
 			"first-person depth-range draws: last frame by stage:{} | avg by stage:{}",
 			StageCounts(lastFirstPerson), StageCounts(g_interval.firstPerson, frames));
+
+		logger::info(
+			"first-person depth range in the pre-pass per frame by first-person order phase (before its block / world block, first person held / held block / after): switches into it {:.2f} / {:.2f} / {:.2f} / {:.2f} | draws {:.1f} / {:.1f} / {:.1f} / {:.1f}",
+			g_prepassFirstSwitches[0] / frames, g_prepassFirstSwitches[1] / frames, g_prepassFirstSwitches[2] / frames, g_prepassFirstSwitches[3] / frames,
+			g_prepassFirstDraws[0] / frames, g_prepassFirstDraws[1] / frames, g_prepassFirstDraws[2] / frames, g_prepassFirstDraws[3] / frames);
+		logger::info(
+			"wide depth range (from below 0.01, not first person's) in the pre-pass per frame by the same phases: switches into it {:.2f} / {:.2f} / {:.2f} / {:.2f} | draws {:.1f} / {:.1f} / {:.1f} / {:.1f}",
+			g_prepassWideSwitches[0] / frames, g_prepassWideSwitches[1] / frames, g_prepassWideSwitches[2] / frames, g_prepassWideSwitches[3] / frames,
+			g_prepassWideDraws[0] / frames, g_prepassWideDraws[1] / frames, g_prepassWideDraws[2] / frames, g_prepassWideDraws[3] / frames);
+		for (std::size_t i = 0; i < g_stackCount; ++i) {
+			const auto& record = g_stacks[i];
+			std::string chain;
+			for (const auto address : record.frames) {
+				if (address) {
+					chain += std::format("{}{}", chain.empty() ? "" : " < ", Util::DescribeCodeAddress(address));
+				}
+			}
+			logger::info("  switch into the {} range before the capture (phase {}) x{:.2f}/frame: {}", record.firstPerson ? "first-person" : "wide", record.phase, record.count / frames, chain);
+		}
+		if (g_stacksDropped) {
+			logger::info("  ... {} more switches with other stacks", g_stacksDropped);
+		}
+		g_prepassFirstDraws = {};
+		g_prepassFirstSwitches = {};
+		g_prepassWideDraws = {};
+		g_prepassWideSwitches = {};
+		g_stackCount = 0;
+		g_stacksDropped = 0;
 
 		if (g_viewportSampled.load()) {
 			logger::info(

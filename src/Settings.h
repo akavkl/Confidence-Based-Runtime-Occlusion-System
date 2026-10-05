@@ -33,6 +33,7 @@ namespace CBRO
 		bool          spotCasterTrim{ true };      // kept spot lights: casters that can't shadow a visible pixel are left out of the shadow map (as point lights' are)
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
 		bool          cellArtNode9{ true };        // CBRO frames: a cell's node 9 (precombined art) the engine has AppCulled is filed anyway, as previs draws it by id
+		bool          firstPersonAfterWorld{ true };  // CBRO frames: the pre-pass draws first person after the world, whose depth CBRO captures in between
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
 		bool          skipPrevisQuery{ true };     // CBRO frames: previs's per-frame query is neither launched nor collected (Hooks/PrevisFeed)
 		bool          interiors{ true };           // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)

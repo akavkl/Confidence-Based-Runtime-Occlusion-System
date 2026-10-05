@@ -7,6 +7,7 @@
 #include "Core/Occlusion.h"
 #include "Core/ShadowLights.h"
 #include "Hooks/CullGroups.h"
+#include "Hooks/FirstPersonOrder.h"
 #include "Hooks/Precipitation.h"
 #include "Hooks/PrevisFeed.h"
 #include "Hooks/RenderStages.h"
@@ -94,6 +95,7 @@ namespace CBRO::Core::Runtime
 			bool          originalPrevis{ true };
 			std::uint32_t framesSinceLog{ 0 };
 			bool          cullingThisFrame{ false };  // CBRO culls this frame: the culling-group hooks act (else pass-through)
+			bool          capturedInPass{ false };    // this pre-pass's capture already ran at its world block's end (FirstPersonOrder)
 			bool          hooksWanted{ true };        // what SyncHooks last asked for (the hooks go in at load)
 			bool          hooksIn{ true };            // the hooks culling needs are in
 		};
@@ -2098,6 +2100,7 @@ namespace CBRO::Core::Runtime
 						static_cast<double>(rain.runs) / frames, static_cast<double>(rain.previsActive) / frames, static_cast<double>(inactive) / frames,
 						rain.previsActive ? rain.msActive / static_cast<double>(rain.previsActive) : 0.0, inactive ? rain.msInactive / static_cast<double>(inactive) : 0.0);
 				}
+				Hooks::FirstPersonOrder::LogStats(g_state.framesSinceLog);
 				SetDiff::LogStats();
 				Async::LogStats(g_state.framesSinceLog);
 				LogTiming();
@@ -2105,7 +2108,9 @@ namespace CBRO::Core::Runtime
 			}
 		}
 
-		void OnPrePassEnd()
+		// The world's depth is complete: at the pre-pass stage's end, or (first person held back, Hooks/FirstPersonOrder) at its
+		// world block's end, before the first-person block.
+		void OnPrePassEnd(bool a_firstPersonAfter)
 		{
 			HiZ::Camera camera{};
 			Raw         raw{};
@@ -2141,7 +2146,7 @@ namespace CBRO::Core::Runtime
 				return;  // no GPU work while previs has the job
 			}
 			CheckFootprint(camera);
-			HiZ::Capture(g_state.renderFrame, camera);
+			HiZ::Capture(g_state.renderFrame, camera, a_firstPersonAfter);
 		}
 
 		class Listener final :
@@ -2230,7 +2235,12 @@ namespace CBRO::Core::Runtime
 					++g_timing.prepassFrames;
 					g_timing.marks[3] = end;  // the engine's pre-pass ends here; CBRO's depth capture follows (the "hi-z" bucket)
 					g_gpu.Mark(3);
-					OnPrePassEnd();
+					// (with first person held back the capture ran at the world block's end, inside the pre-pass bucket; a
+					// block still held runs now, after its capture)
+					Hooks::FirstPersonOrder::Flush();
+					if (!std::exchange(g_state.capturedInPass, false)) {
+						OnPrePassEnd(false);
+					}
 					const auto captured = Qpc();
 					g_timing.captureTicks += captured - end;
 					g_timing.marks[4] = captured;
@@ -2254,6 +2264,26 @@ namespace CBRO::Core::Runtime
 			}
 		};
 		Listener g_listener;
+
+		// The pre-pass's first-person block waits past the world block whenever this pre-pass's depth is captured.
+		class FirstPersonListener final :
+			public Hooks::FirstPersonOrder::Listener
+		{
+		public:
+			bool WantWorldDepth() override
+			{
+				return Occlusion::Active() && g_state.diagnostic != 2 && g_state.convention != Convention::kUnknown && g_state.convention != Convention::kNone;
+			}
+
+			void OnWorldDepth() override
+			{
+				const auto start = Qpc();
+				OnPrePassEnd(true);
+				g_timing.captureTicks += Qpc() - start;
+				g_state.capturedInPass = true;
+			}
+		};
+		FirstPersonListener g_firstPersonListener;
 	}
 
 	void Install()
@@ -2282,6 +2312,11 @@ namespace CBRO::Core::Runtime
 		SetDiff::Install(settings.setDiff);
 		Async::Install(settings.async);
 		Hooks::RenderStages::AddListener(&g_listener);
+		if (settings.firstPersonAfterWorld) {
+			Hooks::FirstPersonOrder::Install(&g_firstPersonListener);
+		} else {
+			logger::info("first person after the world: off ([Occlusion] bFirstPersonAfterWorld=0): the pre-pass draws first person first, and CBRO keeps everything behind it drawn");
+		}
 		g_state.installed = true;
 		g_state.wantActive = settings.startActive;
 		g_state.diagnostic = static_cast<int>(settings.startDiagnostic);

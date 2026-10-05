@@ -794,6 +794,43 @@ namespace CBRO::Core::Occlusion
 			return Verdict::kHidden;
 		}
 
+		// ---- first person drawn after the capture (v1.69, Hooks/FirstPersonOrder) ---------------------------
+		// The depth frame then holds the world behind the weapon and no first-person surface, yet the weapon and arms
+		// still receive light and shadow. They lie within kFirstPersonReach units of the eye (a long rifle's muzzle is
+		// ~90): a light, or a shadow sweep, that comes that close is kept, as one crossing a first-person pixel was.
+		constexpr float kFirstPersonReach = 128.0f;
+
+		bool FirstPersonUnseen(const FrameContext& a_context) noexcept
+		{
+			return a_context.snapshot && a_context.snapshot->firstPersonAfter;
+		}
+
+		// Whether the sweep from a_center (view space: the eye at the origin) along the unit a_dir, radius a_radius +
+		// t x a_spread for t in [0, a_tMax], comes within a_reach of the eye. Its distance to the eye less its radius
+		// is convex in t, least where the offset along a_dir is a_spread x the perpendicular distance / sqrt(1 -
+		// a_spread^2) (at a_tMax when the radius grows as fast as the distance).
+		bool SweepNearEye(const float a_center[3], const float a_dir[3], float a_radius, float a_spread, float a_tMax, float a_reach) noexcept
+		{
+			const float along = ShadowGeometry::Dot(a_center, a_dir);
+			const float perp2 = std::max(ShadowGeometry::Dot(a_center, a_center) - along * along, 0.0f);
+			const float t = a_spread < 1.0f ? -along + a_spread * std::sqrt(perp2 / (1.0f - a_spread * a_spread)) : a_tMax;
+			const float tc = std::clamp(t, 0.0f, a_tMax);
+			const float offset = along + tc;
+			const float reach = a_radius + tc * a_spread + a_reach;
+			return perp2 + offset * offset < reach * reach;
+		}
+
+		// Whether a light's reach (world space) comes within kFirstPersonReach of the depth frame's eye.
+		bool ReachNearEye(const FrameContext& a_context, const RE::NiPoint3& a_center, float a_radius) noexcept
+		{
+			const auto& camera = a_context.snapshot->camera;
+			const float dx = a_center.x - camera.origin[0];
+			const float dy = a_center.y - camera.origin[1];
+			const float dz = a_center.z - camera.origin[2];
+			const float reach = a_radius + a_context.dilateMove + kFirstPersonReach;
+			return dx * dx + dy * dy + dz * dz < reach * reach;
+		}
+
 		// ---- sun shadows: the capsule a caster sweeps along the light --------------------------------------
 
 		enum class SunVerdict
@@ -829,6 +866,10 @@ namespace CBRO::Core::Occlusion
 			// (+ the cache's turn tolerance over the whole receiver range: a reused verdict must hold for a camera
 			// turned by that much, which shifts a point at depth z by z x the slack)
 			const float r0 = radius + a_context.dilateMove + sun.margin + (std::isfinite(sun.reach) ? std::max(sun.reach, 0.0f) * a_context.angularSlack : 0.0f);
+			// (first person, which may lie outside the world view's planes: its own field of view, tested first)
+			if (FirstPersonUnseen(a_context) && SweepNearEye(center, sun.dir, r0, sun.spread, 1.0e6f, kFirstPersonReach)) {
+				return SunVerdict::kNeeded;
+			}
 
 			for (int i = 0; i < sun.reachCount; ++i) {  // the cheap part of the sweep first (most casters end here)
 				const auto& plane = sun.reachPlanes[i];
@@ -2487,6 +2528,10 @@ namespace CBRO::Core::Occlusion
 						if (!LightReach(a_add.object, *a_add.bound, reach)) {
 							Bump(kInvalid);
 							hidden = false;
+						} else if (FirstPersonUnseen(a_context) && ReachNearEye(a_context, reach.center, reach.fRadius)) {
+							CountVerdict(Verdict::kNear);
+							RecordKept(a_context, a_add.object, reach, "light reaches first person");
+							hidden = false;
 						} else if (const auto lightVerdict = Test(a_context, reach); lightVerdict != Verdict::kHidden) {
 							CountVerdict(lightVerdict);
 							RecordKept(a_context, a_add.object, reach, "light reaches the view");
@@ -3779,6 +3824,10 @@ namespace CBRO::Core::Occlusion
 			reason(SphereReason::kNoDepth);
 			return SphereVerdict::kUnknown;
 		}
+		if (FirstPersonUnseen(*context) && ReachNearEye(*context, a_center, a_radius)) {
+			reason(SphereReason::kNear);  // may light the first-person geometry
+			return SphereVerdict::kUnknown;
+		}
 		RE::NiBound bound{};
 		bound.center = a_center;
 		bound.fRadius = a_radius;
@@ -3861,6 +3910,9 @@ namespace CBRO::Core::Occlusion
 		const float dir[3]{ d[0] / dist, d[1] / dist, d[2] / dist };
 		const float spread = r / dist;             // the cone widens with the distance from the lamp
 		const float tMax = a_reach - dist + r;     // no light beyond the reach: no shadow either
+		if (FirstPersonUnseen(*context) && SweepNearEye(center, dir, r, spread, tMax, kFirstPersonReach)) {
+			return LampVerdict::kNeeded;  // may shadow the first-person geometry
+		}
 		float       t0 = 0.0f, t1 = 0.0f;
 		if (!ShadowGeometry::SweepClip(center, dir, r, spread, tMax, context->lampPlanes, context->lampPlaneCount, t0, t1)) {
 			return LampVerdict::kOutside;

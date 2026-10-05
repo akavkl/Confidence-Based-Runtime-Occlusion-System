@@ -90,6 +90,10 @@ namespace CBRO::Core::HiZ
 		std::uint32_t                 mergedFrames{ 1 };
 		float                         mergeMove{ 0.0f };
 		std::uint32_t                 readbackIndex{ 0 };  // the capture's index (Blocks() is dated by it)
+		// The newest capture ran before the first-person block (Hooks/FirstPersonOrder, v1.69): it holds the world's
+		// depth behind the weapon and no first-person surface, so light and shadow tests must keep what may reach the
+		// first-person geometry around the eye themselves (Occlusion's kFirstPersonReach).
+		bool                          firstPersonAfter{ false };
 		std::uint32_t                 levels{ 0 };
 		std::array<std::uint32_t, 16> width{};
 		std::array<std::uint32_t, 16> height{};
@@ -146,7 +150,8 @@ namespace CBRO::Core::HiZ
 	};
 
 	// Creates GPU resources on first use. Returns false if the device path is unusable.
-	bool Capture(std::uint64_t a_frame, const Camera& a_camera);  // after the pre-pass
+	// After the pre-pass's world block; a_firstPersonAfter: before its first-person block too (Snapshot::firstPersonAfter).
+	bool Capture(std::uint64_t a_frame, const Camera& a_camera, bool a_firstPersonAfter);
 	void Poll();                                                  // map finished readbacks, publish the newest
 	[[nodiscard]] const Snapshot* Latest() noexcept;              // newest published snapshot or null
 	void Reset();                                                 // forget published data (load, device change)
