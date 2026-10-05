@@ -8,7 +8,10 @@
 #include "Settings.h"
 #include "Util/Gamebryo.h"
 
+#include <immintrin.h>
 #include <intrin.h>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace CBRO::Core::Occlusion
 {
@@ -1587,6 +1590,474 @@ namespace CBRO::Core::Occlusion
 			}
 		}
 
+		// ---- left-out dump (diagnostics: the frame before the kept dump's) ----------------------------
+		// Every object the main view leaves out on one steady frame (verdicts reused and from the async map as usual),
+		// with how it was left out, where its verdict came from, what a fresh test of its bound says against this
+		// frame's depth, and whether that bound holds the mesh's own vertices (meshes with a CPU copy). The bound is all
+		// CBRO and the engine's frustum test look at: a mesh reaching outside it can be hidden where it is seen.
+
+		enum class LeftOutPath : std::uint8_t
+		{
+			kRejected,        // main-only group: confirmed hidden, its entry rejected
+			kCasterRejected,  // group 0: neither the main view nor the sun needs it (rejected in every view)
+			kDropped,         // group 0 or another shared group: left out of the main view's registration only
+			kInherited,       // its parent was left out of the main view: so is it
+			kSkipHidden,      // a top-level add never filed: confirmed hidden
+			kSkipOutside,     // ... out of view
+			kSkipCaster,      // ... group 0, neither view needs it
+			kOutside,         // filed, judged out of view: the engine's own frustum test drops it from the main view
+		};
+		constexpr const char* kLeftOutPathNames[]{ "rejected", "rejected in every view", "main view drop", "parent dropped", "never filed: hidden", "never filed: out of view", "never filed: no view needs it", "out of view (engine's frustum test)" };
+
+		enum class VerdictSource : std::uint8_t
+		{
+			kFresh,   // evaluated this frame
+			kReused,  // last frame's record still held
+			kAsync,   // the async worker's map
+			kNone,    // not judged (inherited)
+		};
+		constexpr const char* kVerdictSourceNames[]{ "fresh", "reused", "async map", "not judged" };
+		thread_local VerdictSource t_source{ VerdictSource::kNone };  // set by JudgeOrLookup / JudgeRecord
+
+		struct LeftOutItem
+		{
+			const void*   object{ nullptr };
+			const void*   parent{ nullptr };
+			LeftOutPath   path{ LeftOutPath::kRejected };
+			VerdictSource source{ VerdictSource::kNone };
+			Outcome       outcome{ Outcome::kNone };
+			std::uint8_t  verdict{ 0 };
+			std::uint8_t  streak{ 0 };
+			Verdict       now{ Verdict::kInvalid };  // a fresh test of the same bound against this frame's depth
+			std::uint32_t fartherTexels{ 0 };        // ... when visible: level-0 texels beyond its nearest point
+			bool          shaped{ false };           // ... the sphere couldn't settle it and the mesh has a shape:
+			Verdict       shapeNow{ Verdict::kInvalid };  // what the shape test says now
+			float         bound[4]{};
+			float         ownOffset{ 0.0f };  // the object's own worldBound against the bound offered: center distance
+			float         ownRadius{ 0.0f };  // ... and its radius
+			float         distance{ 0.0f };
+			float         ndc[2]{};
+			bool          inFront{ false };
+			// Meshes with a CPU copy of their vertices: how many lie outside the bound offered, and by how much.
+			std::int32_t  vertices{ -1 };  // -1: not checked (no copy, skinned, merged, too many, transform unconfirmed)
+			std::uint32_t verticesOutside{ 0 };
+			float         excess{ 0.0f };
+			float         vertexNdc[2]{};  // the vertex box's center on screen
+			bool          vertexInFront{ false };
+			float         occluder{ 0.0f };  // view depth of the farthest surface over its screen rectangle (Hi-Z, coarse level)
+			float         viewDepth{ 0.0f };  // its center's view depth
+			std::uint32_t refID{ 0 };
+			std::uint32_t baseID{ 0 };
+			std::uint8_t  baseType{ 0 };
+			char          type[32]{};
+			char          name[48]{};
+			char          ancestry[128]{};  // parent < grandparent < ...: type 'name'
+		};
+
+		std::atomic<std::uint32_t> g_leftOutClock{ 0 };  // 0: no left-out dump pending
+		std::vector<LeftOutItem>   g_leftOut;  // (under g_keptLock)
+
+		bool LeftOutFrame(std::uint32_t a_clock) noexcept
+		{
+			const auto clock = g_leftOutClock.load(std::memory_order_relaxed);
+			return clock != 0 && clock == a_clock;
+		}
+		constexpr std::uint32_t    kMaxCheckedVertices = 20000;
+
+		// The same frame's depth as CBRO reads it, per 8x8 block of Hi-Z level 0: the farthest and the nearest surface
+		// (view depth), and the camera, taken by the first RecordLeftOut of the frame.
+		struct DepthPicture
+		{
+			std::uint32_t      width{ 0 }, height{ 0 };
+			std::vector<float> farthest, nearest;
+			float              eye[3]{}, dir[3]{};
+		};
+		std::atomic<std::uint32_t> g_pictureClock{ 0 };
+		DepthPicture               g_picture;  // (under g_keptLock)
+		HiZ::Camera                g_pictureCamera{};  // (under g_keptLock) the depth frame's camera, for the scene scan
+		bool                       g_pictureCameraValid{ false };
+		std::unordered_set<const void*> g_registered;  // (under g_keptLock) objects the main accumulator registered on that frame
+		// (under g_keptLock) objects offered to the main pass on that frame: bit 0 a Block::Add entry, bit 1 a top-level Group::Add
+		std::unordered_map<const void*, std::uint8_t> g_offered;
+
+		void NoteOffered(const FrameContext& a_context, const void* a_object, std::uint8_t a_how) noexcept
+		{
+			if (!LeftOutFrame(a_context.clock)) {
+				return;
+			}
+			std::scoped_lock lock(g_keptLock);
+			g_offered[a_object] |= a_how;
+		}
+
+		void TakeDepthPicture(const FrameContext& a_context) noexcept
+		{
+			const auto& snapshot = *a_context.snapshot;
+			const auto& camera = snapshot.camera;
+			DepthPicture picture{};
+			picture.width = snapshot.width[0] / 8;
+			picture.height = snapshot.height[0] / 8;
+			picture.farthest.assign(static_cast<std::size_t>(picture.width) * picture.height, 0.0f);
+			picture.nearest.assign(picture.farthest.size(), std::numeric_limits<float>::infinity());
+			for (int i = 0; i < 3; ++i) {
+				picture.eye[i] = camera.eye[i];
+				picture.dir[i] = camera.viewDir[i];
+			}
+			const auto* farthest = snapshot.texels + snapshot.offset[0];
+			const auto* nearest = snapshot.nearest ? snapshot.nearest + snapshot.offset[0] : nullptr;
+			for (std::uint32_t y = 0; y < picture.height * 8; ++y) {
+				for (std::uint32_t x = 0; x < picture.width * 8; ++x) {
+					const auto index = static_cast<std::size_t>(y) * snapshot.width[0] + x;
+					const auto block = static_cast<std::size_t>(y / 8) * picture.width + x / 8;
+					picture.farthest[block] = std::max(picture.farthest[block], LinearDepth(camera, farthest[index]));
+					if (nearest) {
+						picture.nearest[block] = std::min(picture.nearest[block], LinearDepth(camera, nearest[index]));
+					}
+				}
+			}
+			std::scoped_lock lock(g_keptLock);
+			g_picture = std::move(picture);
+			g_pictureCamera = camera;
+			g_pictureCameraValid = camera.viewSpace;
+		}
+
+		const char* FullVerdictName(Verdict a_verdict) noexcept
+		{
+			switch (a_verdict) {
+			case Verdict::kHidden:
+				return "hidden";
+			case Verdict::kOutside:
+				return "out of view";
+			case Verdict::kBehind:
+				return "behind";
+			default:
+				return VerdictName(a_verdict);
+			}
+		}
+
+		bool ProjectToView(const HiZ::Camera& a_camera, float a_x, float a_y, float a_z, float a_ndc[2]) noexcept
+		{
+			const float dx = a_x - a_camera.origin[0], dy = a_y - a_camera.origin[1], dz = a_z - a_camera.origin[2];
+			const float z = dx * a_camera.viewDir[0] + dy * a_camera.viewDir[1] + dz * a_camera.viewDir[2];
+			const float x = dx * a_camera.viewRight[0] + dy * a_camera.viewRight[1] + dz * a_camera.viewRight[2];
+			const float y = dx * a_camera.viewUp[0] + dy * a_camera.viewUp[1] + dz * a_camera.viewUp[2];
+			if (!(z > 1.0f)) {
+				return false;
+			}
+			a_ndc[0] = a_camera.scaleX * x / z;
+			a_ndc[1] = a_camera.scaleY * y / z;
+			return true;
+		}
+
+		// The reference owning the object (the nearest ancestor whose userData is a REFR or ACHR) and its base form.
+		void FindReference(const RE::NiAVObject* a_object, LeftOutItem& a_item) noexcept
+		{
+			__try {
+				const RE::NiAVObject* node = a_object;
+				for (int depth = 0; node && depth < 32; ++depth, node = node->parent) {
+					if (!node->userData) {
+						continue;
+					}
+					const auto form = reinterpret_cast<const RE::TESForm*>(node->userData);
+					const auto type = form->GetFormType();
+					if (type != RE::ENUM_FORM_ID::kREFR && type != RE::ENUM_FORM_ID::kACHR) {
+						continue;
+					}
+					a_item.refID = form->GetFormID();
+					if (const auto base = reinterpret_cast<const RE::TESObjectREFR*>(form)->GetObjectReference()) {
+						a_item.baseID = base->GetFormID();
+						a_item.baseType = static_cast<std::uint8_t>(base->GetFormType());
+					}
+					return;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+		}
+
+		const RE::NiAVObject* TryParent(const RE::NiAVObject* a_object) noexcept
+		{
+			__try {
+				return a_object->parent;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+
+		void DescribeAncestry(const RE::NiAVObject* a_object, char* a_out, std::size_t a_size) noexcept
+		{
+			std::size_t used = 0;
+			auto        node = TryParent(a_object);
+			for (int depth = 0; node && depth < 3 && used + 1 < a_size; ++depth, node = TryParent(node)) {
+				char type[32]{}, name[40]{};
+				Util::TryGetRTTIName(node, type, sizeof(type));
+				Util::TryGetObjectName(node, name, sizeof(name));
+				const auto written = std::snprintf(a_out + used, a_size - used, "%s%s '%s'", depth ? " < " : "", type, name);
+				if (written < 0) {
+					break;
+				}
+				used = std::min(a_size - 1, used + static_cast<std::size_t>(written));
+			}
+		}
+
+		// The mesh's CPU vertices placed in the world (the rotation reading the shape test verified) against the bound
+		// offered: how many lie outside it, and the box they span (all reads guarded).
+		void CheckVertices(const RE::NiAVObject* a_object, const float a_rotate[3][3], LeftOutItem& a_item, float a_lo[3], float a_hi[3]) noexcept
+		{
+			__try {
+				const auto base = reinterpret_cast<const std::byte*>(a_object);
+				if (*reinterpret_cast<const std::uintptr_t*>(base + 0x140) != 0) {
+					return;  // skinned
+				}
+				const auto triShape = *reinterpret_cast<const std::byte* const*>(base + 0x148);
+				if (!triShape) {
+					return;
+				}
+				const auto desc = *reinterpret_cast<const std::uint64_t*>(triShape);
+				const auto vertexBuffer = *reinterpret_cast<const std::byte* const*>(triShape + 0x8);
+				if (!vertexBuffer) {
+					return;
+				}
+				const auto          data = *reinterpret_cast<const std::byte* const*>(vertexBuffer + 0x8);
+				const auto          bytes = *reinterpret_cast<const std::uint32_t*>(vertexBuffer + 0x34);
+				const std::uint32_t stride = static_cast<std::uint32_t>(desc & 0xF) * 4;
+				const std::uint32_t position = static_cast<std::uint32_t>((desc >> 2) & 0x3C);
+				const bool          full = ((desc >> 44) & (1ull << 10)) != 0;
+				const std::uint32_t count = *reinterpret_cast<const std::uint16_t*>(base + 0x164);
+				if (!data || count == 0 || count > kMaxCheckedVertices || stride < position + (full ? 12u : 6u) ||
+					static_cast<std::uint64_t>(count) * stride > bytes) {
+					return;
+				}
+				const auto& transform = a_object->world;
+				const float translate[3]{ transform.translate.x, transform.translate.y, transform.translate.z };
+				const float slack = a_item.bound[3] + std::max(1.0f, a_item.bound[3] * 0.01f);
+				for (int i = 0; i < 3; ++i) {
+					a_lo[i] = std::numeric_limits<float>::max();
+					a_hi[i] = -std::numeric_limits<float>::max();
+				}
+				for (std::uint32_t v = 0; v < count; ++v) {
+					const auto* p = data + static_cast<std::size_t>(v) * stride + position;
+					float       local[3];
+					for (int k = 0; k < 3; ++k) {
+						local[k] = full ? reinterpret_cast<const float*>(p)[k] : _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(reinterpret_cast<const std::uint16_t*>(p)[k])));
+					}
+					float world[3];
+					for (int i = 0; i < 3; ++i) {
+						world[i] = translate[i] + transform.scale * (a_rotate[i][0] * local[0] + a_rotate[i][1] * local[1] + a_rotate[i][2] * local[2]);
+						a_lo[i] = std::min(a_lo[i], world[i]);
+						a_hi[i] = std::max(a_hi[i], world[i]);
+					}
+					const float dx = world[0] - a_item.bound[0], dy = world[1] - a_item.bound[1], dz = world[2] - a_item.bound[2];
+					const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+					if (d > slack) {
+						++a_item.verticesOutside;
+						a_item.excess = std::max(a_item.excess, d - a_item.bound[3]);
+					}
+				}
+				a_item.vertices = static_cast<std::int32_t>(count);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				a_item.vertices = -1;
+			}
+		}
+
+		// ---- kept in the middle of the screen (same frame): what the engine does with an object CBRO keeps --------------
+		// For each kept entry whose bound center lies in the middle third of the screen: its fade node (itself, or a mesh's
+		// shader property +0x48) and that node's fade and mesh-LOD state (FO4-ENGINE-NOTES 7.8, 7.9, 7.11). A node with
+		// currentFade 0 files no meshes; a mesh-LOD level below 3 draws only the first segments of a BSMeshLODTriShape.
+		struct KeptRegionItem
+		{
+			const void*   object{ nullptr };
+			const void*   fadeNode{ nullptr };
+			Hooks::CullGroups::GroupKind kind{ Hooks::CullGroups::GroupKind::kUnknown };
+			float         bound[4]{};
+			float         distance{ 0.0f };
+			float         ndc[2]{};
+			bool          fadeRead{ false };
+			float         fadeAmount{ 0.0f }, currentFade{ 0.0f }, nearDistance{ 0.0f }, farDistance{ 0.0f }, boundRadius{ 0.0f }, lodBlend{ 0.0f };
+			std::uint8_t  fadeType{ 0 }, lodState{ 0 }, lodLevel{ 0 }, lodPrevious{ 0 };
+			std::uint64_t fadeFlags{ 0 };
+			std::int64_t  unseenFrames{ 0 };  // frame counter - the node's last OnVisible stamp
+			std::uint32_t lodSizes[3]{};      // BSMeshLODTriShape only
+			bool          meshLOD{ false };
+			std::uint32_t refID{ 0 };
+			std::uint32_t baseID{ 0 };
+			char          type[32]{};
+			char          name[48]{};
+			char          ancestry[128]{};
+		};
+		std::vector<KeptRegionItem> g_keptRegion;  // (under g_keptLock)
+
+		bool ReadFadeState(const std::byte* a_node, std::uint32_t a_frame, KeptRegionItem& a_item) noexcept
+		{
+			__try {
+				a_item.fadeAmount = *reinterpret_cast<const float*>(a_node + 0x118);
+				a_item.fadeType = *reinterpret_cast<const std::uint8_t*>(a_node + 0x11C);
+				a_item.lodState = *reinterpret_cast<const std::uint8_t*>(a_node + 0x11D);
+				a_item.lodLevel = *reinterpret_cast<const std::uint8_t*>(a_node + 0x11E);
+				a_item.lodPrevious = *reinterpret_cast<const std::uint8_t*>(a_node + 0x11F);
+				a_item.lodBlend = *reinterpret_cast<const float*>(a_node + 0x13C);
+				a_item.nearDistance = *reinterpret_cast<const float*>(a_node + 0x198);
+				a_item.farDistance = *reinterpret_cast<const float*>(a_node + 0x19C);
+				a_item.currentFade = *reinterpret_cast<const float*>(a_node + 0x1A0);
+				a_item.boundRadius = *reinterpret_cast<const float*>(a_node + 0x1A8);
+				a_item.unseenFrames = static_cast<std::int64_t>(a_frame) - static_cast<std::int64_t>(*reinterpret_cast<const std::uint32_t*>(a_node + 0x1B0));
+				a_item.fadeFlags = *reinterpret_cast<const std::uint64_t*>(a_node + 0x108);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		const std::byte* ShaderFadeNode(const RE::NiAVObject* a_geometry) noexcept
+		{
+			__try {
+				const auto shader = *reinterpret_cast<const std::byte* const*>(reinterpret_cast<const std::byte*>(a_geometry) + 0x138);
+				return shader ? *reinterpret_cast<const std::byte* const*>(shader + 0x48) : nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+
+		void ReadLODSizes(const RE::NiAVObject* a_geometry, KeptRegionItem& a_item) noexcept
+		{
+			__try {
+				for (int i = 0; i < 3; ++i) {
+					a_item.lodSizes[i] = *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::byte*>(a_geometry) + 0x170 + 4 * i);
+				}
+				a_item.meshLOD = true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+		}
+
+		void RecordKeptRegion(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add) noexcept
+		{
+			if (!LeftOutFrame(a_context.clock) || !a_context.snapshot || !a_add.object || !a_add.bound) {
+				return;
+			}
+			const auto& camera = a_context.snapshot->camera;
+			KeptRegionItem item{};
+			if (!camera.viewSpace || !ProjectToView(camera, a_add.bound->center.x, a_add.bound->center.y, a_add.bound->center.z, item.ndc) ||
+				std::abs(item.ndc[0]) > 1.0f / 3.0f || std::abs(item.ndc[1]) > 1.0f / 3.0f) {
+				return;
+			}
+			if (g_drops.Contains(a_add.object, DropSet::Tag(a_context.clock))) {
+				return;  // (left out of the main view: the left-out dump has it)
+			}
+			item.object = a_add.object;
+			item.kind = a_add.kind;
+			item.bound[0] = a_add.bound->center.x;
+			item.bound[1] = a_add.bound->center.y;
+			item.bound[2] = a_add.bound->center.z;
+			item.bound[3] = a_add.bound->fRadius;
+			const float dx = item.bound[0] - camera.eye[0], dy = item.bound[1] - camera.eye[1], dz = item.bound[2] - camera.eye[2];
+			item.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+			Util::TryGetRTTIName(a_add.object, item.type, sizeof(item.type));
+			Util::TryGetObjectName(a_add.object, item.name, sizeof(item.name));
+			DescribeAncestry(a_add.object, item.ancestry, sizeof(item.ancestry));
+			LeftOutItem ref{};
+			FindReference(a_add.object, ref);
+			item.refID = ref.refID;
+			item.baseID = ref.baseID;
+
+			static const auto frameCounter = reinterpret_cast<const std::uint32_t*>(CBRO::Engine::OG(734919).address());
+			const std::string_view type(item.type);
+			const std::byte* node = nullptr;
+			if (type == "BSFadeNode"sv || type == "BSLeafAnimNode"sv) {
+				node = reinterpret_cast<const std::byte*>(a_add.object);
+			} else if (const_cast<RE::NiAVObject*>(a_add.object)->IsGeometry()) {
+				node = ShaderFadeNode(a_add.object);
+				if (type == "BSMeshLODTriShape"sv) {
+					ReadLODSizes(a_add.object, item);
+				}
+			}
+			static const auto defaultFade = CBRO::Engine::OG(244120).address();  // (the shader property's default +0x48 object, or a pointer to it)
+			if (node && reinterpret_cast<std::uintptr_t>(node) != defaultFade && reinterpret_cast<std::uintptr_t>(node) != *reinterpret_cast<const std::uintptr_t*>(defaultFade)) {
+				item.fadeNode = node;
+				item.fadeRead = ReadFadeState(node, *frameCounter, item);
+			}
+			std::scoped_lock lock(g_keptLock);
+			if (g_keptRegion.size() < 16384) {
+				g_keptRegion.push_back(item);
+			}
+		}
+
+		void RecordLeftOut(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound, LeftOutPath a_path, const Record* a_record) noexcept
+		{
+			if (!LeftOutFrame(a_context.clock) || !a_context.snapshot) {
+				return;
+			}
+			if (g_pictureClock.exchange(a_context.clock) != a_context.clock) {
+				TakeDepthPicture(a_context);
+			}
+			LeftOutItem item{};
+			item.object = a_object;
+			item.parent = a_object->parent;
+			item.path = a_path;
+			item.source = a_path == LeftOutPath::kInherited ? VerdictSource::kNone : t_source;
+			if (a_record) {
+				item.outcome = a_record->outcome;
+				item.verdict = a_record->verdict;
+				item.streak = a_record->streak;
+			}
+			item.bound[0] = a_bound.center.x;
+			item.bound[1] = a_bound.center.y;
+			item.bound[2] = a_bound.center.z;
+			item.bound[3] = a_bound.fRadius;
+			const auto& camera = a_context.snapshot->camera;
+			const float dx = a_bound.center.x - camera.eye[0], dy = a_bound.center.y - camera.eye[1], dz = a_bound.center.z - camera.eye[2];
+			item.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+			item.inFront = camera.viewSpace && ProjectToView(camera, a_bound.center.x, a_bound.center.y, a_bound.center.z, item.ndc);
+			if (item.inFront) {
+				const auto& snapshot = *a_context.snapshot;
+				item.viewDepth = dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2];
+				const float w = static_cast<float>(snapshot.width[0]), h = static_cast<float>(snapshot.height[0]);
+				const float cx = (item.ndc[0] * 0.5f + 0.5f) * w, cy = (0.5f - item.ndc[1] * 0.5f) * h;
+				const float rx = a_bound.fRadius / std::max(item.viewDepth, 1.0f) * camera.scaleX * w * 0.5f;
+				const float ry = a_bound.fRadius / std::max(item.viewDepth, 1.0f) * camera.scaleY * h * 0.5f;
+				item.occluder = LinearDepth(camera, snapshot.MaxDepth(cx - rx, cy - ry, cx + rx, cy + ry));
+			}
+			const auto& own = a_object->worldBound;
+			const float ox = own.center.x - a_bound.center.x, oy = own.center.y - a_bound.center.y, oz = own.center.z - a_bound.center.z;
+			item.ownOffset = std::sqrt(ox * ox + oy * oy + oz * oz);
+			item.ownRadius = own.fRadius;
+
+			VisibleEvidence evidence{};
+			item.now = Test(a_context, a_bound, nullptr, nullptr, &evidence);
+			if (item.now == Verdict::kVisible && evidence.valid) {
+				item.fartherTexels = a_context.snapshot->ScanFarther(evidence.x0, evidence.y0, evidence.x1, evidence.y1, evidence.threshold, evidence.rays ? &evidence.sphere : nullptr).texels;
+			}
+			if (g_tunables.meshShapes && (item.now == Verdict::kVisible || item.now == Verdict::kNear || item.now == Verdict::kEdge) && a_bound.fRadius >= kShapeMinRadius &&
+				camera.viewSpace && (TypeOf(a_object) & kTypeCullable)) {
+				RE::NiBound model{};
+				if (const auto shape = MeshProxy::Find(const_cast<RE::NiAVObject*>(a_object), model)) {
+					std::uint32_t cells = 0;
+					std::uint8_t  hint = 0;
+					item.shaped = true;
+					item.shapeNow = TestShape(a_context, a_object, model, *shape, cells, hint);
+				}
+			}
+
+			Util::TryGetRTTIName(a_object, item.type, sizeof(item.type));
+			Util::TryGetObjectName(a_object, item.name, sizeof(item.name));
+			DescribeAncestry(a_object, item.ancestry, sizeof(item.ancestry));
+			FindReference(a_object, item);
+
+			if (camera.viewSpace && const_cast<RE::NiAVObject*>(a_object)->IsGeometry() && Util::TryReadVtable(a_object) != g_mergedVtable) {
+				float       rotate[3][3];
+				const auto& model = *reinterpret_cast<const RE::NiBound*>(reinterpret_cast<const std::byte*>(a_object) + 0x120);
+				if (WorldRotation(a_object, model, rotate)) {
+					float lo[3]{}, hi[3]{};
+					CheckVertices(a_object, rotate, item, lo, hi);
+					if (item.vertices > 0) {
+						item.vertexInFront = ProjectToView(camera, (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f, item.vertexNdc);
+					}
+				}
+			}
+
+			std::scoped_lock lock(g_keptLock);
+			if (g_leftOut.size() < 16384) {
+				g_leftOut.push_back(item);
+			}
+		}
+
 		// Hidden streak for a hidden verdict now: consecutive only if the object tested hidden in the
 		// previous frame too (a visible verdict writes nothing, so it breaks the chain by omission).
 		std::uint32_t HiddenStreak(std::uint64_t a_value, std::uint32_t a_clock) noexcept
@@ -2402,6 +2873,7 @@ namespace CBRO::Core::Occlusion
 					Bump(kCyclesEvaluate, (__rdtsc() - start) * kTimingStride);
 				}
 			}
+			t_source = reused ? VerdictSource::kReused : VerdictSource::kFresh;  // (the left-out dump)
 			if (a_wantSun && !(a_out.flags & kRecordLight)) {
 				const bool unneededByView = a_out.outcome == Outcome::kOutside || (a_out.outcome == Outcome::kHidden && a_out.streak >= g_tunables.confirmFrames);
 				const bool sunReusable = reused && old->sun != SunOutcome::kNone && old->sunEpoch == a_context.sunEpoch;
@@ -2462,6 +2934,7 @@ namespace CBRO::Core::Occlusion
 				record->bound[2] == a_add.bound->center.z && record->bound[3] == a_add.bound->fRadius) {
 				a_out = *record;
 				Bump(kCacheHits);
+				t_source = VerdictSource::kAsync;
 				return;
 			}
 			if (!a_context.cull) {
@@ -2522,7 +2995,14 @@ namespace CBRO::Core::Occlusion
 			switch (a_add.kind) {
 			case Hooks::CullGroups::GroupKind::kMainOnly: {
 				JudgeOrLookup(a_context, streams.child, a_add, false, out);
-				return out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing() ? &a_context.reject : nullptr;
+				if (out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing()) {
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kRejected, &out);
+					return &a_context.reject;
+				}
+				if (out.outcome == Outcome::kOutside) {
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kOutside, &out);
+				}
+				return nullptr;
 			}
 			case Hooks::CullGroups::GroupKind::kSunShared: {
 				// Group 0 (the shadow casters; the sun's cascades read it too): rejected in every view only when neither
@@ -2540,6 +3020,7 @@ namespace CBRO::Core::Occlusion
 						Bump(kDropFull);
 					}
 					InheritHidden(a_add.object, a_context.clock, g_tunables.confirmFrames);
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kInherited, nullptr);
 					return nullptr;
 				}
 				JudgeOrLookup(a_context, streams.child, a_add, true, out);
@@ -2550,10 +3031,17 @@ namespace CBRO::Core::Occlusion
 				if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !(out.flags & kRecordLight) && GroupZeroUnneeded(a_context, out, a_add.object, *a_add.bound)) {
 					Bump(kCasterRejected);
 					SampleLeftOutType(a_context, a_add.object);
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kCasterRejected, &out);
 					return &a_context.reject;
 				}
-				if (hiddenConfirmed && !g_drops.Insert(a_add.object, tag)) {
-					Bump(kDropFull);
+				if (hiddenConfirmed) {
+					if (!g_drops.Insert(a_add.object, tag)) {
+						Bump(kDropFull);
+					} else {
+						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
+					}
+				} else if (out.outcome == Outcome::kOutside) {
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kOutside, &out);
 				}
 				return nullptr;
 			}
@@ -2570,11 +3058,16 @@ namespace CBRO::Core::Occlusion
 						Bump(kDropFull);
 					}
 					InheritHidden(a_add.object, a_context.clock, g_tunables.confirmFrames);
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kInherited, nullptr);
 					return nullptr;
 				}
 				JudgeOrLookup(a_context, streams.child, a_add, false, out);
-				if (out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing() && !g_drops.Insert(a_add.object, tag)) {
-					Bump(kDropFull);
+				if (out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing()) {
+					if (!g_drops.Insert(a_add.object, tag)) {
+						Bump(kDropFull);
+					} else {
+						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
+					}
 				}
 				return nullptr;
 			}
@@ -2590,17 +3083,28 @@ namespace CBRO::Core::Occlusion
 				}
 				return nullptr;
 			}
+			NoteOffered(*context, a_add.object, 1);  // (diagnostic, one frame per still location)
 			// Decided at Group::Add already (same thread): not again.
 			if (t_top.object == a_add.object && t_top.clock == context->clock) {
 				t_top.object = nullptr;
+				if (!t_top.result) {
+					RecordKeptRegion(*context, a_add);  // (diagnostic, one frame per still location)
+				}
 				return t_top.result;
 			}
 			if (!Timed(*context)) {
-				return FilterDecide(*context, a_add);
+				const auto result = FilterDecide(*context, a_add);
+				if (!result) {
+					RecordKeptRegion(*context, a_add);
+				}
+				return result;
 			}
 			const auto start = __rdtsc();
 			const auto result = FilterDecide(*context, a_add);
 			Bump(kCycles, (__rdtsc() - start) * kTimingStride);
+			if (!result) {
+				RecordKeptRegion(*context, a_add);
+			}
 			return result;
 		}
 
@@ -2614,6 +3118,10 @@ namespace CBRO::Core::Occlusion
 			}
 			Bump(kRegistered);
 			if (!g_drops.Contains(a_object, DropSet::Tag(context->clock))) {
+				if (LeftOutFrame(context->clock)) {
+					std::scoped_lock lock(g_keptLock);
+					g_registered.insert(a_object);  // (the scene scan's "registered with the main view")
+				}
 				return false;
 			}
 			Bump(kRegistrationsDropped);
@@ -2634,6 +3142,7 @@ namespace CBRO::Core::Occlusion
 			}
 			const bool timed = Timed(*context);
 			const auto start = timed ? __rdtsc() : 0;
+			NoteOffered(*context, a_object, 2);  // (diagnostic, one frame per still location)
 
 			bool skip = false;
 			if (!((a_object->GetFlags() >> 11) & 1) && !Hooks::CullGroups::IsSky(a_object)) {
@@ -2652,16 +3161,25 @@ namespace CBRO::Core::Occlusion
 						if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !light && GroupZeroUnneeded(*context, out, a_object, *a_bound)) {
 							Bump(kCasterSkipped);
 							SampleLeftOutType(*context, a_object);
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipCaster, &out);
 							skip = true;
-						} else if (hiddenConfirmed && !g_drops.Insert(a_object, DropSet::Tag(context->clock))) {
-							Bump(kDropFull);
+						} else if (hiddenConfirmed) {
+							if (!g_drops.Insert(a_object, DropSet::Tag(context->clock))) {
+								Bump(kDropFull);
+							} else {
+								RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);
+							}
+						} else if (out.outcome == Outcome::kOutside) {
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kOutside, &out);
 						}
 					} else if (hiddenConfirmed) {
 						Bump(kSkippedHidden);
+						RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipHidden, &out);
 						skip = true;
 					} else if (out.outcome == Outcome::kOutside && !light) {
 						// (a light's bound can be off-view while its light still reaches into view)
 						Bump(kSkippedOutside);
+						RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipOutside, &out);
 						skip = true;
 					}
 				}
@@ -3449,8 +3967,256 @@ namespace CBRO::Core::Occlusion
 
 	void RequestKeptDump()
 	{
+		// The left-out dump takes the next frame as it comes (verdicts reused as usual); the kept dump the one after,
+		// on which nothing is reused (so every kept object is evaluated, and recorded).
 		std::uint32_t expected = 0;
-		g_dumpClock.compare_exchange_strong(expected, Clock() + 1);
+		if (g_dumpClock.compare_exchange_strong(expected, Clock() + 2) && Settings::Get().leftOutDump) {
+			g_leftOutClock.store(Clock() + 1);
+		}
+	}
+
+	namespace
+	{
+		void LogLeftOut(std::vector<LeftOutItem>& a_items, std::uint32_t a_clock)
+		{
+			constexpr const char* kOutcomeNames[]{ "none", "out of view", "hidden", "kept" };
+			std::array<std::uint32_t, 8> byPath{};
+			std::array<std::uint32_t, 4> bySource{};
+			std::map<std::string, std::uint32_t> byNow;
+			std::uint32_t checked = 0, outsideBound = 0, ownMismatch = 0;
+			const auto suspicious = [](const LeftOutItem& a_item) {
+				const auto verdict = a_item.shaped && a_item.shapeNow != Verdict::kInvalid ? a_item.shapeNow : a_item.now;
+				const bool seenNow = verdict != Verdict::kHidden && verdict != Verdict::kOutside && verdict != Verdict::kBehind;
+				const bool ownOff = a_item.ownOffset > std::max(1.0f, a_item.bound[3] * 0.01f) || std::abs(a_item.ownRadius - a_item.bound[3]) > std::max(1.0f, a_item.bound[3] * 0.01f);
+				return seenNow || a_item.verticesOutside > 0 || ownOff;
+			};
+			for (const auto& item : a_items) {
+				++byPath[static_cast<std::size_t>(item.path)];
+				++bySource[static_cast<std::size_t>(item.source)];
+				++byNow[FullVerdictName(item.now)];
+				checked += item.vertices > 0;
+				outsideBound += item.verticesOutside > 0;
+				ownMismatch += item.ownOffset > std::max(1.0f, item.bound[3] * 0.01f) || std::abs(item.ownRadius - item.bound[3]) > std::max(1.0f, item.bound[3] * 0.01f);
+			}
+			std::string paths, sources, now;
+			for (std::size_t i = 0; i < byPath.size(); ++i) {
+				if (byPath[i]) {
+					paths += std::format(" {} {} |", kLeftOutPathNames[i], byPath[i]);
+				}
+			}
+			for (std::size_t i = 0; i < bySource.size(); ++i) {
+				sources += std::format(" {} {}", kVerdictSourceNames[i], bySource[i]);
+			}
+			for (const auto& [name, count] : byNow) {
+				now += std::format(" {} {}", name, count);
+			}
+			logger::info(
+				"==== left out of the main view on one steady frame (clock {}): {} objects ====|{} verdicts:{} | a fresh test of the same bound now:{} | meshes checked against their bound: {}, with vertices outside it {} | own world bound differs from the bound offered: {}",
+				a_clock, a_items.size(), paths, sources, now, checked, outsideBound, ownMismatch);
+
+			// Suspicious first (seen by a fresh test, vertices outside the bound, a bound other than the object's own),
+			// then the nearest ones whose bound center is on screen. Screen = NDC of the depth frame's camera, x right,
+			// y up, [-1, 1].
+			std::ranges::sort(a_items, [](const LeftOutItem& a_left, const LeftOutItem& a_right) { return a_left.distance < a_right.distance; });
+			const auto line = [&](const LeftOutItem& a_item, const char* a_tag) {
+				std::string vertices = "not checked";
+				if (a_item.vertices > 0) {
+					vertices = a_item.verticesOutside ?
+					               std::format("{} of {} outside the bound by up to {:.0f}, their box at screen ({:.3f},{:.3f}){}", a_item.verticesOutside, a_item.vertices, a_item.excess,
+									   a_item.vertexNdc[0], a_item.vertexNdc[1], a_item.vertexInFront ? "" : " behind the camera") :
+					               std::format("all {} inside the bound", a_item.vertices);
+				}
+				logger::info(
+					"  {} {} ({}) | {} '{}' {:X} in {} {:X} | ref {:08X} base {:08X} (form type {}) | bound ({:.0f},{:.0f},{:.0f}) r={:.0f} dist={:.0f} screen ({:.3f},{:.3f}){} view depth {:.0f}, farthest surface over it {:.0f} | record {} ({}) streak {} | now {}{} | own world bound {:.0f} off, r={:.0f} | vertices: {}",
+					a_tag, kLeftOutPathNames[static_cast<std::size_t>(a_item.path)], kVerdictSourceNames[static_cast<std::size_t>(a_item.source)], a_item.type, a_item.name,
+					reinterpret_cast<std::uintptr_t>(a_item.object), a_item.ancestry, reinterpret_cast<std::uintptr_t>(a_item.parent), a_item.refID, a_item.baseID, a_item.baseType,
+					a_item.bound[0], a_item.bound[1], a_item.bound[2], a_item.bound[3], a_item.distance, a_item.ndc[0], a_item.ndc[1], a_item.inFront ? "" : " (behind the camera)",
+					a_item.viewDepth, a_item.occluder, kOutcomeNames[static_cast<std::size_t>(a_item.outcome) & 3],
+					FullVerdictName(static_cast<Verdict>(a_item.verdict)), a_item.streak, FullVerdictName(a_item.now),
+					(a_item.now == Verdict::kVisible ? std::format(" ({} level-0 texels beyond its nearest point)", a_item.fartherTexels) : std::string{}) +
+						(a_item.shaped ? std::format(", by its mesh shape {}", FullVerdictName(a_item.shapeNow)) : std::string{}),
+					a_item.ownOffset, a_item.ownRadius, vertices);
+			};
+			std::uint32_t printed = 0;
+			for (auto& item : a_items) {
+				if (printed >= 150) {
+					break;
+				}
+				if (suspicious(item)) {
+					line(item, "!");
+					item.object = nullptr;  // (printed)
+					++printed;
+				}
+			}
+			// Then every one whose bound center lies in the middle third of the screen, nearest first.
+			printed = 0;
+			for (const auto& item : a_items) {
+				if (printed >= 400) {
+					break;
+				}
+				if (item.object && item.inFront && std::abs(item.ndc[0]) <= 1.0f / 3.0f && std::abs(item.ndc[1]) <= 1.0f / 3.0f) {
+					line(item, "-");
+					++printed;
+				}
+			}
+		}
+
+		// Every mesh in the scene graph whose world bound center lies in a screen window around the screen's upper middle
+		// (the A/B spot's missing traffic-signal heads: NDC x -0.16..0.20, y 0.04..0.30, view depth 2500..7000), with its
+		// path from the scene root (child index, type, name), AppCulled ancestors, and whether the main accumulator
+		// registered it on the left-out frame. Main thread, at a frame start.
+		void ScanScene(const HiZ::Camera& a_camera, const std::unordered_set<const void*>& a_registered, const std::unordered_map<const void*, std::uint8_t>& a_offered)
+		{
+			const auto root = *reinterpret_cast<RE::NiNode* const*>(CBRO::Engine::OG(1327069).address());
+			if (!root) {
+				return;
+			}
+			struct Scan
+			{
+				const HiZ::Camera&                                   camera;
+				const std::unordered_set<const void*>&               registered;
+				const std::unordered_map<const void*, std::uint8_t>& offered;
+				std::vector<std::string>                             path;
+				std::vector<std::string>               lines;
+				std::uint32_t                          visited{ 0 }, found{ 0 }, foundRegistered{ 0 };
+				int                                    culledAt{ -1 };
+
+				void Visit(const RE::NiAVObject* a_object, int a_index)
+				{
+					if (!a_object || ++visited > 4'000'000 || path.size() >= 40) {
+						return;
+					}
+					char type[32]{}, name[40]{};
+					Util::TryGetRTTIName(a_object, type, sizeof(type));
+					Util::TryGetObjectName(a_object, name, sizeof(name));
+					const bool culled = (a_object->GetFlags() & 1) != 0;
+					const auto how = offered.find(a_object);
+					const auto mark = how == offered.end() ? "" : how->second == 1 ? "[entry]" : how->second == 2 ? "[top-level]" : "[top-level+entry]";
+					path.push_back(std::format("{}:{}'{}'{}{}", a_index, type, name, culled ? "(AppCulled)" : "", mark));
+					const int savedCulled = culledAt;
+					if (culled && culledAt < 0) {
+						culledAt = static_cast<int>(path.size()) - 1;
+					}
+					if (const auto node = const_cast<RE::NiAVObject*>(a_object)->IsNode()) {
+						int i = 0;
+						for (auto& child : node->children) {
+							Visit(child.get(), i++);
+						}
+					} else if (const_cast<RE::NiAVObject*>(a_object)->IsGeometry()) {
+						Check(a_object, type, name);
+					}
+					culledAt = savedCulled;
+					path.pop_back();
+				}
+
+				void Check(const RE::NiAVObject* a_object, const char* a_type, const char* a_name)
+				{
+					const auto& bound = a_object->worldBound;
+					float       ndc[2];
+					if (!ProjectToView(camera, bound.center.x, bound.center.y, bound.center.z, ndc) || ndc[0] < -0.16f || ndc[0] > 0.20f || ndc[1] < 0.04f || ndc[1] > 0.30f) {
+						return;
+					}
+					const float dx = bound.center.x - camera.origin[0], dy = bound.center.y - camera.origin[1], dz = bound.center.z - camera.origin[2];
+					const float depth = dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2];
+					if (depth < 2500.0f || depth > 7000.0f) {
+						return;
+					}
+					++found;
+					const bool registeredNow = registered.contains(a_object);
+					foundRegistered += registeredNow;
+					if (lines.size() >= 400) {
+						return;
+					}
+					std::string chain;
+					for (std::size_t i = 0; i < path.size(); ++i) {
+						chain += (i ? " / " : "") + path[i];
+					}
+					std::string fade = "no fade node";
+					if (const auto node = ShaderFadeNode(a_object)) {
+						KeptRegionItem item{};
+						static const auto frameCounter = reinterpret_cast<const std::uint32_t*>(CBRO::Engine::OG(734919).address());
+						if (ReadFadeState(node, *frameCounter, item)) {
+							fade = std::format("fade node {:X} currentFade {:.2f} fadeAmount {:.2f} unseen {} frames, mesh LOD level {}", reinterpret_cast<std::uintptr_t>(node),
+								item.currentFade, item.fadeAmount, item.unseenFrames, item.lodLevel);
+						}
+					}
+					lines.push_back(std::format(
+						"  {} | {} '{}' {:X} | bound ({:.0f},{:.0f},{:.0f}) r={:.0f} view depth {:.0f} screen ({:.3f},{:.3f}) | AppCulled {} | registered with the main view: {} | {} | path: {}",
+						registeredNow ? "drawn" : "NOT REGISTERED", a_type, a_name, reinterpret_cast<std::uintptr_t>(a_object), bound.center.x, bound.center.y, bound.center.z, bound.fRadius,
+						depth, ndc[0], ndc[1], culledAt < 0 ? std::string("no") : std::format("at path level {}", culledAt), registeredNow ? "yes" : "no", fade, chain));
+				}
+			};
+			Scan scan{ a_camera, a_registered, a_offered };
+			scan.Visit(root, 0);
+			logger::info(
+				"==== scene scan: meshes with their bound center at NDC x -0.16..0.20, y 0.04..0.30, view depth 2500..7000: {} ({} registered with the main view on the left-out frame, {} not) | {} objects visited ====",
+				scan.found, scan.foundRegistered, scan.found - scan.foundRegistered, scan.visited);
+			for (const auto& line : scan.lines) {
+				logger::info("{}", line);
+			}
+		}
+
+		void LogKeptRegion(std::vector<KeptRegionItem>& a_items)
+		{
+			std::ranges::sort(a_items, [](const KeptRegionItem& a_left, const KeptRegionItem& a_right) { return a_left.distance < a_right.distance; });
+			std::uint32_t faded = 0, lowLOD = 0;
+			for (const auto& item : a_items) {
+				faded += item.fadeRead && !(item.currentFade > 0.0f);
+				lowLOD += item.fadeRead && item.lodLevel < 3 && ((item.fadeFlags >> 12) & 1);
+			}
+			logger::info(
+				"==== kept in the middle third of the screen on the same frame: {} entries | their fade node at currentFade 0 (files no meshes): {} | mesh LOD level below 3 (mesh-LOD flag set): {} ====",
+				a_items.size(), faded, lowLOD);
+			constexpr const char* kKindNames[]{ "main-only", "group 0", "unknown" };
+			std::uint32_t printed = 0;
+			for (const auto& item : a_items) {
+				if (printed++ >= 500) {
+					break;
+				}
+				std::string fade = "no fade node";
+				if (item.fadeRead) {
+					const auto bit = [&](int a_bit) { return static_cast<int>((item.fadeFlags >> a_bit) & 1); };
+					fade = std::format(
+						"fade node {:X}: type {} fadeAmount {:.2f} currentFade {:.2f} near {:.0f} far {:.0f} boundRadius {:.0f} unseen {} frames | bits 12 {} 14 {} 15 {} 37 {} 38 {} | mesh LOD level {} (previous {}, state {}, blend {:.2f})",
+						reinterpret_cast<std::uintptr_t>(item.fadeNode), item.fadeType, item.fadeAmount, item.currentFade, item.nearDistance, item.farDistance, item.boundRadius,
+						item.unseenFrames, bit(12), bit(14), bit(15), bit(37), bit(38), item.lodLevel, item.lodPrevious, item.lodState, item.lodBlend);
+				}
+				const auto kind = static_cast<std::size_t>(item.kind);
+				logger::info(
+					"  kept {} | {} '{}' {:X} in {} | ref {:08X} base {:08X} | bound ({:.0f},{:.0f},{:.0f}) r={:.0f} dist={:.0f} screen ({:.3f},{:.3f}) | {}{}",
+					kind < 3 ? kKindNames[kind] : "?", item.type, item.name, reinterpret_cast<std::uintptr_t>(item.object), item.ancestry, item.refID, item.baseID,
+					item.bound[0], item.bound[1], item.bound[2], item.bound[3], item.distance, item.ndc[0], item.ndc[1], fade,
+					item.meshLOD ? std::format(" | segments {}/{}/{}", item.lodSizes[0], item.lodSizes[1], item.lodSizes[2]) : std::string{});
+			}
+		}
+
+		// The depth CBRO tested against on that frame, in view depth per 8x8 block of Hi-Z level 0 (rows top to bottom,
+		// screen y from +1 down to -1; columns left to right): k = thousands of units, "  -  " = the far plane (sky).
+		void LogDepthPicture(const DepthPicture& a_picture)
+		{
+			if (a_picture.farthest.empty()) {
+				return;
+			}
+			logger::info(
+				"==== depth on that frame, per block of {}x{} ({} columns x {} rows, NDC x = (column + 0.5) / {} * 2 - 1, y = 1 - (row + 0.5) / {} * 2), camera at ({:.0f},{:.0f},{:.0f}) looking ({:.3f},{:.3f},{:.3f}) ====",
+				8, 8, a_picture.width, a_picture.height, a_picture.width, a_picture.height, a_picture.eye[0], a_picture.eye[1], a_picture.eye[2], a_picture.dir[0], a_picture.dir[1], a_picture.dir[2]);
+			const auto cell = [](float a_depth) {
+				if (!std::isfinite(a_depth) || a_depth > 1.0e6f) {
+					return std::string("   - ");
+				}
+				return a_depth < 10000.0f ? std::format("{:5.1f}", a_depth / 1000.0f) : std::format("{:5.0f}", a_depth / 1000.0f);
+			};
+			for (const auto* plane : { &a_picture.farthest, &a_picture.nearest }) {
+				logger::info("{} surface per block (k units):", plane == &a_picture.farthest ? "farthest" : "nearest");
+				for (std::uint32_t y = 0; y < a_picture.height; ++y) {
+					std::string row = std::format("  row {:2}:", y);
+					for (std::uint32_t x = 0; x < a_picture.width; ++x) {
+						row += cell((*plane)[static_cast<std::size_t>(y) * a_picture.width + x]);
+					}
+					logger::info("{}", row);
+				}
+			}
+		}
 	}
 
 	void FlushKeptDump()
@@ -3459,11 +4225,36 @@ namespace CBRO::Core::Occlusion
 		if (dumpClock == 0 || Clock() <= dumpClock) {
 			return;
 		}
-		std::vector<KeptItem> items;
+		std::vector<KeptItem>       items;
+		std::vector<LeftOutItem>    leftOut;
+		std::vector<KeptRegionItem> keptRegion;
+		DepthPicture                picture;
+		std::unordered_set<const void*> registered;
+		std::unordered_map<const void*, std::uint8_t> offered;
+		HiZ::Camera                 camera{};
+		bool                        cameraValid = false;
 		{
 			std::scoped_lock lock(g_keptLock);
 			items.swap(g_kept);
+			leftOut.swap(g_leftOut);
+			keptRegion.swap(g_keptRegion);
+			registered.swap(g_registered);
+			offered.swap(g_offered);
+			picture = std::move(g_picture);
+			g_picture = DepthPicture{};
+			camera = g_pictureCamera;
+			cameraValid = g_pictureCameraValid;
+			g_pictureCameraValid = false;
 		}
+		if (const auto leftOutClock = g_leftOutClock.load(); leftOutClock != 0) {  // (bLeftOutDump)
+			LogLeftOut(leftOut, leftOutClock);
+			LogKeptRegion(keptRegion);
+			if (cameraValid) {
+				ScanScene(camera, registered, offered);
+			}
+			LogDepthPicture(picture);
+		}
+		g_leftOutClock.store(0);
 		g_dumpClock.store(0);
 
 		// Meshes a shape settled on this frame (not drawn): listed apart, largest first, so a wrongly hidden
@@ -3649,6 +4440,10 @@ namespace CBRO::Core::Occlusion
 			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f} || sky meshes given previs's force-visible mark {:.2f}, CBRO drops of them ignored {:.2f}",
 			per(kMerged), per(kMergedRejected), per(kMergedConfirming), per(kInstanceTests), per(kInstanceEntries), per(kInstanceEntriesRejected),
 			static_cast<double>(Hooks::CullGroups::TakeForcedCleared()) / frames, static_cast<double>(sky.forced) / frames, static_cast<double>(sky.kept) / frames);
+		const auto art = Hooks::CullGroups::TakeCellArtCounts();
+		logger::info(
+			"cell art node 9 per frame (AppCulled by the engine, previs draws its chunks by id): nodes {:.2f} | children filed into group 0 {:.1f}",
+			static_cast<double>(art.nodes) / frames, static_cast<double>(art.filed) / frames);
 		logger::info(
 			"occlusion lights per frame: tested {:.0f} | rejected {:.0f} (point/spot lights whose whole reach is hidden)",
 			per(kLightsTested), per(kLightsRejected));

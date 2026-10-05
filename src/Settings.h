@@ -32,6 +32,7 @@ namespace CBRO
 		bool          spotCullWindow{ true };      // CBRO frames: previs suspended around a spot light's group-0 cull, so its frustum test runs (else stale results)
 		bool          spotCasterTrim{ true };      // kept spot lights: casters that can't shadow a visible pixel are left out of the shadow map (as point lights' are)
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
+		bool          cellArtNode9{ true };        // CBRO frames: a cell's node 9 (precombined art) the engine has AppCulled is filed anyway, as previs draws it by id
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
 		bool          skipPrevisQuery{ true };     // CBRO frames: previs's per-frame query is neither launched nor collected (Hooks/PrevisFeed)
 		bool          interiors{ true };           // CBRO culls interiors/override-root scenes too (0: stands by there, the engine's previs and rooms untouched)
@@ -42,6 +43,7 @@ namespace CBRO
 		bool          lampGroupTrim{ true };       // sun off: group-0 entries the main view doesn't need are left out when no lamp's shadow of them can reach a visible surface
 		bool          unoccludeLights{ true };     // CBRO frames: clear the previs-driven BSLight::bOccluded mark before the deferred-lights stage (dark lamps otherwise)
 		bool          lampDiagnostic{ true };      // diagnostic: the engine's shadow-light loop decisions per light in CBRO frames (Core/ShadowLights)
+		bool          leftOutDump{ false };        // diagnostic: with each still-location dump, what the main view leaves out, kept mid-screen entries' fade state, a scene scan and the depth picture
 		std::uint32_t feedAuditInterval{ 600 };    // frames between audits of CBRO's scene-walk replica (0 = off)
 		bool          verdictCache{ true };        // reuse last frame's verdict while nothing it depended on changed
 		float         cacheMove{ 4.0f };           // camera movement (units) a reused verdict tolerates; bounds grow by it

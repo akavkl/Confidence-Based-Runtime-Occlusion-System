@@ -533,12 +533,57 @@ namespace CBRO::Hooks::CullGroups
 			return reinterpret_cast<RegisterFn>(g_registerOriginal)(a_accumulator, a_object);
 		}
 
+		// A cell's node 9 holds precombined art (mesh keys with bit 30, TESObjectCELL::AttachCombinedObjectArt+0x69D).
+		// The engine has it AppCulled in some cells (the v1.67 scene scan, 2026-10-05: cells 12 and 17 of the A/B spot,
+		// not cell 13; the writer isn't known). The previs-off walk skips an AppCulled node, so in CBRO frames its chunks
+		// (traffic-signal heads, signs, bollards) were never filed, while previs draws them: its feed looks each chunk up
+		// by id and tests only the chunk's own bit 0 (FO4-ENGINE-NOTES 5.5b, 7.12). So when the walk starts a cell's
+		// node 3, an AppCulled node 9 of the same cell has its children filed into group 0 as the walk files a node 9's
+		// (each child with bit 0 clear, whole, flags 0). Every CBRO frame (the hooks are in only then), culling or not.
+		bool                       g_cellArtNode9{ false };
+		bool                       g_cellNodePruning{ false };
+		constexpr std::uint32_t    kCellArtNode = 9;
+		std::atomic<std::uint64_t> g_culledArtNodes{ 0 };   // AppCulled node 9s found
+		std::atomic<std::uint64_t> g_culledArtFiled{ 0 };   // their children filed
+
+		void FileCulledCellArt(RE::NiAVObject* a_node3) noexcept
+		{
+			const auto cell = a_node3->parent;
+			if (!cell || cell->children.size() <= kCellArtNode || cell->children[3].get() != a_node3) {
+				return;
+			}
+			const auto art = cell->children[kCellArtNode].get();
+			if (!art || !(art->GetFlags() & 1)) {
+				return;  // (not AppCulled: the walk files it itself)
+			}
+			const auto node = art->IsNode();
+			if (!node) {
+				return;
+			}
+			g_culledArtNodes.fetch_add(1, std::memory_order_relaxed);
+			std::uint64_t filed = 0;
+			for (auto& child : node->children) {
+				const auto object = child.get();
+				if (object && !(object->GetFlags() & 1)) {
+					AddDirect(reinterpret_cast<void*>(g_mainGroup), object, &object->worldBound, 0);
+					++filed;
+				}
+			}
+			g_culledArtFiled.fetch_add(filed, std::memory_order_relaxed);
+		}
+
 		// From a prune site's stub, with the node whose children are about to be added one by one (a cell's child node
 		// 3 or 9 at the scene walk, or a root registered with DrawWorld's cull: index kRootIndex); main thread, inside
 		// DrawWorld's cull. True leaves the node out (none of its objects is filed with any view).
 		bool CellNodeThunk(RE::NiAVObject* a_node, std::uint32_t a_index)
 		{
-			if (!a_node || !g_mainCullActive.load(std::memory_order_relaxed)) {
+			if (!a_node) {
+				return false;
+			}
+			if (a_index == 3 && g_cellArtNode9) {
+				FileCulledCellArt(a_node);
+			}
+			if (!g_cellNodePruning || !g_mainCullActive.load(std::memory_order_relaxed)) {
 				return false;
 			}
 			const auto filter = g_cellNodeFilter.load(std::memory_order_relaxed);
@@ -868,12 +913,21 @@ namespace CBRO::Hooks::CullGroups
 		g_groupAddOriginal = Util::DetourSwitchable(g_groupAddHook, CBRO::Engine::OG(kGroupAddID).address(), Util::FnAddr(&GroupAddThunk), kGroupAddPrologue, "cullgroups:Group::Add");
 		g_childPushOriginal = Util::DetourSwitchable(g_childPushHook, CBRO::Engine::OG(kChildPushID).address(), Util::FnAddr(&ChildPushThunk), kChildPushPrologue, "cullgroups:ChildPush");
 		g_registerOriginal = Util::WriteVFuncSwitchable(g_registerHook, CBRO::Engine::OG(kAccumulatorVtableID).address(), kRegisterObjectSlot, Util::FnAddr(&RegisterObjectThunk), "cullgroups:BSShaderAccumulator::RegisterObject");
-		if (Settings::Get().cellNodePruning) {
+		// The walk's node loops carry two things: cell-node pruning and the AppCulled node-9 art (FileCulledCellArt).
+		g_cellNodePruning = Settings::Get().cellNodePruning;
+		g_cellArtNode9 = Settings::Get().cellArtNode9;
+		if (g_cellNodePruning || g_cellArtNode9) {
 			if (!InstallCellNodePrune()) {
-				logger::warn("cullgroups: cell-node pruning unavailable; every cell's objects are walked one by one");
+				logger::warn("cullgroups: the scene walk's node loops couldn't be hooked: no cell-node pruning, and a cell's AppCulled node 9 (precombined art previs draws) stays undrawn in CBRO frames");
+				g_cellNodePruning = false;
+				g_cellArtNode9 = false;
 			}
-		} else {
+		}
+		if (!Settings::Get().cellNodePruning) {
 			logger::info("cullgroups: cell-node pruning off ([Occlusion] bCellNodePruning=0)");
+		}
+		if (!Settings::Get().cellArtNode9) {
+			logger::info("cullgroups: a cell's AppCulled node 9 left to the engine ([Occlusion] bCellArtNode9=0): its precombined art is undrawn in CBRO frames");
 		}
 
 		// Without a group hook, Block::Add can't tell which group it serves: those entries count as shared
@@ -967,6 +1021,11 @@ namespace CBRO::Hooks::CullGroups
 	SkyCounts TakeSkyCounts() noexcept
 	{
 		return { g_skyForced.exchange(0), g_skyKept.exchange(0) };
+	}
+
+	CellArtCounts TakeCellArtCounts() noexcept
+	{
+		return { g_culledArtNodes.exchange(0), g_culledArtFiled.exchange(0) };
 	}
 
 	bool IsSky(const RE::NiAVObject* a_object) noexcept

@@ -229,6 +229,15 @@ namespace CBRO::Hooks::CullGroups
 		std::uint64_t kept{ 0 };
 	};
 	[[nodiscard]] SkyCounts TakeSkyCounts() noexcept;
+
+	// A cell's node 9 (precombined art) the engine has AppCulled, found by the scene walk in CBRO frames, and its
+	// children CBRO filed into group 0 in its place (previs draws them by id). Taken per summary.
+	struct CellArtCounts
+	{
+		std::uint64_t nodes{ 0 };
+		std::uint64_t filed{ 0 };
+	};
+	[[nodiscard]] CellArtCounts TakeCellArtCounts() noexcept;
 	[[nodiscard]] bool      IsSky(const RE::NiAVObject* a_object) noexcept;
 
 	// Block entry bounds (SoA: groups of 4 entries, x[4] y[4] z[4] radius[4], at block + 0x60).
