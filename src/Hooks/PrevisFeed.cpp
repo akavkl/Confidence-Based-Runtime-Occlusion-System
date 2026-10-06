@@ -132,6 +132,11 @@ namespace CBRO::Hooks::PrevisFeed
 		Launch               g_launch{ Launch::kNone };
 		bool                 g_querySkipped{ false };
 		double               g_qpcPerMs{ 0.0 };
+		// Frames left in which the query runs on because a rain pass ran (set by every rain pass, counted down by the
+		// launch wrapper): the first rainy frame after a dry spell still walks the world node, every later one reads
+		// previs's list.
+		constexpr std::uint32_t    kRainHoldFrames = 120;
+		std::atomic<std::uint32_t> g_rainHold{ 0 };
 
 		std::atomic<Owner>         g_owner{ Owner::kPrevis };
 		std::atomic<MainFeedFn>    g_mainFn{ nullptr };
@@ -245,9 +250,16 @@ namespace CBRO::Hooks::PrevisFeed
 		// StartOfFrameUpdate+0x28A: in a CBRO frame the background query isn't launched.
 		std::uintptr_t LaunchThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
 		{
+			const auto rain = g_rainHold.load(std::memory_order_relaxed);
+			if (rain) {
+				g_rainHold.store(rain - 1, std::memory_order_relaxed);
+			}
 			if (g_skipQuery && g_window.load(std::memory_order_relaxed)) {
-				g_launch = Launch::kSkipped;
-				return 0;  // (void at the site: StartOfFrameUpdate returns right after)
+				if (!rain) {
+					g_launch = Launch::kSkipped;
+					return 0;  // (void at the site: StartOfFrameUpdate returns right after)
+				}
+				++g_windowCounts.queryRain;
 			}
 			g_launch = Launch::kLaunched;
 			return reinterpret_cast<PassFn>(g_launchSite.previous)(a1, a2, a3, a4);
@@ -608,6 +620,7 @@ namespace CBRO::Hooks::PrevisFeed
 
 	bool BeginRainWindow() noexcept
 	{
+		g_rainHold.store(kRainHoldFrames, std::memory_order_relaxed);
 		// Only when this frame's query was skipped (previs's rain list is empty), over the engine's own state.
 		if (!g_querySkipped || ReadSuspendedByte()) {
 			return false;

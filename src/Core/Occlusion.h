@@ -28,6 +28,10 @@ namespace CBRO::Hooks::CullGroups
 
 namespace CBRO::Core::Occlusion
 {
+	// Light tests (TestSphere): how far (NDC) the current view may overhang the depth frame and still be judged by its
+	// edge (Occlusion.cpp has why; objects and sun shadows take fViewOverhang).
+	inline constexpr float kLightOverhang = 0.03f;
+
 	// Per-frame inputs, prepared on the main thread right before DrawWorld culls.
 	struct FrameContext
 	{
@@ -41,11 +45,16 @@ namespace CBRO::Core::Occlusion
 		// around where this frame's frustum lands on the depth frame's image plane. Only the part of
 		// an object inside it can be seen this frame; if that part lies within the depth frame, the
 		// rest of the object needn't have been rendered. Infinite when unknown (then an object must
-		// lie fully inside the depth frame to be judged).
+		// lie fully inside the depth frame to be judged). The async worker's is widened toward the turn the next
+		// frame may bring (Runtime), and its map is used only by a frame whose view lies inside.
 		float view[4]{
 			-std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(),
 			-std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()
 		};
+		// Per side {x0, x1, y0, y1}: how far (NDC) a part in view past the depth frame is judged by its edge, for objects
+		// and sun shadows (fViewOverhang; up to fViewOverhangTurn where the view itself reaches that far past it). Set
+		// with the planes by BeginFrame and PrepareContext.
+		float overhang[4]{};
 
 		// The sun's shadow cascades (with previs off they read DrawWorld group 0 as extra views).
 		struct Sun
@@ -116,6 +125,19 @@ namespace CBRO::Core::Occlusion
 	// a_droppedTotal: registrations dropped at emptied lamp shadow maps (Hooks::CullGroups, running total). Frames whose
 	// drawn set rises well over the recent median are logged with the flips behind them (diagnostic, bounded).
 	void EndFrameSample(std::uint64_t a_registrationsTotal, std::uint64_t a_droppedTotal);
+	// What the last EndFrameSample measured (valid: that frame and the one before were culled): main view kept, other
+	// views' registrations (lamp maps' drops taken out), confirming verdicts and edge verdicts (walk and worker together).
+	struct FrameSample
+	{
+		bool  valid{ false };
+		float kept{ 0.0f };
+		float other{ 0.0f };
+		float confirming{ 0.0f };
+		float edge{ 0.0f };
+		float finalEdge{ 0.0f };        // the walk's own decisions only: kept as edge,
+		float finalConfirming{ 0.0f };  // ... and hidden but still confirming
+	};
+	[[nodiscard]] FrameSample LastFrameSample() noexcept;
 
 	void SetActive(bool a_active);
 	void SetObserveOnly(bool a_observeOnly);  // runtime override of [Occlusion] bObserveOnly (diagnostics)

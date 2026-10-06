@@ -419,8 +419,8 @@ namespace CBRO::Core::Feed
 			gates.enabled, gates.ini, gates.suspended, gates.gateA, gates.gateB, gates.exterior,
 			calls.mainPrevious, calls.mainCBRO, calls.sunPrevious, calls.sunCBRO);
 		logger::info(
-			"previs query this interval: skipped {} frames (rain windows {}) | collected {} times with previs active, {:.3f} ms per collect on the main thread",
-			windows.querySkips, windows.rain, windows.queryRuns, windows.queryRuns ? windows.queryMs / windows.queryRuns : 0.0);
+			"previs query this interval: skipped {} frames (rain windows {}), run on in CBRO frames while it rains {} | collected {} times with previs active, {:.3f} ms per collect on the main thread",
+			windows.querySkips, windows.rain, windows.queryRain, windows.queryRuns, windows.queryRuns ? windows.queryMs / windows.queryRuns : 0.0);
 		if (g_auditInterval) {
 			logger::info(
 				"feed audits this interval: {} run, {} not replicable (interior/override) | totals: missing {} | route mismatch {} | extra {}",

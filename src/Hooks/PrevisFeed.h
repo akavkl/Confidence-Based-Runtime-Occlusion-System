@@ -83,6 +83,7 @@ namespace CBRO::Hooks::PrevisFeed
 		std::uint32_t lamp{ 0 };       // lamp windows (spot-light group-0 culls)
 		std::uint32_t rain{ 0 };       // rain windows (the rain map in a frame whose query was skipped)
 		std::uint32_t querySkips{ 0 }; // frames whose previs query was skipped (launch and collect)
+		std::uint32_t queryRain{ 0 };  // CBRO frames whose query ran because it rains (v1.75)
 		std::uint32_t queryRuns{ 0 };  // collects run with previs active
 		double        queryMs{ 0.0 };  // main-thread time of those collects
 	};
@@ -94,7 +95,9 @@ namespace CBRO::Hooks::PrevisFeed
 	// cascades run inside CBRO's windows) and the light-visibility callbacks only fire at the end of the main feed, so
 	// both are skipped; the rain map, the one reader left, then walks the world node with previs suspended (the
 	// engine's previs-off path), and so does the cascade cull of a switch frame back to previs. A query launched is
-	// always collected. Pass-through until installed; main thread.
+	// always collected. Pass-through until installed; main thread. While it rains (a rain pass within the last
+	// kRainHoldFrames) the query runs on (v1.75): the world-node walk cost the v1.74 run 3.7-4.6 ms a rainy frame on the
+	// main thread, previs's list 0.13-0.33 ms plus its collect (~0.6 ms).
 	bool InstallQuerySkip();
 	[[nodiscard]] bool BeginRainWindow() noexcept;  // true = previs was suspended now: pass it to EndRainWindow
 	void EndRainWindow(bool a_opened) noexcept;

@@ -14,8 +14,9 @@
 // worker had then.
 //
 // Safety: the worker's context is the frame's own, with its dilation grown by the camera movement the next frame may
-// bring (moveMargin); its view box is the frame's (not widened by the turn margin). A map's verdicts are used only in
-// a frame whose camera stayed within the margins of the camera the worker judged for (BeginFrame); otherwise, and for
+// bring (moveMargin) and its view box widened toward the turn the next frame may bring (Runtime, v1.70). A map's
+// verdicts are used only in a frame whose camera stayed within the margins of the camera the worker judged for and
+// whose view lies inside the box the worker judged with (BeginFrame); otherwise, and for
 // any object the map has no record of with its current bound, the walk judges the object itself (Occlusion), last
 // frame's record only continuing its streaks. Objects are dereferenced by the worker only between the cull's end and
 // the forward stage's end of the same frame (Wait): the engine frees scene objects in its update, never while it
@@ -37,16 +38,18 @@ namespace CBRO::Core::Async
 	void Record(RE::NiAVObject* a_object, const RE::NiBound& a_bound, Hooks::CullGroups::GroupKind a_kind) noexcept;
 
 	// Main thread, at the cull begin: publishes the worker's map when it finished; true when that map holds for a
-	// camera at a_pose (within the margins the worker judged with), so this frame may hide by it.
-	bool BeginFrame(const Pose& a_pose) noexcept;
+	// camera at a_pose (within the margins the worker judged with, and a_viewHeld: the frame's view lies inside the
+	// worker's), so this frame may hide by it.
+	bool BeginFrame(const Pose& a_pose, bool a_viewHeld) noexcept;
 
 	// Last frame's record for an object (any thread during the cull; the map is read-only then), or null, whether or
 	// not the map holds for this frame's camera (BeginFrame's answer).
 	[[nodiscard]] const Occlusion::Record* Find(const void* a_object) noexcept;
 
 	// Main thread, at the cull stage's end: this frame's candidates and the worker's context (the frame's, dilated
-	// by the move margin) go to the worker. a_pose is the camera the context was built for.
-	void Submit(const Occlusion::FrameContext& a_context, const Pose& a_pose, float a_moveMargin, float a_turnMargin);
+	// by the move margin) go to the worker. a_pose is the camera the context was built for; a_viewWiden (NDC) how far
+	// its view's most widened side lies past the frame's (for the log).
+	void Submit(const Occlusion::FrameContext& a_context, const Pose& a_pose, float a_moveMargin, float a_viewWiden);
 
 	// Main thread, before the frame's render ends: blocks until the worker is done with the frame's objects.
 	void Wait() noexcept;

@@ -679,6 +679,32 @@ namespace CBRO::Core::Runtime
 			return true;
 		}
 
+		// Where a NiCamera rotation's view (frustum tangents a_tx, a_ty) lands on a depth frame, raw: the box over every
+		// reading of the rotation that fit at capture. False without one, or when the view reaches sideways past the
+		// frame's image plane.
+		bool PlaceRotation(const HiZ::Camera& a_then, const float a_rotate[3][3], float a_tx, float a_ty, float a_out[4]) noexcept
+		{
+			if (!a_then.footprint || !a_then.axisReadings) {
+				return false;
+			}
+			float x0 = std::numeric_limits<float>::infinity(), x1 = -x0, y0 = x0, y1 = -x0;
+			for (int reading = 0; reading < 2; ++reading) {
+				if (!(a_then.axisReadings & (1u << reading))) {
+					continue;
+				}
+				float basis[3][3];
+				MappedBasis(a_then, reading, a_rotate, basis);
+				if (!PlaceView(a_then, basis, a_tx, a_ty, x0, x1, y0, y1)) {
+					return false;
+				}
+			}
+			a_out[0] = x0;
+			a_out[1] = x1;
+			a_out[2] = y0;
+			a_out[3] = y1;
+			return true;
+		}
+
 		// Yaw, pitch, roll (degrees) of basis a_b against basis a_a, both {dir, right, up}.
 		void TurnBetween(const float a_a[3][3], const float a_b[3][3], float a_out[3]) noexcept
 		{
@@ -1401,8 +1427,29 @@ namespace CBRO::Core::Runtime
 
 		// ---- asynchronous verdicts (Core/Async): what the worker's job needs from the frame -------------------------
 		// The worker judges this frame's candidates for the NEXT frame's walk, so its context is this frame's with the
-		// dilation grown by the movement the next frame may bring and the view box widened by the turn it may bring:
-		// twice the last frame's, plus a floor. The next frame uses the map only if its camera stayed within them.
+		// dilation grown by the movement the next frame may bring (twice the last frame's, plus a floor) and the view box
+		// widened toward the turn it may bring (JobView). The next frame uses the map only if its camera stayed within
+		// the margins and its view inside the box.
+
+		// The view a job judges with (v1.70). Up to v1.69 it was the frame's own, and the map was used after any turn
+		// within the turn margin (1-8 deg): an object in the strip the turn brought into view had been judged out of view
+		// (left out of the walk, or out of group 0) or by its part inside the old view, and was missing for a frame at the
+		// leading edge of every turn. Now the box reaches where the frame's turn, repeated once and twice, places the
+		// view: only the sides the camera turns toward grow, by the turn's speed. Every side also gets a floor within the
+		// view overhang (fViewOverhang, and the lights'), for turns the last one doesn't predict: a still view's side that
+		// far past the depth frame's edge judges every object crossing it as the edge itself would, so a still camera
+		// loses nothing but objects (and sun shadows) wholly inside the floor's strip beyond the screen, which stay filed
+		// (the engine's frustum test still drops them from the main view).
+		struct JobView
+		{
+			bool          valid{ false };   // a job was submitted with it
+			float         box[4]{};         // NDC on the depth frame {x0, x1, y0, y1} (infinite: no view, nothing judged by one)
+			float         widen[4]{};       // how far each side lies past the frame's own view
+			bool          placed{ false };  // a later view can be placed on the depth frame (else only its epoch holds)
+			std::uint32_t epoch{ 0 };       // the view epoch its records carry
+			HiZ::Camera   camera{};         // the depth frame's camera
+		};
+
 		struct AsyncFrame
 		{
 			Occlusion::FrameContext context{};   // this frame's (as given to Occlusion::BeginFrame)
@@ -1410,7 +1457,9 @@ namespace CBRO::Core::Runtime
 			bool                    lastKnown{ false };
 			Async::Pose             last{};      // last frame's camera (the frame's own motion)
 			float                   moveMargin{ 0.0f };
-			float                   turnMargin{ 0.0f };
+			float                   frameMove{ 0.0f };   // the camera's movement since last frame's cull begin (the log)
+			JobView                 next{};      // for the job this frame submits
+			JobView                 judged{};    // the last submitted job's (what the map this frame reads was judged with)
 		};
 		AsyncFrame g_asyncFrame;
 
@@ -1437,6 +1486,212 @@ namespace CBRO::Core::Runtime
 			}
 			FrustumExtents(ReadFrustum(root), a_out.zoom[0], a_out.zoom[1]);
 			return true;
+		}
+
+		// The view this frame's job judges with (JobView), from the frame's context and its turn since a_last.
+		void PrepareJobView(const Occlusion::FrameContext& a_context, const Async::Pose& a_pose, bool a_turnKnown, const Async::Pose& a_last, JobView& a_out)
+		{
+			a_out = {};
+			std::copy_n(a_context.view, 4, a_out.box);
+			a_out.epoch = a_context.viewEpoch;
+			const auto root = RE::Main::WorldRootCamera();
+			if (!a_context.snapshot || !std::isfinite(a_context.view[0]) || !root) {
+				return;
+			}
+			const auto& camera = a_context.snapshot->camera;
+			if (g_footprint.disabled || !camera.footprint || !camera.axisReadings) {
+				return;  // (a still view on a depth frame with no mapping: held within its epoch only)
+			}
+			a_out.camera = camera;
+			a_out.placed = true;
+			float box[4]{ a_context.view[0], a_context.view[1], a_context.view[2], a_context.view[3] };
+			if (a_turnKnown) {
+				// The frame's turn E = R_last^T * R, applied again once and twice: R * E^k extrapolates under either
+				// reading of the matrices (a world-frame turn, or a local one).
+				float step[3][3]{};
+				for (int r = 0; r < 3; ++r) {
+					for (int c = 0; c < 3; ++c) {
+						for (int k = 0; k < 3; ++k) {
+							step[r][c] += a_last.rotate[k][r] * a_pose.rotate[k][c];
+						}
+					}
+				}
+				float tx = 0.0f, ty = 0.0f;
+				FrustumTangents(ReadFrustum(root), tx, ty);
+				float turned[3][3];
+				std::memcpy(turned, a_pose.rotate, sizeof(turned));
+				for (int times = 0; times < 2; ++times) {
+					float next[3][3]{};
+					for (int r = 0; r < 3; ++r) {
+						for (int c = 0; c < 3; ++c) {
+							for (int k = 0; k < 3; ++k) {
+								next[r][c] += turned[r][k] * step[k][c];
+							}
+						}
+					}
+					std::memcpy(turned, next, sizeof(turned));
+					float ahead[4];
+					if (PlaceRotation(camera, turned, tx, ty, ahead)) {  // (a view placed sideways: the next frame's check fails it)
+						box[0] = std::min(box[0], ahead[0]);
+						box[1] = std::max(box[1], ahead[1]);
+						box[2] = std::min(box[2], ahead[2]);
+						box[3] = std::max(box[3], ahead[3]);
+					}
+				}
+			}
+			// The floor never takes a side past the overhang (v1.74): a side the view already reaches past the depth frame by
+			// that much is where the turn goes, and the prediction covers it; up to v1.73 the floor took the leading side of
+			// every slow pan past it, so each object and sun shadow crossing it was edge in the map and judged again in the walk.
+			const float overhang = std::min(Settings::Get().viewOverhang, Occlusion::kLightOverhang);
+			const float least = 0.9f * overhang;
+			const float past[4]{ -1.0f - a_context.view[0], a_context.view[1] - 1.0f, -1.0f - a_context.view[2], a_context.view[3] - 1.0f };
+			const float ahead[4]{ a_context.view[0] - box[0], box[1] - a_context.view[1], a_context.view[2] - box[2], box[3] - a_context.view[3] };
+			for (int i = 0; i < 4; ++i) {
+				a_out.widen[i] = std::max(ahead[i], std::clamp(overhang - past[i], 0.0f, least));
+			}
+			a_out.box[0] = a_context.view[0] - a_out.widen[0];
+			a_out.box[1] = a_context.view[1] + a_out.widen[1];
+			a_out.box[2] = a_context.view[2] - a_out.widen[2];
+			a_out.box[3] = a_context.view[3] + a_out.widen[3];
+		}
+
+		// Whether this frame's view (camera at a_pose, view epoch a_epoch) lies inside the view a job judged with: placed on
+		// the job's depth frame, raw, to within CurrentView's still shift. An unplaced job holds within its own epoch only
+		// (the tested bounds' angular slack covers any two cameras of one; with the verdict cache off, none).
+		bool ViewHeld(const JobView& a_job, const Async::Pose& a_pose, std::uint32_t a_epoch, bool a_cacheEnabled) noexcept
+		{
+			if (!a_job.valid || !std::isfinite(a_job.box[0])) {
+				return true;  // (no job: no map; no view: no verdict rests on one)
+			}
+			if (!a_job.placed || g_footprint.disabled) {
+				return a_cacheEnabled && a_epoch == a_job.epoch;
+			}
+			const auto root = RE::Main::WorldRootCamera();
+			if (!root) {
+				return false;
+			}
+			float tx = 0.0f, ty = 0.0f;
+			FrustumTangents(ReadFrustum(root), tx, ty);
+			float view[4];
+			if (!PlaceRotation(a_job.camera, a_pose.rotate, tx, ty, view)) {
+				return false;
+			}
+			constexpr float kSlack = 0.0005f;  // (CurrentView's kStillShift)
+			return view[0] >= a_job.box[0] - kSlack && view[1] <= a_job.box[1] + kSlack && view[2] >= a_job.box[2] - kSlack && view[3] <= a_job.box[3] + kSlack;
+		}
+
+		// ---- what the culled frames draw by how fast the camera turns and moves (diagnostic, v1.71) ----------------
+		// Per interval, the frames binned by the NiCamera's turn since the previous frame (degrees), and by its movement
+		// (units, v1.73): how often the worker's map was used, and the main view's and the other views' registrations,
+		// confirming and edge verdicts (walk and worker together). The aggregate spreads can't tell a turn's leading-edge
+		// strip from a load or a flick.
+		struct MotionTable
+		{
+			const char*          what{ nullptr };
+			std::array<float, 7> limits{};
+			struct Bin
+			{
+				std::uint32_t frames{ 0 };
+				std::uint32_t mapUsed{ 0 };
+				double        kept{ 0.0 };
+				float         keptMax{ 0.0f };
+				double        other{ 0.0 };
+				float         otherMax{ 0.0f };
+				double        confirming{ 0.0 };
+				double        edge{ 0.0 };
+				double        finalEdge{ 0.0 };
+				double        finalConfirming{ 0.0 };
+			};
+			std::array<Bin, 8> bins{};
+		};
+		MotionTable g_turnTable{ "camera turn (deg per frame)", { 0.1f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f } };
+		MotionTable g_moveTable{ "camera movement (units per frame)", { 0.25f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f } };
+
+		void NoteMotionSample(MotionTable& a_table, float a_value, const Occlusion::FrameSample& a_sample, bool a_mapUsed)
+		{
+			std::size_t index = 0;
+			while (index < a_table.limits.size() && a_value >= a_table.limits[index]) {
+				++index;
+			}
+			auto&       bin = a_table.bins[index];
+			const auto& sample = a_sample;
+			++bin.frames;
+			bin.mapUsed += a_mapUsed ? 1u : 0u;
+			bin.kept += sample.kept;
+			bin.keptMax = std::max(bin.keptMax, sample.kept);
+			bin.other += sample.other;
+			bin.otherMax = std::max(bin.otherMax, sample.other);
+			bin.confirming += sample.confirming;
+			bin.edge += sample.edge;
+			bin.finalEdge += sample.finalEdge;
+			bin.finalConfirming += sample.finalConfirming;
+		}
+
+		// How old the depth a culled frame judges by is (frames since its capture, at the cull begin), and whether a newer
+		// capture had been read back by the cull's end, when the worker's job starts (diagnostic, v1.73): what a later
+		// pick of the depth could gain. A turn's leading strip with no depth is the turn times that age.
+		struct DepthAge
+		{
+			std::array<std::uint32_t, 6> atBegin{};    // [age], 5 = 5 or more
+			std::array<std::uint32_t, 6> newerAtEnd{}; // [its age then]
+			std::uint32_t                frames{ 0 };
+		};
+		DepthAge g_depthAge;
+
+		void LogDepthAge()
+		{
+			const auto row = [](const std::array<std::uint32_t, 6>& a_counts) {
+				std::string text;
+				for (std::size_t i = 1; i < a_counts.size(); ++i) {
+					if (a_counts[i]) {
+						text += std::format(" {}{}:{}", i, i + 1 == a_counts.size() ? "+" : "", a_counts[i]);
+					}
+				}
+				return text.empty() ? std::string(" none") : text;
+			};
+			if (g_depthAge.frames) {
+				std::uint32_t newer = 0;
+				for (const auto count : g_depthAge.newerAtEnd) {
+					newer += count;
+				}
+				logger::info(
+					"depth age this interval (culled frames, frames since the capture judged by):{} | a newer capture read back by the cull's end in {} of {} frames (its age then:{})",
+					row(g_depthAge.atBegin), newer, g_depthAge.frames, row(g_depthAge.newerAtEnd));
+			}
+			g_depthAge = {};
+		}
+
+		void NoteMotion(float a_turn, float a_move, bool a_mapUsed)
+		{
+			const auto sample = Occlusion::LastFrameSample();
+			if (!sample.valid) {
+				return;
+			}
+			NoteMotionSample(g_turnTable, a_turn * 180.0f / 3.14159265f, sample, a_mapUsed);
+			NoteMotionSample(g_moveTable, a_move, sample, a_mapUsed);
+		}
+
+		void LogMotionTable(MotionTable& a_table)
+		{
+			std::string line;
+			for (std::size_t i = 0; i < a_table.bins.size(); ++i) {
+				const auto& bin = a_table.bins[i];
+				if (!bin.frames) {
+					continue;
+				}
+				const double n = bin.frames;
+				const auto   range = i == 0 ? std::format("<{}", a_table.limits[0]) :
+				                     i == a_table.limits.size() ? std::format("{}+", a_table.limits[i - 1]) :
+				                                                  std::format("{}-{}", a_table.limits[i - 1], a_table.limits[i]);
+				line += std::format(
+					"{}{}: {} frames, map used {:.0f}%, main view kept {:.0f} (max {:.0f}), other views {:.0f} (max {:.0f}), confirming {:.0f}, edge {:.0f}, walk decided edge {:.0f} confirming {:.0f}",
+					line.empty() ? "" : " | ", range, bin.frames, 100.0 * bin.mapUsed / n, bin.kept / n, bin.keptMax, bin.other / n, bin.otherMax,
+					bin.confirming / n, bin.edge / n, bin.finalEdge / n, bin.finalConfirming / n);
+			}
+			if (!line.empty()) {
+				logger::info("culled frames by {} this interval: {}", a_table.what, line);
+			}
+			a_table.bins = {};
 		}
 
 		void CloseSegment(std::int64_t a_now)
@@ -2041,30 +2296,23 @@ namespace CBRO::Core::Runtime
 			if (Async::Enabled()) {
 				Async::Pose pose{};
 				const bool  known = ReadPose(pose);
-				float       frameMove = 0.0f, frameTurn = 0.0f;
+				float       frameMove = 0.0f;
 				if (known && g_asyncFrame.lastKnown) {
 					frameMove = PoseDistance(pose, g_asyncFrame.last);
-					frameTurn = RotationAngle(pose.rotate, g_asyncFrame.last.rotate);
 				}
 				// Interiors judge inside the walk (as v1.28) unless bAsyncInteriors.
 				context.asyncFrame = !g_state.interiorScene || settings.asyncInteriors;
-				const bool mapValid = Async::BeginFrame(pose);
+				const bool viewHeld = !known || ViewHeld(g_asyncFrame.judged, pose, context.viewEpoch, context.cacheEnabled);
+				const bool mapValid = Async::BeginFrame(pose, viewHeld);
 				context.asyncValid = context.asyncFrame && known && context.cull && mapValid;
+				PrepareJobView(context, pose, known && g_asyncFrame.lastKnown, g_asyncFrame.last, g_asyncFrame.next);
 				g_asyncFrame.pose = pose;
 				g_asyncFrame.last = pose;
 				g_asyncFrame.lastKnown = known;
 				g_asyncFrame.moveMargin = std::clamp(2.0f * frameMove + 4.0f, 6.0f, 48.0f);
-				g_asyncFrame.turnMargin = std::clamp(2.0f * frameTurn + 0.5f * 3.14159265f / 180.0f, 1.0f * 3.14159265f / 180.0f, 8.0f * 3.14159265f / 180.0f);
-				// Zoomed in (scopes, a zoomed third-person view), a degree moves the view much farther across the screen:
-				// the margin shrinks with the zoom, so a map is reused only for as much on-screen motion as at the
-				// default FOV (projection scale ~2.1 there; a 5-degree view has ~40, where 1 degree is half the screen).
-				if (snapshot && snapshot->camera.viewSpace) {
-					constexpr float kDefaultScale = 2.2f;
-					const float     scale = std::max(snapshot->camera.scaleX, snapshot->camera.scaleY);
-					if (scale > kDefaultScale) {
-						g_asyncFrame.turnMargin *= kDefaultScale / scale;
-					}
-				}
+				g_asyncFrame.frameMove = frameMove;
+				// (No turn margin since v1.71: up to v1.70 a map was refused after any turn past 2x the last one plus
+				// 0.5 deg, at most 8 deg, shrunk by the zoom. ViewHeld places the turned view itself, in NDC at the zoom.)
 			}
 			ShadowLights::PublishLamps();  // last frame's shadow-casting lamps, for group 0 with the sun off
 			if (settings.unoccludeLights && Occlusion::Active() && g_state.hooksIn) {
@@ -2103,6 +2351,9 @@ namespace CBRO::Core::Runtime
 				Hooks::FirstPersonOrder::LogStats(g_state.framesSinceLog);
 				SetDiff::LogStats();
 				Async::LogStats(g_state.framesSinceLog);
+				LogMotionTable(g_turnTable);
+				LogMotionTable(g_moveTable);
+				LogDepthAge();
 				LogTiming();
 				g_state.framesSinceLog = 0;
 			}
@@ -2206,6 +2457,16 @@ namespace CBRO::Core::Runtime
 				case Stage::kCull:
 					Hooks::CullGroups::SetMainCullActive(false);
 					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations, Hooks::CullGroups::ReadDroppedRegistrations());
+					if (g_state.cullingThisFrame) {
+						NoteMotion(g_stillness.lastTurn, g_asyncFrame.frameMove, g_asyncFrame.context.asyncValid);
+						if (const auto judged = g_asyncFrame.context.snapshot) {
+							++g_depthAge.frames;
+							++g_depthAge.atBegin[std::min<std::uint64_t>(g_state.renderFrame + 1 - judged->frame, 5)];
+							if (const auto ready = HiZ::NewestReady(); ready > judged->frame) {
+								++g_depthAge.newerAtEnd[std::min<std::uint64_t>(g_state.renderFrame + 1 - ready, 5)];
+							}
+						}
+					}
 					Feed::EndCull();  // (closes an audit frame: DrawWorld's cull and its jobs are done)
 					{
 						// The set-diff diagnostic files this frame's main-view registrations (settled frames only).
@@ -2215,17 +2476,38 @@ namespace CBRO::Core::Runtime
 						SetDiff::EndCull(CurrentMode(), settled, root ? root->world.translate : RE::NiPoint3{});
 					}
 					// Asynchronous verdicts: this frame's candidates go to the worker with this frame's context, dilated for
-					// the next frame's camera (the walk is done: every candidate is recorded). The view stays this frame's,
-					// placed once at the cull begin, still or turned. (Up to v1.58 the worker placed its own, always as a
-					// turned view: it never took the still path, so with turned views switched off it had none, and every
-					// object crossing the screen edge stayed drawn. Nor is the view widened by the turn margin: that would
-					// leave every such object unjudged with the camera still.)
+					// the next frame's camera (the walk is done: every candidate is recorded). The view is this frame's,
+					// placed once at the cull begin, still or turned, and widened toward the frame's turn (JobView). (Up to
+					// v1.58 the worker placed its own, always as a turned view: it never took the still path, so with turned
+					// views switched off it had none, and every object crossing the screen edge stayed drawn. Nor is the
+					// view widened by a turn margin on every side: that would leave every such object unjudged with the
+					// camera still.)
 					if (Async::Enabled() && g_state.cullingThisFrame && g_asyncFrame.context.asyncFrame && g_asyncFrame.context.snapshot) {
-						auto worker = g_asyncFrame.context;
+						auto  worker = g_asyncFrame.context;
+						auto& job = g_asyncFrame.next;
 						worker.dilateMove += g_asyncFrame.moveMargin;
 						worker.asyncValid = false;
+						std::copy_n(job.box, 4, worker.view);
+						// The epoch's slack covers the camera's turn within it, not a box grown past the last job's: a side
+						// widened further in the same epoch (or a view lost: an infinite box, used at any turn) starts a new
+						// one, so the worker re-judges what it judged with the narrower box (a slow turn while zoomed; at the
+						// default FOV the floor exceeds such turns).
+						const auto& last = g_asyncFrame.judged;
+						const bool  grew = !std::isfinite(job.box[0]) ?
+						                       std::isfinite(last.box[0]) :
+						                       job.widen[0] > last.widen[0] + 1.0e-4f || job.widen[1] > last.widen[1] + 1.0e-4f ||
+						                           job.widen[2] > last.widen[2] + 1.0e-4f || job.widen[3] > last.widen[3] + 1.0e-4f;
+						if (last.valid && worker.cacheEnabled && worker.viewEpoch == last.epoch && grew) {
+							worker.viewEpoch = ++g_epochs.viewEpoch;
+							++g_epochs.viewChanges;
+						}
+						job.epoch = worker.viewEpoch;
+						job.valid = true;
+						g_asyncFrame.judged = job;
 						Occlusion::PrepareContext(worker);
-						Async::Submit(worker, g_asyncFrame.pose, g_asyncFrame.moveMargin, g_asyncFrame.turnMargin);
+						Async::Submit(worker, g_asyncFrame.pose, g_asyncFrame.moveMargin, std::max({ job.widen[0], job.widen[1], job.widen[2], job.widen[3] }));
+					} else {
+						g_asyncFrame.judged.valid = false;
 					}
 					g_timing.marks[1] = Qpc();
 					g_gpu.Mark(1);

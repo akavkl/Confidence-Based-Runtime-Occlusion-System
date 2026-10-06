@@ -153,6 +153,9 @@ namespace CBRO::Core::HiZ
 	// After the pre-pass's world block; a_firstPersonAfter: before its first-person block too (Snapshot::firstPersonAfter).
 	bool Capture(std::uint64_t a_frame, const Camera& a_camera, bool a_firstPersonAfter);
 	void Poll();                                                  // map finished readbacks, publish the newest
+	// Diagnostic: the frame of the newest capture whose readback is ready now but not yet published (0: none), found
+	// without publishing it (Poll still does, at the next cull begin).
+	[[nodiscard]] std::uint64_t NewestReady() noexcept;
 	[[nodiscard]] const Snapshot* Latest() noexcept;              // newest published snapshot or null
 	void Reset();                                                 // forget published data (load, device change)
 

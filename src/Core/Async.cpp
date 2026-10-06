@@ -46,7 +46,6 @@ namespace CBRO::Core::Async
 			std::array<Lane, kThreads> lanes{};
 			Pose                       pose{};
 			float                      moveMargin{ 0.0f };
-			float                      turnMargin{ 0.0f };
 			bool                       filled{ false };
 		};
 
@@ -168,8 +167,8 @@ namespace CBRO::Core::Async
 		{
 			std::uint32_t framesValid{ 0 };
 			std::uint32_t framesInvalidMoved{ 0 };
-			std::uint32_t framesInvalidTurned{ 0 };
 			std::uint32_t framesInvalidZoom{ 0 };
+			std::uint32_t framesInvalidView{ 0 };
 			std::uint32_t framesNoMap{ 0 };
 			std::uint32_t submitted{ 0 };
 			std::uint32_t skippedBusy{ 0 };
@@ -183,7 +182,7 @@ namespace CBRO::Core::Async
 			double        waitMaxMs{ 0.0 };
 			std::uint32_t waits{ 0 };
 			double        moveMarginSum{ 0.0 };
-			double        turnMarginSum{ 0.0 };
+			double        viewWidenSum{ 0.0 };
 		};
 		Stats                      g_stats;
 		std::atomic<std::uint64_t> g_lookups{ 0 };
@@ -203,18 +202,6 @@ namespace CBRO::Core::Async
 		{
 			const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
 			return std::sqrt(dx * dx + dy * dy + dz * dz);
-		}
-
-		float RotationAngle(const float a[3][3], const float b[3][3]) noexcept
-		{
-			float squared = 0.0f;
-			for (int r = 0; r < 3; ++r) {
-				for (int c = 0; c < 3; ++c) {
-					const float d = a[r][c] - b[r][c];
-					squared += d * d;
-				}
-			}
-			return 2.0f * std::asin(std::min(1.0f, std::sqrt(squared) / 2.8284271f));
 		}
 
 		void RunJob(Job& a_job)
@@ -339,7 +326,7 @@ namespace CBRO::Core::Async
 		}
 	}
 
-	bool BeginFrame(const Pose& a_pose) noexcept
+	bool BeginFrame(const Pose& a_pose, bool a_viewHeld) noexcept
 	{
 		if (!g_enabled) {
 			return false;
@@ -366,12 +353,15 @@ namespace CBRO::Core::Async
 			++g_stats.framesNoMap;
 		} else if (Distance3(a_pose.eye, read.pose.eye) > read.moveMargin) {
 			++g_stats.framesInvalidMoved;
-		} else if (RotationAngle(a_pose.rotate, read.pose.rotate) > read.turnMargin) {
-			++g_stats.framesInvalidTurned;
 		} else if (std::abs(a_pose.zoom[0] - read.pose.zoom[0]) > 0.002f * read.pose.zoom[0] || std::abs(a_pose.zoom[1] - read.pose.zoom[1]) > 0.002f * read.pose.zoom[1]) {
 			// Zoomed out, the view reaches past what the worker judged (its "out of view" verdicts no longer hold);
 			// zoomed in, its edge objects were clipped to a wider view. Either way the walk judges this frame.
 			++g_stats.framesInvalidZoom;
+		} else if (!a_viewHeld) {
+			// Turned toward a side the worker's view wasn't widened to (a reversal, or faster than twice the last turn):
+			// objects there were judged out of view, or by their part inside it. (Up to v1.70 any turn past a margin,
+			// 1-8 deg, counted too: the view's place on the depth frame is the whole of what a turn changes.)
+			++g_stats.framesInvalidView;
 		} else {
 			++g_stats.framesValid;
 			valid = true;
@@ -421,7 +411,7 @@ namespace CBRO::Core::Async
 		return nullptr;
 	}
 
-	void Submit(const Occlusion::FrameContext& a_context, const Pose& a_pose, float a_moveMargin, float a_turnMargin)
+	void Submit(const Occlusion::FrameContext& a_context, const Pose& a_pose, float a_moveMargin, float a_viewWiden)
 	{
 		if (!g_enabled) {
 			return;
@@ -436,7 +426,6 @@ namespace CBRO::Core::Async
 		auto*      read = g_frames[parity ^ 1u].filled ? &g_frames[parity ^ 1u] : nullptr;
 		write.pose = a_pose;
 		write.moveMargin = a_moveMargin;
-		write.turnMargin = a_turnMargin;
 		std::uint64_t candidates = 0;
 		std::uint32_t threads = 0;
 		for (auto& lane : write.lanes) {
@@ -454,7 +443,7 @@ namespace CBRO::Core::Async
 		g_stats.candidates += candidates;
 		g_stats.threadsSeen = std::max(g_stats.threadsSeen, threads);
 		g_stats.moveMarginSum += a_moveMargin;
-		g_stats.turnMarginSum += a_turnMargin;
+		g_stats.viewWidenSum += a_viewWiden;
 		lock.unlock();
 		g_wake.notify_one();
 	}
@@ -517,13 +506,13 @@ namespace CBRO::Core::Async
 		const auto&  s = g_stats;
 		const double jobs = std::max(1u, s.submitted);
 		logger::info(
-			"async per interval: map valid {} frames | not used: no map {}, camera moved past the margin {}, turned past it {}, zoom changed {} | jobs {} (skipped: worker busy {}) | candidates {:.0f}/job on {} threads, overflow {} | worker {:.2f} ms/job (max {:.2f}) | main thread waited {} times, {:.2f} ms avg (max {:.2f}) | lookups {:.0f}/frame: in sequence {:.0f}, by look-ahead {:.0f}, by index {:.0f}, missing {:.0f} | index full {} | margins: move {:.1f} units, turn {:.2f} deg",
-			s.framesValid, s.framesNoMap, s.framesInvalidMoved, s.framesInvalidTurned, s.framesInvalidZoom, s.submitted, s.skippedBusy,
+			"async per interval: map valid {} frames | not used: no map {}, camera moved past the margin {}, zoom changed {}, turned out of the view it judged {} | jobs {} (skipped: worker busy {}) | candidates {:.0f}/job on {} threads, overflow {} | worker {:.2f} ms/job (max {:.2f}) | main thread waited {} times, {:.2f} ms avg (max {:.2f}) | lookups {:.0f}/frame: in sequence {:.0f}, by look-ahead {:.0f}, by index {:.0f}, missing {:.0f} | index full {} | margins: move {:.1f} units, view widened {:.3f} NDC (its widest side)",
+			s.framesValid, s.framesNoMap, s.framesInvalidMoved, s.framesInvalidZoom, s.framesInvalidView, s.submitted, s.skippedBusy,
 			static_cast<double>(s.candidates) / jobs, s.threadsSeen, s.overflow, s.workerMs / jobs, s.workerMaxMs,
 			s.waits, s.waits ? s.waitMs / s.waits : 0.0, s.waitMaxMs,
 			static_cast<double>(lookups) / frames, static_cast<double>(sequential) / frames, static_cast<double>(ahead) / frames, static_cast<double>(indexed) / frames,
 			static_cast<double>(lookups - sequential - ahead - indexed) / frames, s.indexFull,
-			s.moveMarginSum / jobs, s.turnMarginSum / jobs * 180.0 / 3.14159265);
+			s.moveMarginSum / jobs, s.viewWidenSum / jobs);
 		g_stats = {};
 	}
 }

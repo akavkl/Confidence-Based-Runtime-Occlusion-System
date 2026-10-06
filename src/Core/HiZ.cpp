@@ -869,6 +869,27 @@ namespace CBRO::Core::HiZ
 		++g_counters.readbacks;
 	}
 
+	std::uint64_t NewestReady() noexcept
+	{
+		const auto context = Util::GetContext();
+		if (!context || g_gpu.failed) {
+			return 0;
+		}
+		Slot* newest = nullptr;
+		for (auto& slot : g_gpu.slots) {
+			if (slot.state == Slot::State::kPending && (!newest || slot.frame > newest->frame)) {
+				newest = &slot;
+			}
+		}
+		// (readbacks finish in order, so the newest pending one being mappable is the whole answer; DO_NOT_WAIT never stalls)
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (!newest || FAILED(context->Map(newest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
+			return 0;
+		}
+		context->Unmap(newest->staging.Get(), 0);
+		return newest->frame;
+	}
+
 	BlockChanges Blocks() noexcept
 	{
 		return { g_blockChangedAt.empty() ? nullptr : g_blockChangedAt.data(), g_blocksW, g_blocksH };

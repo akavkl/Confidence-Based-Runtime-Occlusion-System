@@ -50,6 +50,7 @@ namespace CBRO
 		float         cacheMove{ 4.0f };           // camera movement (units) a reused verdict tolerates; bounds grow by it
 		float         cacheAngle{ 0.1f };          // camera turn (degrees) a reused verdict tolerates; bounds grow by depth x it
 		float         viewOverhang{ 0.03f };       // NDC the view may reach past the (older) depth frame and objects/sun shadows still be judged, by its edge (0 = kept)
+		float         viewOverhangTurn{ 0.08f };    // ... while turning, up to this much: the strip the turn brought into view, for objects mostly inside the frame (0 = off)
 		std::uint32_t hiZTemporalFrames{ 4 };      // Hi-Z = farthest depth over this many consecutive frames of a still camera (1 = off)
 		float         depthTolerance{ 0.002f };    // relative margin on linear view depth before an object counts as hidden
 		float         depthSlack{ 4.0f };          // plus this many game units

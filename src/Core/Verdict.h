@@ -28,6 +28,7 @@ namespace CBRO::Core::Occlusion
 		kRecordDepth = 1 << 0,     // a hidden view outcome with its evidence recorded (rect, threshold, blocks)
 		kRecordLight = 1 << 2,     // the object is a light (never skipped as out of view)
 		kRecordNoCache = 1 << 3,   // never reuse (a light's reach test, a table-full case)
+		kRecordSunEdge = 1 << 4,   // the sun outcome is "needed" only as the shadow may land where the depth frame has nothing (streak carried)
 	};
 
 	struct Record
