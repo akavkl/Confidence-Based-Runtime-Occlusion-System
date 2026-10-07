@@ -238,6 +238,26 @@ namespace CBRO::Hooks::CullGroups
 		std::uint64_t filed{ 0 };
 	};
 	[[nodiscard]] CellArtCounts TakeCellArtCounts() noexcept;
+
+	// Interior frames whose camera stood in a room bound (the scene walk's restricted branch, CBRO frames), and what
+	// CBRO filed into group 0 that the walk files only with the camera outside every room: the cell's child 3
+	// (unbound statics and chunks), child 9 (precombined art; AppCulled frames apart) and child 7's roomless
+	// multibounds. Rooms: those the camera's portal entry lists, against child 7's rooms; the others filed whole
+	// into group 1 (their objects), and the portal path's adds left out because their room was. Taken per summary.
+	struct OutsideRoomsCounts
+	{
+		std::uint64_t frames{ 0 };
+		std::uint64_t unbound{ 0 };
+		std::uint64_t art{ 0 };
+		std::uint64_t artCulled{ 0 };
+		std::uint64_t roomless{ 0 };
+		std::uint64_t roomsSeen{ 0 };
+		std::uint64_t roomsTotal{ 0 };
+		std::uint64_t hiddenRooms{ 0 };
+		std::uint64_t hiddenRoomObjects{ 0 };
+		std::uint64_t portalAddsSkipped{ 0 };
+	};
+	[[nodiscard]] OutsideRoomsCounts TakeOutsideRoomsCounts() noexcept;
 	[[nodiscard]] bool      IsSky(const RE::NiAVObject* a_object) noexcept;
 
 	// Block entry bounds (SoA: groups of 4 entries, x[4] y[4] z[4] radius[4], at block + 0x60).

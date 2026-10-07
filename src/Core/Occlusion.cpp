@@ -4691,6 +4691,13 @@ namespace CBRO::Core::Occlusion
 		logger::info(
 			"cell art node 9 per frame (AppCulled by the engine, previs draws its chunks by id): nodes {:.2f} | children filed into group 0 {:.1f}",
 			static_cast<double>(art.nodes) / frames, static_cast<double>(art.filed) / frames);
+		if (const auto rooms = Hooks::CullGroups::TakeOutsideRoomsCounts(); rooms.frames) {
+			const auto perRoomFrame = [&](std::uint64_t a_count) { return static_cast<double>(a_count) / static_cast<double>(rooms.frames); };
+			logger::info(
+				"interior outside its rooms ({} frames with the camera in a room bound; the engine files only the rooms its portals show): filed into group 0 per such frame: unbound node {:.1f}, precombined art {:.1f} (node 9 AppCulled on {} frames), roomless multibounds {:.1f} | rooms the camera sees {:.1f} of {:.1f}; the others filed whole into group 1: rooms {:.1f}, objects {:.1f} | portal adds left out (their room filed whole) {:.1f}",
+				rooms.frames, perRoomFrame(rooms.unbound), perRoomFrame(rooms.art), rooms.artCulled, perRoomFrame(rooms.roomless), perRoomFrame(rooms.roomsSeen), perRoomFrame(rooms.roomsTotal),
+				perRoomFrame(rooms.hiddenRooms), perRoomFrame(rooms.hiddenRoomObjects), perRoomFrame(rooms.portalAddsSkipped));
+		}
 		logger::info(
 			"occlusion lights per frame: tested {:.0f} | rejected {:.0f} (point/spot lights whose whole reach is hidden)",
 			per(kLightsTested), per(kLightsRejected));
