@@ -215,8 +215,21 @@ namespace CBRO::Hooks::CullGroups
 		float dir[3]{};                // row 0 of the shadow camera's rotation: the light's travel direction
 		float cameraPos[3]{};          // the shadow camera's position
 		float range{ 0.0f };           // cascade range
+		// The cascades (the light's records, as its slot-14 update left them last frame; FO4-ENGINE-NOTES 6.1):
+		// their count, and the last one's accumulator and receiver slab (NiPlanes {normal, constant}, world space,
+		// n . x = constant on the plane: +0x58 faces the view direction at its first view depth, +0x68 faces back at
+		// its last, both with the blend band). godrayCascades: how many cascades godrays read (542491).
+		std::uint32_t cascades{ 0 };
+		const void*   farAccumulator{ nullptr };
+		float         farSlab[2][4]{};
+		std::uint32_t godrayCascades{ 0 };
 	};
 	[[nodiscard]] bool ReadSun(SunSource& a_out) noexcept;
+
+	// The sun's last cascade (Core/Occlusion, v1.80): its accumulator's registrations go through a filter that returns
+	// true to leave the geometry out of that cascade alone. Null = none. Set on the main thread before the cascades run
+	// (the cull begin), read on the registering thread.
+	void SetFarCascade(const void* a_accumulator, CasterFilter a_filter) noexcept;
 
 	// Rejected entries that had been marked force-visible (previs active) since the last call.
 	[[nodiscard]] std::uint64_t TakeForcedCleared() noexcept;

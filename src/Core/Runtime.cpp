@@ -2,6 +2,7 @@
 
 #include "Core/Async.h"
 #include "Core/Feed.h"
+#include "Core/HangWatch.h"
 #include "Core/SetDiff.h"
 #include "Core/HiZ.h"
 #include "Core/Occlusion.h"
@@ -1006,16 +1007,69 @@ namespace CBRO::Core::Runtime
 			std::uint32_t badDirection{ 0 };   // not unit length, or not pointing down (sun at the horizon)
 			std::uint32_t badPlacement{ 0 };   // the shadow camera isn't on the sun's side of the view
 			std::uint32_t batched{ 0 };        // frames with bCullingBatch set (the other path)
+			// The last cascade judged alone (v1.80), per frame with the sun on: on, or why not.
+			std::uint32_t farOn{ 0 };
+			std::uint32_t farDisabled{ 0 };    // bFarCascadeTrim=0
+			std::uint32_t farGodrays{ 0 };     // a single cascade, or godrays read the last one too
+			std::uint32_t farSlabBad{ 0 };     // its slab planes didn't validate (normal, order, range)
+			float         farNear{ 0.0f };     // last frame on: the slab's view depths, from the planes
+			float         farFar{ 0.0f };
+			float         farFrom{ 0.0f };     // ... and the depth judged from (corners, margin)
 			float         dir[3]{};
 			float         range{ 0.0f };
 			float         placement{ 0.0f };   // (view - shadow camera) . direction: 15000 when as the engine builds it
 		};
 		SunStats g_sun;
 
+		// The sun's last cascade (v1.80): judged alone when godrays don't read it (FO4-ENGINE-NOTES 6.1). Its slab planes
+		// are last frame's (the light's update runs after the cull), taken along the depth frame's view axis: n . x = c at
+		// view depth (c - n . origin) / (n . viewDir). A cascade picked by distance from the eye rather than by view depth
+		// starts nearer at the view's corners, so receivers count from that corner depth; both ends get a margin.
+		void ReadFarCascade(const HiZ::Camera& a_camera, const Hooks::CullGroups::SunSource& a_source, Occlusion::FrameContext::Sun& a_out)
+		{
+			if (!Settings::Get().farCascadeTrim) {
+				++g_sun.farDisabled;
+				return;
+			}
+			if (a_source.cascades < 2 || !a_source.farAccumulator || a_source.cascades <= std::min(a_source.cascades, a_source.godrayCascades)) {
+				++g_sun.farGodrays;
+				return;
+			}
+			const auto dot = [](const float* a_a, const float* a_b) { return a_a[0] * a_b[0] + a_a[1] * a_b[1] + a_a[2] * a_b[2]; };
+			const auto& nearPlane = a_source.farSlab[0];
+			const auto& farPlane = a_source.farSlab[1];
+			const float nearFacing = dot(nearPlane, a_camera.viewDir);
+			const float farFacing = dot(farPlane, a_camera.viewDir);
+			const float zNear = (nearPlane[3] - dot(nearPlane, a_camera.origin)) / nearFacing;
+			const float zFar = (farPlane[3] - dot(farPlane, a_camera.origin)) / farFacing;
+			const float range = a_source.range;
+			if (!(nearFacing > 0.98f) || !(farFacing < -0.98f) || !(zNear > 0.0f) || !(zFar > zNear) || !(range > 0.0f) ||
+				!(zFar > 0.9f * range) || !(zFar < 1.5f * range) || !(a_camera.scaleX > 0.0f) || !(a_camera.scaleY > 0.0f)) {
+				++g_sun.farSlabBad;
+				return;
+			}
+			const float tx = 1.1f / a_camera.scaleX;  // (the view's edge, with room for a turn's overhang)
+			const float ty = 1.1f / a_camera.scaleY;
+			const float corner = std::sqrt(1.0f + tx * tx + ty * ty);
+			a_out.farNear = zNear / corner - 0.02f * zNear - 64.0f;
+			a_out.farFar = zFar * 1.02f + 64.0f;
+			a_out.farOn = a_out.farNear > 0.0f;
+			if (!a_out.farOn) {
+				++g_sun.farSlabBad;
+				return;
+			}
+			++g_sun.farOn;
+			g_sun.farNear = zNear;
+			g_sun.farFar = zFar;
+			g_sun.farFrom = a_out.farNear;
+			Occlusion::SetFarCascade(a_source.farAccumulator);
+		}
+
 		void ReadSunState(const HiZ::Camera& a_camera, Occlusion::FrameContext::Sun& a_out)
 		{
 			using State = Occlusion::FrameContext::Sun::State;
 			a_out = {};
+			Occlusion::SetFarCascade(nullptr);
 			if (!Settings::Get().sunShadowCulling) {
 				++g_sun.disabled;
 				return;
@@ -1069,14 +1123,16 @@ namespace CBRO::Core::Runtime
 			a_out.spread = 0.0175f;  // sin(1 deg)
 			a_out.margin = 64.0f;
 			a_out.state = State::kOn;
+			ReadFarCascade(a_camera, source, a_out);
 		}
 
 		void LogSun()
 		{
 			logger::info(
-				"sun shadows per interval: on {} | off {} | not used: disabled {}, unreadable {}, path changed {}, direction {}, placement {} || batched frames {} || last direction ({:.3f},{:.3f},{:.3f}) range {:.0f} placement {:.0f}",
+				"sun shadows per interval: on {} | off {} | not used: disabled {}, unreadable {}, path changed {}, direction {}, placement {} || batched frames {} || last direction ({:.3f},{:.3f},{:.3f}) range {:.0f} placement {:.0f} || last cascade judged alone: {} frames | not: off {}, read by godrays or single {}, slab unverified {} | its slab (view depth) {:.0f}-{:.0f}, receivers counted from {:.0f}",
 				g_sun.on, g_sun.off, g_sun.disabled, g_sun.unreadable, g_sun.pathChanged, g_sun.badDirection, g_sun.badPlacement, g_sun.batched,
-				g_sun.dir[0], g_sun.dir[1], g_sun.dir[2], g_sun.range, g_sun.placement);
+				g_sun.dir[0], g_sun.dir[1], g_sun.dir[2], g_sun.range, g_sun.placement,
+				g_sun.farOn, g_sun.farDisabled, g_sun.farGodrays, g_sun.farSlabBad, g_sun.farNear, g_sun.farFar, g_sun.farFrom);
 			SunStats next{};
 			std::copy_n(g_sun.dir, 3, next.dir);
 			next.range = g_sun.range;
@@ -2408,6 +2464,7 @@ namespace CBRO::Core::Runtime
 			{
 				switch (a_stage) {
 				case Stage::kCull: {
+					HangWatch::Beat();
 					const auto now = Qpc();
 					CloseFrameTiming(now);  // the previous frame's buckets go to its mode
 					g_timing.marks = {};
@@ -2530,6 +2587,9 @@ namespace CBRO::Core::Runtime
 					break;
 				}
 				case Stage::kSunCascades:
+					// (the last cascade's registration filter lives from this frame's cull begin to here: never across a
+					// menu, a loading screen or a frame CBRO doesn't cull, whose context it would read)
+					Occlusion::SetFarCascade(nullptr);
 					ShadowLights::LampLoopEnd();  // (nothing unless LampLoopBegin ran this frame)
 					ShadowLights::SetLampStage(false);
 					g_timing.marks[6] = Qpc();
@@ -2593,6 +2653,7 @@ namespace CBRO::Core::Runtime
 		Feed::Install();
 		SetDiff::Install(settings.setDiff);
 		Async::Install(settings.async);
+		HangWatch::Install();
 		Hooks::RenderStages::AddListener(&g_listener);
 		if (settings.firstPersonAfterWorld) {
 			Hooks::FirstPersonOrder::Install(&g_firstPersonListener);

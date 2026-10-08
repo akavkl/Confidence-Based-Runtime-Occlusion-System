@@ -103,6 +103,7 @@ namespace CBRO::Hooks::PrevisFeed
 		bool     g_available{ false };
 		FeedSite g_preCullSite;   // Render_PreUI+0x157: the cull window opens after its call
 		FeedSite g_cascadeSite;   // 1108521+0xE49: the cascade window is that call
+		std::uint64_t g_cascadeCalls{ 0 };  // calls of CascadeCullThunk (main thread)
 		bool     g_windowsAvailable{ false };
 
 		// The windows (main thread only: Render_PreUI's thread). `g_window` is the policy's word for the frame ("a CBRO
@@ -232,6 +233,7 @@ namespace CBRO::Hooks::PrevisFeed
 		// skipped: previs's sun list is empty and the walk filed group 0), so it takes its group-0 path.
 		std::uintptr_t CascadeCullThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
 		{
+			++g_cascadeCalls;
 			if (!g_window.load(std::memory_order_relaxed) && !g_querySkipped) {
 				return reinterpret_cast<PassFn>(g_cascadeSite.previous)(a1, a2, a3, a4);
 			}
@@ -664,6 +666,11 @@ namespace CBRO::Hooks::PrevisFeed
 	std::uintptr_t CascadeCullPrevious() noexcept
 	{
 		return g_cascadeSite.ok ? g_cascadeSite.previous : 0;
+	}
+
+	std::uint64_t CascadeCullCalls() noexcept
+	{
+		return g_cascadeCalls;
 	}
 
 	bool Available() noexcept

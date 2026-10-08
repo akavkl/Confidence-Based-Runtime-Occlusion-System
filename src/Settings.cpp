@@ -66,6 +66,7 @@ namespace CBRO
 		cullActors = ReadBool(path, L"Occlusion", L"bCullActors", cullActors);
 		meshShapes = ReadBool(path, L"Occlusion", L"bMeshShapes", meshShapes);
 		sunShadowCulling = ReadBool(path, L"Occlusion", L"bSunShadowCulling", sunShadowCulling);
+		farCascadeTrim = ReadBool(path, L"Occlusion", L"bFarCascadeTrim", farCascadeTrim);
 		lampShadowCulling = ReadBool(path, L"Occlusion", L"bLampShadowCulling", lampShadowCulling);
 		lampShadowVolumes = ReadBool(path, L"Occlusion", L"bLampShadowVolumes", lampShadowVolumes);
 		spotShadowCulling = ReadBool(path, L"Occlusion", L"bSpotShadowCulling", spotShadowCulling);
@@ -112,9 +113,9 @@ namespace CBRO
 
 		logger::info("settings: {} ({})", path.string(), exists ? "found" : "missing, using defaults");
 		logger::info(
-			"settings: occlusion={} disablePrevis={} previsFeed={} skipPrevisQuery={} interiors={} interiorLegacyPrevis={} asyncInteriors={} setDiff={} async={} lampGroupTrim={} unoccludeLights={} lampDiagnostic={} leftOutDump={} feedAuditInterval={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} meshShapes={} sunShadowCulling={} lampShadowCulling={} spotShadowCulling={} spotCullWindow={} spotCasterTrim={} cellNodePruning={} cellArtNode9={} interiorOutsideRooms={} firstPersonAfterWorld={} viewOverhang={} viewOverhangTurn={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
+			"settings: occlusion={} disablePrevis={} previsFeed={} skipPrevisQuery={} interiors={} interiorLegacyPrevis={} asyncInteriors={} setDiff={} async={} lampGroupTrim={} unoccludeLights={} lampDiagnostic={} leftOutDump={} feedAuditInterval={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} meshShapes={} sunShadowCulling={} farCascadeTrim={} lampShadowCulling={} spotShadowCulling={} spotCullWindow={} spotCasterTrim={} cellNodePruning={} cellArtNode9={} interiorOutsideRooms={} firstPersonAfterWorld={} viewOverhang={} viewOverhangTurn={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
 			occlusion, disablePrevis, previsFeed, skipPrevisQuery, interiors, interiorLegacyPrevis, asyncInteriors, setDiff, async, lampGroupTrim, unoccludeLights, lampDiagnostic, leftOutDump, feedAuditInterval, startActive, observeOnly, toggleHotkey, statusHotkey, notify, hiZDownsample, hiZTemporalFrames, confirmFrames, maxSnapshotAge,
-			maxCameraMove, maxCameraAngle, nearDistance, cullActors, meshShapes, sunShadowCulling, lampShadowCulling, spotShadowCulling, spotCullWindow, spotCasterTrim, cellNodePruning, cellArtNode9, interiorOutsideRooms, firstPersonAfterWorld, viewOverhang, viewOverhangTurn, depthTolerance, depthSlack,
+			maxCameraMove, maxCameraAngle, nearDistance, cullActors, meshShapes, sunShadowCulling, farCascadeTrim, lampShadowCulling, spotShadowCulling, spotCullWindow, spotCasterTrim, cellNodePruning, cellArtNode9, interiorOutsideRooms, firstPersonAfterWorld, viewOverhang, viewOverhangTurn, depthTolerance, depthSlack,
 			worldDepthMin, worldDepthMax);
 		logger::info(
 			"settings: enabled={} probe={} renderStageHooks={} cullingHooks={} cullingGroupHooks={} drawCallCounter={} sceneSurvey={} summaryInterval={} traceFrames={} traceDelay={} traceHotkey=0x{:X} surveyHotkey=0x{:X}",

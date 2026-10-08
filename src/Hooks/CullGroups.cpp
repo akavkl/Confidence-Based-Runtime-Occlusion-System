@@ -47,6 +47,13 @@ namespace CBRO::Hooks::CullGroups
 		constexpr std::size_t   kShadowCameraOffset = 0x2C0;   // BSShadowDirectionalLight -> NiCamera*
 		constexpr std::size_t   kLocalRotateOffset = 0x30;     // NiAVObject::local.rotate (row 0 first)
 		constexpr std::size_t   kLocalTranslateOffset = 0x60;  // NiAVObject::local.translate
+		constexpr std::size_t   kCascadeCountOffset = 0x190;   // BSShadowDirectionalLight -> u32 cascade count
+		constexpr std::size_t   kCascadesOffset = 0x198;       // ... -> its cascade records (0xF0 bytes each)
+		constexpr std::size_t   kCascadeStride = 0xF0;
+		constexpr std::size_t   kCascadeAccumulatorOffset = 0x48;  // record -> BSShaderAccumulator*
+		constexpr std::size_t   kCascadeSlabOffsets[2]{ 0x58, 0x68 };  // record -> receiver slab NiPlanes (near, far)
+		constexpr std::uint32_t kMaxCascades = 8;
+		constexpr std::uint64_t kGodrayCascadesID = 542491;    // u32: godrays read the first min(count, this) cascades
 
 		// The three loops that add a node's children to the main groups one by one (see the header), each patched
 		// at the instruction that starts the loop with a switchable jump to a stub that asks the cell-node filter
@@ -216,6 +223,8 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<std::uint64_t>  g_countedRegistrations{ 0 };
 		std::atomic<const void*>    g_filteredAccumulator{ nullptr };
 		std::atomic<CasterFilter>   g_casterFilter{ nullptr };
+		std::atomic<const void*>    g_farAccumulator{ nullptr };
+		std::atomic<CasterFilter>   g_farFilter{ nullptr };
 
 		std::atomic<std::uint64_t> g_forcedCleared{ 0 };
 		std::atomic<std::uint64_t> g_skyForced{ 0 };   // sky entries given previs's force-visible mark (CBRO frames)
@@ -244,6 +253,7 @@ namespace CBRO::Hooks::CullGroups
 		std::uintptr_t g_shadowSceneNode{ 0 };
 		std::uintptr_t g_dirLightVtable{ 0 };
 		std::uintptr_t g_shadowRange{ 0 };
+		std::uintptr_t g_godrayCascades{ 0 };
 		std::uintptr_t g_blockAddOriginal{ 0 };
 		std::uintptr_t g_groupAddOriginal{ 0 };
 		std::uintptr_t g_childPushOriginal{ 0 };
@@ -536,6 +546,11 @@ namespace CBRO::Hooks::CullGroups
 			if (a_accumulator && a_accumulator == g_filteredAccumulator.load(std::memory_order_relaxed)) {
 				if (const auto filter = g_casterFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
 					return true;  // a caster that can't shadow a visible pixel (callers ignore the result)
+				}
+			}
+			if (a_accumulator && a_accumulator == g_farAccumulator.load(std::memory_order_relaxed)) {
+				if (const auto filter = g_farFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
+					return true;  // a caster whose shadow lands on nothing visible in the sun's last cascade
 				}
 			}
 			if (const auto observer = g_mainRegistrationObserver.load(std::memory_order_relaxed);
@@ -936,6 +951,51 @@ namespace CBRO::Hooks::CullGroups
 			return CallsTo(a_path[0].site, a_path[0].target) && CallsTo(a_path[1].site, a_path[1].target);
 		}
 
+		// A plugin that wraps a site after CBRO did fails CallsTo, though the engine's function still runs beneath it:
+		// CBRO's own hook under that wrapper is what calls it. Shader Replacer v0.1 wraps both unbatched sites; read as
+		// "path changed" on every frame, that kept sun-shadow trimming off for the whole session (2026-10-08: the
+		// cascades registered 12.3k objects a frame against previs's 2.1k). So an unbatched site also counts as the
+		// engine's when CBRO's hook there ran since the previous check (the last frame's cascades: they run after the
+		// cull) and chains to the engine's function. CBRO's cascade wrapper sits inside the engine's stage function, so
+		// its call proves that function ran too, in either load order. Without directional shadows the stage never
+		// reaches the cascade cull's call. The batched path has no CBRO hook to give such proof.
+		std::uint64_t g_stageEntriesSeen{ 0 };
+		std::uint64_t g_cascadeCallsSeen{ 0 };
+
+		bool UnbatchedIntact(bool a_dirShadows) noexcept
+		{
+			using RenderStages::Stage;
+			const auto entries = RenderStages::Entries(Stage::kSunCascades);
+			const auto calls = PrevisFeed::CascadeCullCalls();
+			const bool stageRan = entries != g_stageEntriesSeen && RenderStages::OriginalOf(Stage::kSunCascades) == g_unbatchedPath[0].target;
+			const bool cullRan = calls != g_cascadeCallsSeen && PrevisFeed::CascadeCullPrevious() == g_unbatchedPath[1].target;
+			g_stageEntriesSeen = entries;
+			g_cascadeCallsSeen = calls;
+			return (stageRan || cullRan || CallsTo(g_unbatchedPath[0].site, g_unbatchedPath[0].target)) &&
+			       (!a_dirShadows || cullRan || CallsTo(g_unbatchedPath[1].site, g_unbatchedPath[1].target));
+		}
+
+		// Once per session, when the path stays unverified for a while (a single frame can lack the proof, e.g. the
+		// first one with directional shadows on): which call isn't the engine's.
+		std::uint32_t           g_pathFailures{ 0 };
+		bool                    g_pathWarned{ false };
+		constexpr std::uint32_t kPathWarnFrames = 60;
+
+		void WarnPathChanged(bool a_batched)
+		{
+			const auto& path = a_batched ? g_batchedPath : g_unbatchedPath;
+			const auto  describe = [](const CallSite& a_site) {
+				return std::format(
+					"{} -> {} {}", Util::DescribeCodeAddress(a_site.site), Util::DescribeCodeAddress(Util::ReadCall5Target(a_site.site)),
+					CallsTo(a_site.site, a_site.target) ? "(engine's)" : "(CHANGED)");
+			};
+			logger::warn(
+				"cullgroups: sun cascades: the {} path is not verified as the engine's for {} culled frames in a row: {}, {}; light update slot {}. "
+				"Sun-shadow trimming stays off while it lasts (group 0 keeps every object for the cascades)",
+				a_batched ? "batched" : "unbatched", kPathWarnFrames, describe(path[0]), describe(path[1]),
+				*reinterpret_cast<const std::uintptr_t*>(g_dirLightUpdateSlot) == g_dirLightUpdate ? "(engine's)" : "(CHANGED)");
+		}
+
 		// The sun's two cascade paths (see the constants), located and logged once; ReadSun re-reads them.
 		void ResolveSunPath()
 		{
@@ -1007,6 +1067,12 @@ namespace CBRO::Hooks::CullGroups
 		// (the filter first: a reader that sees the accumulator sees its filter, or none)
 		g_casterFilter.store(a_filter, std::memory_order_release);
 		g_filteredAccumulator.store(a_accumulator, std::memory_order_release);
+	}
+
+	void SetFarCascade(const void* a_accumulator, CasterFilter a_filter) noexcept
+	{
+		g_farFilter.store(a_filter, std::memory_order_release);
+		g_farAccumulator.store(a_accumulator, std::memory_order_release);
 	}
 
 	std::uint64_t ReadDroppedRegistrations() noexcept
@@ -1113,6 +1179,7 @@ namespace CBRO::Hooks::CullGroups
 		g_shadowSceneNode = CBRO::Engine::OG(kShadowSceneNodeID).address();
 		g_dirLightVtable = CBRO::Engine::OG(kDirLightVtableID).address();
 		g_shadowRange = CBRO::Engine::OG(kShadowRangeID).address();
+		g_godrayCascades = CBRO::Engine::OG(kGodrayCascadesID).address();
 		ResolveSunPath();
 		g_blockAddOriginal = Util::DetourSwitchable(g_blockAddHook, CBRO::Engine::OG(kBlockAddID).address(), Util::FnAddr(&BlockAddThunk), kBlockAddPrologue, "cullgroups:Block::Add");
 		g_groupAddOriginal = Util::DetourSwitchable(g_groupAddHook, CBRO::Engine::OG(kGroupAddID).address(), Util::FnAddr(&GroupAddThunk), kGroupAddPrologue, "cullgroups:Group::Add");
@@ -1273,9 +1340,14 @@ namespace CBRO::Hooks::CullGroups
 			// The path this frame takes (bCullingBatch picks it) still calls where the engine put it, and the
 			// light's update (which sets the direction the cascades use) is the engine's own.
 			a_out.groupsEnabled = *reinterpret_cast<const std::uint8_t*>(g_groupsEnabled) != 0;
-			a_out.pathIntact = Intact(a_out.groupsEnabled ? g_batchedPath : g_unbatchedPath) &&
-			                   *reinterpret_cast<const std::uintptr_t*>(g_dirLightUpdateSlot) == g_dirLightUpdate;
 			a_out.dirShadows = *reinterpret_cast<const std::uint8_t*>(g_dirShadows) != 0;
+			a_out.pathIntact = (a_out.groupsEnabled ? Intact(g_batchedPath) : UnbatchedIntact(a_out.dirShadows)) &&
+			                   *reinterpret_cast<const std::uintptr_t*>(g_dirLightUpdateSlot) == g_dirLightUpdate;
+			g_pathFailures = a_out.pathIntact ? 0 : g_pathFailures + 1;
+			if (g_pathFailures == kPathWarnFrames && !g_pathWarned) {
+				g_pathWarned = true;
+				WarnPathChanged(a_out.groupsEnabled);
+			}
 			a_out.range = *reinterpret_cast<const float*>(g_shadowRange);
 
 			const auto node = *reinterpret_cast<const std::byte* const*>(a_out.groupsEnabled ? g_shadowSceneNode : g_unbatchedSceneNode);
@@ -1293,6 +1365,16 @@ namespace CBRO::Hooks::CullGroups
 				a_out.dir[i] = row0[i];
 				a_out.cameraPos[i] = translate[i];
 			}
+			a_out.cascades = *reinterpret_cast<const std::uint32_t*>(light + kCascadeCountOffset);
+			const auto records = *reinterpret_cast<const std::byte* const*>(light + kCascadesOffset);
+			if (records && a_out.cascades > 0 && a_out.cascades <= kMaxCascades) {
+				const auto last = records + kCascadeStride * (a_out.cascades - 1);
+				a_out.farAccumulator = *reinterpret_cast<const void* const*>(last + kCascadeAccumulatorOffset);
+				for (int i = 0; i < 2; ++i) {
+					std::copy_n(reinterpret_cast<const float*>(last + kCascadeSlabOffsets[i]), 4, a_out.farSlab[i]);
+				}
+			}
+			a_out.godrayCascades = g_godrayCascades ? *reinterpret_cast<const std::uint32_t*>(g_godrayCascades) : kMaxCascades;
 			return true;
 		} __except (EXCEPTION_EXECUTE_HANDLER) {
 			return false;

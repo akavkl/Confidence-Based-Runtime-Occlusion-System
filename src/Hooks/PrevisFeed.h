@@ -104,6 +104,9 @@ namespace CBRO::Hooks::PrevisFeed
 	// For CullGroups' sun-path check: the cascade site calls CBRO's wrapper, which chains to this previous target.
 	[[nodiscard]] std::uintptr_t CascadeCullThunkAddress() noexcept;
 	[[nodiscard]] std::uintptr_t CascadeCullPrevious() noexcept;
+	// Calls of that wrapper so far (window or not): proof the engine's cascade cull ran when another plugin wraps the
+	// site over CBRO's wrapper (CullGroups reads the change between two frames).
+	[[nodiscard]] std::uint64_t CascadeCullCalls() noexcept;
 
 	// A culling group's six frustum planes (NiPlane {n, d}, 16 bytes each, at group+0). False if unreadable.
 	[[nodiscard]] bool GroupPlanes(const void* a_group, float a_planes[6][4]) noexcept;

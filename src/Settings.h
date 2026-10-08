@@ -26,6 +26,7 @@ namespace CBRO
 		bool          cullActors{ true };          // NPC/creature parts may be hidden too (their shadows stay: main view only)
 		bool          meshShapes{ true };          // big static meshes are judged by their actual geometry (box + occupancy grid)
 		bool          sunShadowCulling{ true };    // skip hidden objects whose sun shadow can't fall on anything visible
+		bool          farCascadeTrim{ true };      // ... and leave a needed shadow out of the sun's last cascade when nothing visible lies in its slab (v1.80)
 		bool          lampShadowCulling{ true };   // leave casters out of point-light shadow maps where they can't shadow the view
 		bool          lampShadowVolumes{ true };   // ... also when their shadow volume misses every visible surface (nearest/farthest depth test)
 		bool          spotShadowCulling{ true };   // spot lights: the shadow map draws nothing while the lit volume (shadow frustum) is hidden

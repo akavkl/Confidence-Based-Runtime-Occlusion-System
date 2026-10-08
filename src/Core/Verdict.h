@@ -29,6 +29,7 @@ namespace CBRO::Core::Occlusion
 		kRecordLight = 1 << 2,     // the object is a light (never skipped as out of view)
 		kRecordNoCache = 1 << 3,   // never reuse (a light's reach test, a table-full case)
 		kRecordSunEdge = 1 << 4,   // the sun outcome is "needed" only as the shadow may land where the depth frame has nothing (streak carried)
+		kRecordSunFar = 1 << 5,    // the sun outcome is "needed", but not by the last cascade: nothing visible in its slab (v1.80)
 	};
 
 	struct Record

@@ -47,4 +47,7 @@ namespace CBRO::Hooks::RenderStages
 	// checks whether a site still calls the engine's function (Hooks/CullGroups: the sun's cascade path).
 	[[nodiscard]] std::uintptr_t ThunkOf(Stage a_stage) noexcept;
 	[[nodiscard]] std::uintptr_t OriginalOf(Stage a_stage) noexcept;
+	// How often CBRO's thunk on a stage was entered so far: proof the stage ran through it when another plugin wraps
+	// the site over CBRO's thunk.
+	[[nodiscard]] std::uint64_t Entries(Stage a_stage) noexcept;
 }

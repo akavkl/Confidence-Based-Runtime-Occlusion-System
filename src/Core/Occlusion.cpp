@@ -41,6 +41,10 @@ namespace CBRO::Core::Occlusion
 		// ... and when a cached hidden verdict's evidence is re-checked against a newer depth (ViewValid): fewer, since a
 		// failure only means the full test runs.
 		constexpr std::uint32_t kRecheckRefine = 2;
+		// Sun shadows (TestSun): a sweep whose screen box is wider than kSunPieceExtent (NDC) and needed as a whole is
+		// tested again in up to kSunPieces equal stretches.
+		constexpr int   kSunPieces = 8;
+		constexpr float kSunPieceExtent = 0.25f;
 		// Light tests (TestSphere): how far (NDC) the current view may overhang the depth frame and still be judged,
 		// the overhang taken to hold what the frame's adjacent edge holds. A camera swaying by a fraction of a degree
 		// (first-person idle motion) leaves such a strip every few frames; judged unknown, every lamp crossing it
@@ -151,6 +155,11 @@ namespace CBRO::Core::Occlusion
 			kStreakFromBackup,    // hidden verdicts without last frame's record whose streak the table's backup continued
 			kOverhangHidden,      // objects hidden with part of them in a thin overhang of the view, judged by the depth frame's edge (fViewOverhang)
 			kSunOverhang,         // sun shadows found behind surfaces the same way
+			kSunPiecewise,        // sun shadows found behind surfaces stretch by stretch where the whole sweep's box said needed (v1.79)
+			kSunFarTests,         // needed sun shadows tested again for the last cascade alone (v1.80)
+			kSunFarUnneeded,      // ... that find nothing visible in its slab
+			kSunFarLeftOut,       // group-0 entries the main view doesn't need left out of the last cascade
+			kSunFarRegistrations, // the last cascade's registrations left out for them (their geometry)
 			kWalkJudged,          // async frames: entries the worker's map couldn't answer, judged in the walk (counted twice: the worker judges them too)
 			kWalkUnsettled,       // ... of the map's answers, edge and confirming verdicts judged again in the walk (v1.71)
 			kWalkSunEdge,         // ... and sun outcomes needed only for the map's no-depth strip, judged again in the walk (v1.73)
@@ -359,6 +368,7 @@ namespace CBRO::Core::Occlusion
 		// ones the main view needn't draw this frame are recorded here, and the main accumulator's
 		// registration of them is skipped (MainView).
 		DropSet       g_drops;
+		DropSet       g_farDrops;  // group-0 entries the sun's last cascade doesn't need this frame (v1.80)
 		std::uint32_t g_dropCycle{ 0 };  // clock / kTagCycle at the last frame start (main thread)
 
 		// ---- object types -----------------------------------------------------------------------
@@ -924,7 +934,8 @@ namespace CBRO::Core::Occlusion
 		// in front of the eye, within the cascade range and inside the current view, so the sweep is clipped to
 		// where its cross-section reaches that region; that part is then tested against the depth frame like an
 		// object: hidden only if every visible surface over its screen box is in front of its nearest point.
-		SunVerdict TestSun(const FrameContext& a_context, const RE::NiBound& a_bound, DepthRect* a_rect = nullptr) noexcept
+		// a_far (v1.80): only the receivers of the sun's last cascade, the slab of view depth it covers (Sun::farPlanes).
+		SunVerdict TestSun(const FrameContext& a_context, const RE::NiBound& a_bound, DepthRect* a_rect = nullptr, bool a_far = false) noexcept
 		{
 			const auto& snapshot = *a_context.snapshot;
 			const auto& camera = snapshot.camera;
@@ -946,70 +957,118 @@ namespace CBRO::Core::Occlusion
 			// turned by that much, which shifts a point at depth z by z x the slack)
 			const float r0 = radius + a_context.dilateMove + sun.margin + (std::isfinite(sun.reach) ? std::max(sun.reach, 0.0f) * a_context.angularSlack : 0.0f);
 			// (first person, which may lie outside the world view's planes: its own field of view, tested first)
-			if (FirstPersonUnseen(a_context) && SweepNearEye(center, sun.dir, r0, sun.spread, 1.0e6f, kFirstPersonReach)) {
+			// (not in the last cascade's slab: first person is drawn next to the eye)
+			if (!a_far && FirstPersonUnseen(a_context) && SweepNearEye(center, sun.dir, r0, sun.spread, 1.0e6f, kFirstPersonReach)) {
 				return SunVerdict::kNeeded;
 			}
 
-			for (int i = 0; i < sun.reachCount; ++i) {  // the cheap part of the sweep first (most casters end here)
-				const auto& plane = sun.reachPlanes[i];
+			const auto* reachPlanes = a_far ? sun.farReachPlanes : sun.reachPlanes;
+			const int   reachCount = a_far ? sun.farReachCount : sun.reachCount;
+			for (int i = 0; i < reachCount; ++i) {  // the cheap part of the sweep first (most casters end here)
+				const auto& plane = reachPlanes[i];
 				if (ShadowGeometry::Dot(plane.n, center) + plane.d + r0 < 0.0f) {
 					return SunVerdict::kOutside;
 				}
 			}
 			float t0 = 0.0f, t1 = 0.0f;
-			if (!ShadowGeometry::SweepClip(center, sun.dir, r0, sun.spread, 1.0e6f, sun.planes, sun.planeCount, t0, t1)) {
+			if (!ShadowGeometry::SweepClip(center, sun.dir, r0, sun.spread, 1.0e6f, a_far ? sun.farPlanes : sun.planes, a_far ? sun.farPlaneCount : sun.planeCount, t0, t1)) {
 				return SunVerdict::kOutside;
 			}
 
-			const float q0[3]{ center[0] + t0 * sun.dir[0], center[1] + t0 * sun.dir[1], center[2] + t0 * sun.dir[2] };
-			const float q1[3]{ center[0] + t1 * sun.dir[0], center[1] + t1 * sun.dir[1], center[2] + t1 * sun.dir[2] };
-			const float ra = r0 + t0 * sun.spread;
-			const float rb = r0 + t1 * sun.spread;
-			// Depth minus radius is linear along the capsule: its nearest point is at one of the ends.
-			const float nearest = std::min(q0[2] - ra, q1[2] - rb);
-			if (nearest < g_tunables.nearDistance) {
+			// Depth minus radius is linear along the capsule: its nearest point is at one of the ends (no stretch of it
+			// is nearer than the whole).
+			if (std::min(center[2] + t0 * sun.dir[2] - (r0 + t0 * sun.spread), center[2] + t1 * sun.dir[2] - (r0 + t1 * sun.spread)) < g_tunables.nearDistance) {
 				return SunVerdict::kNeeded;
 			}
-			// The capsule projects within the box around both end spheres' projections (all in front of the eye).
-			float x0, x1, y0, y1, u0, u1, v0, v1;
-			SphereExtent(q0[0], q0[2], ra, x0, x1);
-			SphereExtent(q0[1], q0[2], ra, y0, y1);
-			SphereExtent(q1[0], q1[2], rb, u0, u1);
-			SphereExtent(q1[1], q1[2], rb, v0, v1);
-			x0 = std::min(x0, u0) * camera.scaleX;
-			x1 = std::max(x1, u1) * camera.scaleX;
-			y0 = std::min(y0, v0) * camera.scaleY;
-			y1 = std::max(y1, v1) * camera.scaleY;
-			bool overhung = false;
-			switch (ClipToView(a_context, x0, x1, y0, y1, g_tunables.viewOverhang, &overhung, a_context.overhang)) {
-			case Verdict::kOutside:
-				return SunVerdict::kOutside;
-			case Verdict::kEdge:
-				return SunVerdict::kEdge;
-			default:
-				break;
-			}
-			const float limit = CacheLimit(a_context, (nearest - g_tunables.depthSlack) / (1.0f + g_tunables.depthTolerance));
-			if (!(limit > 0.0f)) {
-				return SunVerdict::kNeeded;
-			}
-			const float farthest = std::max(q0[2] + ra, q1[2] + rb);
-			const float limitFar = CacheLimitFar(a_context, (farthest + g_tunables.depthSlack) * (1.0f + g_tunables.depthTolerance));
 			const float width = static_cast<float>(snapshot.width[0]);
 			const float height = static_cast<float>(snapshot.height[0]);
 			const auto  bufferDepth = [&](float a_z) { return std::min(g_tunables.depthMin + g_tunables.depthRange * (camera.depthA + camera.depthB / a_z), 0.999999f); };
-			if (a_rect) {
-				a_rect->Add((x0 * 0.5f + 0.5f) * width - 0.25f, (0.5f - y1 * 0.5f) * height - 0.25f, (x1 * 0.5f + 0.5f) * width + 0.25f, (0.5f - y0 * 0.5f) * height + 0.25f);
+			// The stretch [a_ta, a_tb] of the sweep: the convex hull of its end spheres, so it projects within the box around
+			// both end spheres' projections (all in front of the eye), and its depth lies between the ends' nearest and
+			// farthest points. a_extent: the box's larger side in NDC, before clipping to the view.
+			const auto stretch = [&](float a_ta, float a_tb, float* a_extent, bool& a_overhung) {
+				const float q0[3]{ center[0] + a_ta * sun.dir[0], center[1] + a_ta * sun.dir[1], center[2] + a_ta * sun.dir[2] };
+				const float q1[3]{ center[0] + a_tb * sun.dir[0], center[1] + a_tb * sun.dir[1], center[2] + a_tb * sun.dir[2] };
+				const float ra = r0 + a_ta * sun.spread;
+				const float rb = r0 + a_tb * sun.spread;
+				const float nearest = std::min(q0[2] - ra, q1[2] - rb);
+				float       x0, x1, y0, y1, u0, u1, v0, v1;
+				SphereExtent(q0[0], q0[2], ra, x0, x1);
+				SphereExtent(q0[1], q0[2], ra, y0, y1);
+				SphereExtent(q1[0], q1[2], rb, u0, u1);
+				SphereExtent(q1[1], q1[2], rb, v0, v1);
+				x0 = std::min(x0, u0) * camera.scaleX;
+				x1 = std::max(x1, u1) * camera.scaleX;
+				y0 = std::min(y0, v0) * camera.scaleY;
+				y1 = std::max(y1, v1) * camera.scaleY;
+				if (a_extent) {
+					*a_extent = std::max(x1 - x0, y1 - y0);
+				}
+				bool overhung = false;
+				switch (ClipToView(a_context, x0, x1, y0, y1, g_tunables.viewOverhang, &overhung, a_context.overhang)) {
+				case Verdict::kOutside:
+					return SunVerdict::kOutside;
+				case Verdict::kEdge:
+					return SunVerdict::kEdge;
+				default:
+					break;
+				}
+				const float limit = CacheLimit(a_context, (nearest - g_tunables.depthSlack) / (1.0f + g_tunables.depthTolerance));
+				if (!(limit > 0.0f)) {
+					return SunVerdict::kNeeded;
+				}
+				const float farthest = std::max(q0[2] + ra, q1[2] + rb);
+				const float limitFar = CacheLimitFar(a_context, (farthest + g_tunables.depthSlack) * (1.0f + g_tunables.depthTolerance));
+				const float bx0 = (x0 * 0.5f + 0.5f) * width - 0.25f;
+				const float by0 = (0.5f - y1 * 0.5f) * height - 0.25f;
+				const float bx1 = (x1 * 0.5f + 0.5f) * width + 0.25f;
+				const float by1 = (0.5f - y0 * 0.5f) * height + 0.25f;
+				if (a_rect) {
+					a_rect->Add(bx0, by0, bx1, by1);
+				}
+				// No visible surface inside the stretch's depth range over its screen box: at every texel the surfaces are
+				// all in front of it or all behind it (the sky, cleared to the far plane, counts as behind: nothing there
+				// receives a shadow).
+				if (!snapshot.NoSurfaceBetween(bx0, by0, bx1, by1, bufferDepth(limit), bufferDepth(limitFar), kRefineLevels)) {
+					return SunVerdict::kNeeded;
+				}
+				a_overhung = a_overhung || overhung;
+				return SunVerdict::kHidden;
+			};
+
+			bool  overhung = false;
+			float extent = 0.0f;
+			const auto whole = stretch(t0, t1, &extent, overhung);
+			const int  pieces = (whole == SunVerdict::kNeeded || whole == SunVerdict::kEdge) && extent > kSunPieceExtent ?
+			                        static_cast<int>(std::min(std::ceil(extent / kSunPieceExtent), static_cast<float>(kSunPieces))) :
+			                        1;
+			if (pieces < 2) {
+				if (whole == SunVerdict::kHidden && overhung) {
+					Bump(kSunOverhang);
+				}
+				return whole;
 			}
-			// No visible surface inside the capsule's depth range over its screen box: at every texel the surfaces are
-			// all in front of it or all behind it (the sky, cleared to the far plane, counts as behind: nothing there
-			// receives a shadow).
-			if (!snapshot.NoSurfaceBetween(
-					(x0 * 0.5f + 0.5f) * width - 0.25f, (0.5f - y1 * 0.5f) * height - 0.25f,
-					(x1 * 0.5f + 0.5f) * width + 0.25f, (0.5f - y0 * 0.5f) * height + 0.25f,
-					bufferDepth(limit), bufferDepth(limitFar), kRefineLevels)) {
-				return SunVerdict::kNeeded;
+			// A long sweep (a low sun, the cascade range) projects to a box over much of the view with a depth range
+			// that takes in most surfaces there, so the whole is nearly always needed. Its stretches cover it (their
+			// union is the sweep) with smaller boxes and narrower ranges: hidden only if every one is.
+			bool edge = false;
+			for (int i = 0; i < pieces; ++i) {
+				const float ta = t0 + (t1 - t0) * static_cast<float>(i) / static_cast<float>(pieces);
+				const float tb = i + 1 == pieces ? t1 : t0 + (t1 - t0) * static_cast<float>(i + 1) / static_cast<float>(pieces);
+				switch (stretch(ta, tb, nullptr, overhung)) {
+				case SunVerdict::kNeeded:
+					return SunVerdict::kNeeded;
+				case SunVerdict::kEdge:
+					edge = true;
+					break;
+				default:
+					break;
+				}
 			}
+			if (edge) {
+				return SunVerdict::kEdge;
+			}
+			Bump(kSunPiecewise);
 			if (overhung) {
 				Bump(kSunOverhang);
 			}
@@ -1037,7 +1096,10 @@ namespace CBRO::Core::Occlusion
 		{
 			auto& sun = a_context.sun;
 			sun.planeCount = 0;
+			sun.farPlaneCount = 0;
+			sun.farReachCount = 0;
 			if (sun.state != FrameContext::Sun::State::kOn || !a_context.snapshot) {
+				sun.farOn = false;
 				return;
 			}
 			const auto& camera = a_context.snapshot->camera;
@@ -1064,6 +1126,22 @@ namespace CBRO::Core::Occlusion
 			for (int i = 0; i < count; ++i) {
 				if (ShadowGeometry::Dot(sun.planes[i].n, sun.dir) + sun.spread <= 0.0f) {
 					sun.reachPlanes[sun.reachCount++] = sun.planes[i];
+				}
+			}
+			// The last cascade alone: its slab's view depths in place of the eye and the range, the same view edges.
+			if (!sun.farOn || !(sun.farNear > 0.0f) || !(sun.farFar > sun.farNear)) {
+				sun.farOn = false;
+				return;
+			}
+			sun.farPlanes[0] = { { 0.0f, 0.0f, 1.0f }, -sun.farNear };
+			sun.farPlanes[1] = { { 0.0f, 0.0f, -1.0f }, std::min(sun.farFar, sun.reach) };
+			for (int i = 2; i < count; ++i) {
+				sun.farPlanes[i] = sun.planes[i];
+			}
+			sun.farPlaneCount = count;
+			for (int i = 0; i < count; ++i) {
+				if (ShadowGeometry::Dot(sun.farPlanes[i].n, sun.dir) + sun.spread <= 0.0f) {
+					sun.farReachPlanes[sun.farReachCount++] = sun.farPlanes[i];
 				}
 			}
 		}
@@ -2691,7 +2769,7 @@ namespace CBRO::Core::Occlusion
 			a_out.sunReadback = a_context.readback;
 			a_out.sunBlocks[0] = 255;
 			a_out.sunStreak = 0;
-			a_out.flags &= ~kRecordSunEdge;
+			a_out.flags &= ~(kRecordSunEdge | kRecordSunFar);
 			switch (a_context.sun.state) {
 			case FrameContext::Sun::State::kOff: {
 				// The sun's cascades don't read group 0 this frame; the spot lights' group passes do (FO4-ENGINE-NOTES
@@ -2737,6 +2815,17 @@ namespace CBRO::Core::Occlusion
 				Bump(kSunOutside);
 				a_out.sun = SunOutcome::kUnneeded;
 				return;
+			}
+			// Needed, though maybe not by the sun's last cascade (v1.80): only receivers in the slab of view depth it covers
+			// read it, so the same sweep is tested against those alone. Its boxes join the evidence (the record is judged
+			// again when the depth there moves, SunValid).
+			if ((verdict == SunVerdict::kNeeded || verdict == SunVerdict::kEdge) && a_context.sun.farOn) {
+				Bump(kSunFarTests);
+				const auto lastCascade = TestSun(a_context, a_bound, &rect, true);
+				if (lastCascade == SunVerdict::kOutside || lastCascade == SunVerdict::kHidden) {
+					Bump(kSunFarUnneeded);
+					a_out.flags |= kRecordSunFar;
+				}
 			}
 			if (rect.used) {
 				SetBlocks(a_context, a_out.sunBlocks, rect);
@@ -2875,6 +2964,53 @@ namespace CBRO::Core::Occlusion
 			return true;
 		}
 
+		// A group-0 entry the main view doesn't need, kept for its sun shadow (v1.80). With a low sun a caster's sweep runs
+		// up to the whole cascade range, so EvaluateSun found it needed whenever it reached a visible surface anywhere:
+		// one next to the camera kept it in every cascade whose box holds it, the last (largest) one included (2026-10-09,
+		// a London building: the last cascade filed 1,185 objects a frame against previs' 323). That cascade is read only
+		// by receivers in its slab of view depth (godrays read the first ones, FO4-ENGINE-NOTES 6.1), so an entry whose
+		// sweep finds nothing visible there is left out of that cascade's registration alone (FarCascade).
+		void NoteFarCascade(const FrameContext& a_context, const RE::NiAVObject* a_object, const Record& a_out) noexcept
+		{
+			if (!(a_out.flags & kRecordSunFar) || a_out.sun != SunOutcome::kNeeded || !a_context.sun.farOn) {
+				return;
+			}
+			if (g_farDrops.Insert(a_object, DropSet::Tag(a_context.clock))) {
+				Bump(kSunFarLeftOut);
+			} else {
+				Bump(kDropFull);
+			}
+		}
+
+		// The last cascade's registration of a geometry: left out when it, or a node above it, was left out of that cascade
+		// this frame (the entry is the geometry or one of its parents; the walk below a node never leaves its bound).
+		constexpr int kFarParentDepth = 6;
+
+		bool InFarDrops(const RE::NiAVObject* a_object, std::uint32_t a_tag) noexcept
+		{
+			__try {
+				auto object = a_object;
+				for (int depth = 0; object && depth < kFarParentDepth; ++depth) {
+					if (g_farDrops.Contains(object, a_tag)) {
+						return true;
+					}
+					object = object->parent;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			return false;
+		}
+
+		bool FarCascade(const RE::NiAVObject* a_object)
+		{
+			const auto context = CurrentContext();
+			if (!context || !context->sun.farOn || !a_object || !InFarDrops(a_object, DropSet::Tag(context->clock))) {
+				return false;
+			}
+			Bump(kSunFarRegistrations);
+			return true;
+		}
+
 		enum class Reuse : std::uint8_t
 		{
 			kNo,
@@ -2952,9 +3088,14 @@ namespace CBRO::Core::Occlusion
 				return false;  // (rests on the lamps and the depth of its frame, or on depth not there yet: re-judged every frame)
 			}
 			if (a_old.sun != SunOutcome::kBehind) {
-				return true;
+				// (a needed shadow the last cascade doesn't need rests on the depth in its slab, when its test read any)
+				if (!(a_old.flags & kRecordSunFar) || a_old.sunBlocks[0] == 255) {
+					return true;
+				}
+			} else if (a_old.sunBlocks[0] == 255) {
+				return false;
 			}
-			return a_old.sunBlocks[0] != 255 && (a_old.sunReadback == a_context.readback || !BlocksChanged(a_context, a_old.sunBlocks, a_old.sunReadback));
+			return a_old.sunReadback == a_context.readback || !BlocksChanged(a_context, a_old.sunBlocks, a_old.sunReadback);
 		}
 
 		void ReuseView(const Record& a_old, Record& a_out) noexcept
@@ -3054,6 +3195,7 @@ namespace CBRO::Core::Occlusion
 				const bool sunReusable = reused && old->sun != SunOutcome::kNone && old->sunEpoch == a_context.sunEpoch;
 				if (!unneededByView) {
 					a_out.sun = SunOutcome::kNone;
+					a_out.flags &= ~kRecordSunFar;
 				} else if (sunReusable && SunValid(a_context, *old)) {
 					ReuseSun(a_context, a_out);
 					// (the shadow streak's backup, kept fresh as the view's is, for a record the map loses or an edge)
@@ -3247,6 +3389,9 @@ namespace CBRO::Core::Occlusion
 					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kCasterRejected, &out);
 					return &a_context.reject;
 				}
+				if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !(out.flags & kRecordLight)) {
+					NoteFarCascade(a_context, a_add.object, out);
+				}
 				if (hiddenConfirmed) {
 					if (!g_drops.Insert(a_add.object, tag)) {
 						Bump(kDropFull);
@@ -3377,12 +3522,16 @@ namespace CBRO::Core::Occlusion
 							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipCaster, &out);
 							skip = true;
 						} else if (hiddenConfirmed) {
+							NoteFarCascade(*context, a_object, out);
 							if (!g_drops.Insert(a_object, DropSet::Tag(context->clock))) {
 								Bump(kDropFull);
 							} else {
 								RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);
 							}
 						} else if (out.outcome == Outcome::kOutside) {
+							if (!light) {
+								NoteFarCascade(*context, a_object, out);
+							}
 							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kOutside, &out);
 						}
 					} else if (hiddenConfirmed) {
@@ -3877,6 +4026,7 @@ namespace CBRO::Core::Occlusion
 
 		g_table = std::make_unique<Entry[]>(kTableSize);
 		g_drops.Allocate();
+		g_farDrops.Allocate();
 		Calibrate();
 		Hooks::CullGroups::SetFilter(&Filter);
 		Hooks::CullGroups::SetInstanceFilter(&Instances);
@@ -3965,6 +4115,7 @@ namespace CBRO::Core::Occlusion
 		if (const auto cycle = a_context.clock / DropSet::kTagCycle; cycle != g_dropCycle) {
 			g_dropCycle = cycle;
 			g_drops.Clear();
+			g_farDrops.Clear();
 		}
 		MeshProxy::BeginFrame();
 		GatherSpotLamps();  // (Runtime published last frame's lamps just before)
@@ -3992,6 +4143,11 @@ namespace CBRO::Core::Occlusion
 		const auto start = __rdtsc();
 		JudgeRecord(a_context, a_add, a_old, a_wantSun, a_out);
 		Bump(kCycles, (__rdtsc() - start) * kTimingStride);  // (the worker's own stats block: "all threads", never the main thread's share)
+	}
+
+	void SetFarCascade(const void* a_accumulator) noexcept
+	{
+		Hooks::CullGroups::SetFarCascade(a_accumulator, a_accumulator ? &FarCascade : nullptr);
 	}
 
 	void PrepareContext(FrameContext& a_context) noexcept
@@ -4705,8 +4861,8 @@ namespace CBRO::Core::Occlusion
 			"occlusion main view only (groups the sun's shadow cascades read too) per frame: entries {:.0f} | dropped with their parent {:.0f} | registrations {:.0f}, left out {:.0f} | drop table full {:.0f}",
 			per(kShared), per(kDropInherited), per(kRegistered), per(kRegistrationsDropped), per(kDropFull));
 		logger::info(
-			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f} | sun off: kept, no lamp known {:.0f}; lamp tests {:.0f}: no lamp's shadow reaches a visible surface {:.0f} (left out), a lamp's may {:.0f} | confirming {:.0f} | needed {:.0f} || objects nothing needs: never filed {:.0f}, rejected {:.0f} | kept for a spot lamp within reach (sun up): entries {:.0f}, cell nodes {:.1f} (spot lamps not all known {:.0f}; {} spot lamps this frame)",
-			per(kSunTests), per(kSunOutside), per(kSunHidden), per(kSunOff), per(kSunLampTests), per(kSunLampUnneeded), per(kSunLampNeeded), per(kSunConfirming), per(kSunNeeded), per(kCasterSkipped), per(kCasterRejected),
+			"occlusion sun shadows per frame (group-0 objects the main view doesn't need): shadow tested {:.0f} | not needed: out of reach {:.0f}, behind surfaces {:.0f} | sun off: kept, no lamp known {:.0f}; lamp tests {:.0f}: no lamp's shadow reaches a visible surface {:.0f} (left out), a lamp's may {:.0f} | confirming {:.0f} | needed {:.0f} | behind surfaces only stretch by stretch (of the not needed) {:.0f} | last cascade: needed shadows tested {:.0f}, nothing visible in its slab {:.0f}, entries left out of it {:.0f} ({:.0f} registrations) || objects nothing needs: never filed {:.0f}, rejected {:.0f} | kept for a spot lamp within reach (sun up): entries {:.0f}, cell nodes {:.1f} (spot lamps not all known {:.0f}; {} spot lamps this frame)",
+			per(kSunTests), per(kSunOutside), per(kSunHidden), per(kSunOff), per(kSunLampTests), per(kSunLampUnneeded), per(kSunLampNeeded), per(kSunConfirming), per(kSunNeeded), per(kSunPiecewise), per(kSunFarTests), per(kSunFarUnneeded), per(kSunFarLeftOut), per(kSunFarRegistrations), per(kCasterSkipped), per(kCasterRejected),
 			per(kSpotLampKept), per(kSpotLampNodesKept), per(kSpotLampsUnknown), g_spotLamps.count);
 		logger::info(
 			"occlusion early skips per frame (main-view-only groups, never filed with the engine): hidden {:.0f} | out of view {:.0f} | top-level adds considered {:.0f}",

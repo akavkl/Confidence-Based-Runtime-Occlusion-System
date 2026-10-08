@@ -79,6 +79,17 @@ namespace CBRO::Core::Occlusion
 			// beyond one of them is out of reach without the full sweep.
 			ShadowGeometry::Plane reachPlanes[6]{};
 			int                   reachCount{ 0 };
+
+			// The sun's last cascade, when godrays don't read it (v1.80): the view depths its receivers can have (Runtime,
+			// from the cascade's slab planes, widened for a cascade picked by distance rather than depth) and the planes
+			// TestSun clips a sweep to for that cascade alone (set by BeginFrame, as above). farOn false: none.
+			bool                  farOn{ false };
+			float                 farNear{ 0.0f };
+			float                 farFar{ 0.0f };
+			ShadowGeometry::Plane farPlanes[6]{};
+			int                   farPlaneCount{ 0 };
+			ShadowGeometry::Plane farReachPlanes[6]{};
+			int                   farReachCount{ 0 };
 		};
 		Sun sun;
 
@@ -118,6 +129,9 @@ namespace CBRO::Core::Occlusion
 	void JudgeAsync(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add, const Record* a_old, bool a_wantSun, Record& a_out);
 	// Derives a context's sun and lamp receiver planes from its view (BeginFrame does this for the frame's own).
 	void PrepareContext(FrameContext& a_context) noexcept;
+	// The sun's last cascade's accumulator while the context's farOn holds (v1.80: its registrations are filtered), or
+	// null. Main thread, at the cull begin.
+	void SetFarCascade(const void* a_accumulator) noexcept;
 
 	// Once per frame at the cull stage's end (main thread, DrawWorld's jobs done), with the running total of
 	// every accumulator's registrations (Hooks::CullGroups::ReadHookCalls): records how much the culled set

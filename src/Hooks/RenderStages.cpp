@@ -10,9 +10,11 @@ namespace CBRO::Hooks::RenderStages
 		std::array<Listener*, 4>   g_listeners{};
 		std::size_t                g_listenerCount{ 0 };
 		bool                       g_installed{ false };
+		std::array<std::uint64_t, static_cast<std::size_t>(Stage::kCount)> g_entries{};
 
 		Stage Enter(Stage a_stage)
 		{
+			++g_entries[static_cast<std::size_t>(a_stage)];
 			for (std::size_t i = 0; i < g_listenerCount; ++i) {
 				g_listeners[i]->OnStageBegin(a_stage);
 			}
@@ -154,6 +156,11 @@ namespace CBRO::Hooks::RenderStages
 	{
 		const auto site = FindSite(a_stage);
 		return site ? *site->original : 0;
+	}
+
+	std::uint64_t Entries(Stage a_stage) noexcept
+	{
+		return a_stage < Stage::kCount ? g_entries[static_cast<std::size_t>(a_stage)] : 0;
 	}
 
 	void LogChain()
