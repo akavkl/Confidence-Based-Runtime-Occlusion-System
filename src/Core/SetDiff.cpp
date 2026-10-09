@@ -3,9 +3,12 @@
 #include "Hooks/CullGroups.h"
 #include "Util/Gamebryo.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace CBRO::Core::SetDiff
 {
@@ -220,6 +223,54 @@ namespace CBRO::Core::SetDiff
 		Side g_side[2];  // 0 previs, 1 CBRO
 		std::uint32_t g_unsettled{ 0 };
 		std::uint32_t g_overflow{ 0 };
+
+		// Previs-only objects whose bound comes within kNearGap of the eye, with their place in the scene graph (2026-10-09:
+		// a wall's lower part drawn by previs, not by CBRO, with Runtime Combiner's chunks in the scene).
+		constexpr float       kNearGap = 2000.0f;
+		constexpr std::size_t kNearMax = 400;
+		struct Near
+		{
+			float       gap{ 0.0f };
+			std::string text;
+		};
+		std::vector<Near> g_previsNear;
+
+		bool DescribeNear(const RE::NiAVObject* a_object, const RE::NiPoint3& a_eye, Near& a_out) noexcept
+		{
+			__try {
+				const auto& bound = a_object->worldBound;
+				const float dx = bound.center.x - a_eye.x, dy = bound.center.y - a_eye.y, dz = bound.center.z - a_eye.z;
+				const float gap = std::sqrt(dx * dx + dy * dy + dz * dz) - bound.fRadius;
+				if (!(gap <= kNearGap)) {
+					return false;
+				}
+				a_out.gap = gap;
+				char type[48]{}, name[64]{};
+				Util::TryGetRTTIName(a_object, type, sizeof(type));
+				Util::TryGetObjectName(a_object, name, sizeof(name));
+				char path[512]{};
+				std::size_t used = 0;
+				auto parent = a_object->parent;
+				for (int depth = 0; parent && depth < 7 && used < sizeof(path) - 1; ++depth, parent = parent->parent) {
+					char ptype[48]{}, pname[48]{};
+					Util::TryGetRTTIName(parent, ptype, sizeof(ptype));
+					Util::TryGetObjectName(parent, pname, sizeof(pname));
+					const int n = std::snprintf(path + used, sizeof(path) - used, "%s%s'%s'%s", depth ? " < " : "", ptype, pname, (parent->GetFlags() & 1) ? "(AppCulled)" : "");
+					if (n <= 0) {
+						break;
+					}
+					used = std::min(sizeof(path) - 1, used + static_cast<std::size_t>(n));
+				}
+				char line[900]{};
+				std::snprintf(line, sizeof(line), "  %s '%s' %llX | bound (%.0f,%.0f,%.0f) r=%.0f gap %.0f | flags 0x%llX%s | in %s", type, name,
+					static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(a_object)), bound.center.x, bound.center.y, bound.center.z, bound.fRadius, gap,
+					static_cast<unsigned long long>(a_object->GetFlags()), (a_object->GetFlags() & 1) ? " (AppCulled)" : "", path);
+				a_out.text = line;
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
 	}
 
 	void Install(bool a_enabled)
@@ -266,6 +317,12 @@ namespace CBRO::Core::SetDiff
 				Info       info{};
 				const bool readable = DescribeImpl(object, a_eye, info);
 				mine.onlyHere.Add(info, readable);
+				if (a_mode == 0 && g_previsNear.size() < kNearMax) {
+					Near item;
+					if (DescribeNear(object, a_eye, item)) {
+						g_previsNear.push_back(std::move(item));
+					}
+				}
 			}
 		}
 	}
@@ -281,6 +338,7 @@ namespace CBRO::Core::SetDiff
 		}
 		g_unsettled = 0;
 		g_overflow = 0;
+		g_previsNear.clear();
 	}
 
 	void LogStats()
@@ -308,6 +366,15 @@ namespace CBRO::Core::SetDiff
 			if (previs.onlyHere.sampleCount) {
 				logger::info("set diff: previs-only samples: {}", previs.onlyHere.Samples());
 			}
+		}
+		if (!g_previsNear.empty()) {
+			std::ranges::sort(g_previsNear, [](const Near& a_left, const Near& a_right) { return a_left.gap < a_right.gap; });
+			logger::info("set diff: drawn by previs, never by CBRO here, bound within {:.0f} of the eye: {}{} (nearest first)", kNearGap, g_previsNear.size(),
+				g_previsNear.size() >= kNearMax ? "+" : "");
+			for (const auto& item : g_previsNear) {
+				logger::info("{}", item.text);
+			}
+			g_previsNear.clear();  // (logged once per summary)
 		}
 	}
 }

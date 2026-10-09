@@ -39,4 +39,19 @@ namespace CBRO::Core::MeshProxy
 	[[nodiscard]] const Shape* Find(RE::NiAVObject* a_object, RE::NiBound& a_modelBound) noexcept;
 
 	void LogStats(std::uint32_t a_frames);
+
+	// Diagnostic (the left-out dump): the object's mesh as Find reads it now, a shape built from that data on the spot,
+	// and the cached shape when one is ready for the same data. Positions are model space, 3 floats a vertex.
+	struct Inspection
+	{
+		bool                       read{ false };    // the mesh qualifies and its data could be copied
+		bool                       fresh{ false };   // a shape was built from it now
+		bool                       cached{ false };  // the cache holds a ready shape for the same data (its check)
+		Shape                      freshShape{};
+		Shape                      cachedShape{};
+		std::vector<float>         positions;
+		std::vector<std::uint16_t> indices;
+		std::uint32_t              vertexCount{ 0 };
+	};
+	void Inspect(RE::NiAVObject* a_object, Inspection& a_out) noexcept;
 }

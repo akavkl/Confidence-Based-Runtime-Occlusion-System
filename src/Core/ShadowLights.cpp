@@ -68,18 +68,18 @@ namespace CBRO::Core::ShadowLights
 		std::atomic<std::uint64_t> g_lampsPoint{ 0 };
 		std::atomic<std::uint64_t> g_lampsSpot{ 0 };
 
-		void RecordLamp(const RE::NiPoint3& a_position, float a_reach, bool a_spot) noexcept
+		Lamp* RecordLamp(const RE::NiPoint3& a_position, float a_reach, bool a_spot) noexcept
 		{
 			auto& list = g_lampLists[g_lampWrite];
 			if (!std::isfinite(a_reach) || a_reach < 16.0f || a_reach > 1.0e6f || !std::isfinite(a_position.x) || !std::isfinite(a_position.y) || !std::isfinite(a_position.z)) {
-				return;
+				return nullptr;
 			}
 			if (list.count >= LampList::kMax) {
 				++list.overflow;
-				return;
+				return nullptr;
 			}
-			list.items[list.count++] = Lamp{ a_position, a_reach, a_spot };
 			(a_spot ? g_lampsSpot : g_lampsPoint).fetch_add(1, std::memory_order_relaxed);
+			return &(list.items[list.count++] = Lamp{ a_position, a_reach, a_spot });
 		}
 
 		// The spot light's NiLight position and radius, read under SEH (the light must be one of the engine's).
@@ -105,14 +105,14 @@ namespace CBRO::Core::ShadowLights
 		std::atomic<int> g_spotSamplesLogged{ 0 };
 
 		// A spot light whose Update(camera) passed (it goes on to its shadow map): recorded for the lamp trimming.
-		void RecordSpotLight(std::uintptr_t a_light) noexcept
+		Lamp* RecordSpotLight(std::uintptr_t a_light) noexcept
 		{
 			RE::NiPoint3 position{};
 			float        reach = 0.0f;
 			if (!ReadSpotLight(a_light, position, reach)) {
-				return;
+				return nullptr;
 			}
-			RecordLamp(position, reach, true);
+			const auto lamp = RecordLamp(position, reach, true);
 			// (the first few, with the camera, so the read layout can be checked against the scene)
 			if (g_spotSamplesLogged.load(std::memory_order_relaxed) < 6 && g_spotSamplesLogged.fetch_add(1) < 6) {
 				const auto root = RE::Main::WorldRootCamera();
@@ -121,6 +121,24 @@ namespace CBRO::Core::ShadowLights
 					position.x, position.y, position.z, reach,
 					root ? root->world.translate.x : 0.0f, root ? root->world.translate.y : 0.0f, root ? root->world.translate.z : 0.0f);
 			}
+			return lamp;
+		}
+
+		// Whether the frame before recorded this spot lamp (same position and reach) with the same lit volume. Lamps() is
+		// still that frame's list while the lamp loop runs (the cull begin published it).
+		bool SteadySpot(const Lamp& a_lamp) noexcept
+		{
+			const auto& before = Lamps();
+			const auto  close = [](float a_a, float a_b) { return std::abs(a_a - a_b) <= 0.5f; };
+			for (std::uint32_t i = 0; i < std::min<std::uint32_t>(before.count, LampList::kMax); ++i) {
+				const auto& other = before.items[i];
+				if (other.spot && other.reach == a_lamp.reach && other.position.x == a_lamp.position.x && other.position.y == a_lamp.position.y &&
+					other.position.z == a_lamp.position.z) {
+					return close(other.volume.fRadius, a_lamp.volume.fRadius) && close(other.volume.center.x, a_lamp.volume.center.x) &&
+					       close(other.volume.center.y, a_lamp.volume.center.y) && close(other.volume.center.z, a_lamp.volume.center.z);
+				}
+			}
+			return false;
 		}
 		std::uint32_t  g_confirmFrames{ 2 };
 		bool           g_casterCulling{ true };
@@ -411,13 +429,13 @@ namespace CBRO::Core::ShadowLights
 		}
 
 		// Whether the spot light's shadow map can stay empty this frame (its lit volume hidden for confirmFrames frames),
-		// with the accumulator its casters go to. Main thread (the lamp loop).
-		bool ShouldEmptySpot(std::uintptr_t a_light, const void*& a_accumulator) noexcept
+		// with the accumulator its casters go to and the lit volume it tested. Main thread (the lamp loop).
+		bool ShouldEmptySpot(std::uintptr_t a_light, const void*& a_accumulator, RE::NiBound& a_volume) noexcept
 		{
 			g_spotTests.fetch_add(1, std::memory_order_relaxed);
 			RE::NiPoint3 position{};
 			float        reach = 0.0f;
-			RE::NiBound  volume{};
+			auto&        volume = a_volume;
 			bool         byFrustum = false;
 			if (!ReadSpotLight(a_light, position, reach) || !ReadSpotVolume(a_light, position, reach, volume, byFrustum, a_accumulator)) {
 				g_spotUnreadable.fetch_add(1, std::memory_order_relaxed);
@@ -932,11 +950,17 @@ namespace CBRO::Core::ShadowLights
 			NoteUpdate(a_light, result);
 			const void* dropped = nullptr;
 			if (result && Occlusion::Active()) {
-				RecordSpotLight(a_light);  // (emptied or not: the lamp list stays every lamp the engine lights)
+				const auto lamp = RecordSpotLight(a_light);  // (emptied or not: the lamp list stays every lamp the engine lights)
 				// Only in the main frame's lamp loop: another view's render would be judged against the wrong depth.
 				const void* accumulator = nullptr;
-				if (g_spotCulling && g_lampStage && ShouldEmptySpot(a_light, accumulator)) {
+				RE::NiBound volume{};
+				if (g_spotCulling && g_lampStage && ShouldEmptySpot(a_light, accumulator, volume)) {
 					dropped = accumulator;
+				}
+				if (lamp && g_lampStage) {
+					lamp->volume = volume;
+					lamp->emptied = dropped != nullptr;
+					lamp->steady = SteadySpot(*lamp);
 				}
 			}
 			// This light's cull comes next in the loop; the next light's Update (or the stage's end) resets it.

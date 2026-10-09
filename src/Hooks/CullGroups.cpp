@@ -225,6 +225,8 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<CasterFilter>   g_casterFilter{ nullptr };
 		std::atomic<const void*>    g_farAccumulator{ nullptr };
 		std::atomic<CasterFilter>   g_farFilter{ nullptr };
+		std::array<std::atomic<const void*>, 8> g_sunAccumulators{};
+		std::atomic<CasterFilter>   g_sunFilter{ nullptr };
 
 		std::atomic<std::uint64_t> g_forcedCleared{ 0 };
 		std::atomic<std::uint64_t> g_skyForced{ 0 };   // sky entries given previs's force-visible mark (CBRO frames)
@@ -380,6 +382,8 @@ namespace CBRO::Hooks::CullGroups
 			}
 		}
 
+		thread_local const RE::NiBound* t_widened{ nullptr };  // (WidenBound, for the add in progress)
+
 		bool IsSkyMesh(const RE::NiAVObject* a_object) noexcept
 		{
 			if (!a_object || !g_skyShaderVtable || ReadAt<std::uintptr_t>(a_object, 0) != g_triShapeVtable) {
@@ -415,6 +419,7 @@ namespace CBRO::Hooks::CullGroups
 
 			// Continuation calls (startIndex >= 0) only add more instance entries of a merged mesh.
 			const RE::NiBound* replacement = nullptr;
+			t_widened = nullptr;
 			if (filter && culling && a_startIndex < 0 && a_object && a_bound) {
 				replacement = filter(add);
 				if (add.kind == GroupKind::kUnknown) {
@@ -432,7 +437,8 @@ namespace CBRO::Hooks::CullGroups
 
 			const bool watchInstances = instanceFilter && culling && add.kind == GroupKind::kMainOnly && a_object;
 			const auto before = (watchInstances || replacement || sky) ? ReadAt<std::uint32_t>(a_block, kBlockCountOffset) : 0u;
-			const auto result = reinterpret_cast<BlockAddFn>(g_blockAddOriginal)(a_block, a_object, replacement ? replacement : a_bound, a_startIndex);
+			const auto widened = std::exchange(t_widened, nullptr);
+			const auto result = reinterpret_cast<BlockAddFn>(g_blockAddOriginal)(a_block, a_object, replacement ? replacement : widened ? widened : a_bound, a_startIndex);
 			if (sky && add.mainPass && before < 0x200 && ReadAt<std::uint32_t>(a_block, kBlockCountOffset) > before) {
 				auto*      bytes = static_cast<std::uint8_t*>(a_block) + kEntryBytesOffset + before * kEntryBytesStride;
 				const auto mark = bytes[1];
@@ -553,15 +559,30 @@ namespace CBRO::Hooks::CullGroups
 					return true;  // a caster whose shadow lands on nothing visible in the sun's last cascade
 				}
 			}
-			if (const auto observer = g_mainRegistrationObserver.load(std::memory_order_relaxed);
-				observer && a_accumulator && a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
-				observer(a_object);  // (both modes: the diagnostic compares them)
+			if (const auto filter = g_sunFilter.load(std::memory_order_relaxed); filter && a_accumulator) {
+				for (const auto& accumulator : g_sunAccumulators) {
+					const auto value = accumulator.load(std::memory_order_relaxed);
+					if (!value) {
+						break;
+					}
+					if (value == a_accumulator) {
+						if (filter(a_object)) {
+							return true;  // a caster kept in group 0 for a spot lamp alone: the sun doesn't need its shadow
+						}
+						break;
+					}
+				}
 			}
 			if (g_mainCullActive.load(std::memory_order_relaxed) && a_accumulator &&
 				a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
 				if (const auto filter = g_mainViewFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
 					return true;  // left out of the main view (callers ignore the result)
 				}
+			}
+			// (both modes, after CBRO's main-view filter: the diagnostic compares what each mode draws)
+			if (const auto observer = g_mainRegistrationObserver.load(std::memory_order_relaxed);
+				observer && a_accumulator && a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
+				observer(a_object);
 			}
 			return reinterpret_cast<RegisterFn>(g_registerOriginal)(a_accumulator, a_object);
 		}
@@ -1075,6 +1096,15 @@ namespace CBRO::Hooks::CullGroups
 		g_farAccumulator.store(a_accumulator, std::memory_order_release);
 	}
 
+	void SetSunCascades(const void* const* a_accumulators, std::uint32_t a_count, CasterFilter a_filter) noexcept
+	{
+		g_sunFilter.store(nullptr, std::memory_order_release);
+		for (std::size_t i = 0; i < g_sunAccumulators.size(); ++i) {
+			g_sunAccumulators[i].store(a_accumulators && a_filter && i < a_count ? a_accumulators[i] : nullptr, std::memory_order_relaxed);
+		}
+		g_sunFilter.store(a_accumulators && a_count ? a_filter : nullptr, std::memory_order_release);
+	}
+
 	std::uint64_t ReadDroppedRegistrations() noexcept
 	{
 		std::uint64_t total = 0;
@@ -1316,6 +1346,11 @@ namespace CBRO::Hooks::CullGroups
 		return IsSkyMesh(a_object);
 	}
 
+	void WidenBound(const RE::NiBound* a_bound) noexcept
+	{
+		t_widened = a_bound;
+	}
+
 	bool AddDirect(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags) noexcept
 	{
 		if (!g_groupAddOriginal || !a_group || !a_object || !a_bound) {
@@ -1370,6 +1405,9 @@ namespace CBRO::Hooks::CullGroups
 			if (records && a_out.cascades > 0 && a_out.cascades <= kMaxCascades) {
 				const auto last = records + kCascadeStride * (a_out.cascades - 1);
 				a_out.farAccumulator = *reinterpret_cast<const void* const*>(last + kCascadeAccumulatorOffset);
+				for (std::uint32_t i = 0; i < a_out.cascades && i < a_out.accumulators.size(); ++i) {
+					a_out.accumulators[i] = *reinterpret_cast<const void* const*>(records + kCascadeStride * i + kCascadeAccumulatorOffset);
+				}
 				for (int i = 0; i < 2; ++i) {
 					std::copy_n(reinterpret_cast<const float*>(last + kCascadeSlabOffsets[i]), 4, a_out.farSlab[i]);
 				}

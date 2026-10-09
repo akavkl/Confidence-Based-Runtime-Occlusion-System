@@ -99,6 +99,9 @@ namespace CBRO::Hooks::CullGroups
 	// ignored for unknown groups (a filter records a main-view drop instead, see MainViewFilter). May run on
 	// any thread; must be lock-free. The returned bound must outlive the call.
 	using BlockFilter = const RE::NiBound* (*)(const BlockAdd& a_add);
+	// From inside the filter (same thread): when it keeps the entry, the engine files it with this bound in place of
+	// the one offered (a bound that encloses the offered one; v1.83 static collection pieces). Consumed by that add.
+	void WidenBound(const RE::NiBound* a_bound) noexcept;
 
 	// Called after a main-pass add into a main-only group that wrote instance entries [a_first, a_end) into
 	// a_add.block (merge-instanced meshes, fresh or continued). Instance k of the mesh is entry
@@ -220,6 +223,7 @@ namespace CBRO::Hooks::CullGroups
 		// n . x = constant on the plane: +0x58 faces the view direction at its first view depth, +0x68 faces back at
 		// its last, both with the blend band). godrayCascades: how many cascades godrays read (542491).
 		std::uint32_t cascades{ 0 };
+		std::array<const void*, 8> accumulators{};  // each cascade's (the first `cascades` of them)
 		const void*   farAccumulator{ nullptr };
 		float         farSlab[2][4]{};
 		std::uint32_t godrayCascades{ 0 };
@@ -230,6 +234,10 @@ namespace CBRO::Hooks::CullGroups
 	// true to leave the geometry out of that cascade alone. Null = none. Set on the main thread before the cascades run
 	// (the cull begin), read on the registering thread.
 	void SetFarCascade(const void* a_accumulator, CasterFilter a_filter) noexcept;
+
+	// Every cascade of the sun (Core/Occlusion, v1.82): their accumulators' registrations go through a filter that returns
+	// true to leave the geometry out of the sun's shadow maps. Null/0 = none. Set and read as SetFarCascade.
+	void SetSunCascades(const void* const* a_accumulators, std::uint32_t a_count, CasterFilter a_filter) noexcept;
 
 	// Rejected entries that had been marked force-visible (previs active) since the last call.
 	[[nodiscard]] std::uint64_t TakeForcedCleared() noexcept;

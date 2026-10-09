@@ -132,6 +132,8 @@ namespace CBRO::Core::Occlusion
 	// The sun's last cascade's accumulator while the context's farOn holds (v1.80: its registrations are filtered), or
 	// null. Main thread, at the cull begin.
 	void SetFarCascade(const void* a_accumulator) noexcept;
+	// Every cascade's accumulator (v1.82: entries kept in group 0 for spot lamps alone are left out of them); null/0 = none.
+	void SetSunCascades(const void* const* a_accumulators, std::uint32_t a_count) noexcept;
 
 	// Once per frame at the cull stage's end (main thread, DrawWorld's jobs done), with the running total of
 	// every accumulator's registrations (Hooks::CullGroups::ReadHookCalls): records how much the culled set

@@ -542,6 +542,40 @@ namespace CBRO::Core::MeshProxy
 		return nullptr;
 	}
 
+	void Inspect(RE::NiAVObject* a_object, Inspection& a_out) noexcept
+	{
+		a_out = {};
+		if (!g_enabled) {
+			return;
+		}
+		Source source{};
+		Skip   skip{ Skip::kType };
+		if (!ReadSource(a_object, source, skip)) {
+			return;
+		}
+		std::vector<std::byte> vertexCopy;
+		Failure                failure{ Failure::kCopy };
+		a_out.fresh = BuildShape(source, a_out.freshShape, vertexCopy, a_out.indices, a_out.positions, failure);
+		a_out.read = a_out.fresh || failure != Failure::kCopy;
+		a_out.vertexCount = source.vertexCount;
+		// (the cache, without taking a slot)
+		const auto hash = static_cast<std::size_t>(((source.key >> 5) * 0x9E3779B97F4A7C15ull) >> (64 - kSlotBits));
+		for (std::size_t probe = 0; probe < 32; ++probe) {
+			const auto& slot = g_slots[(hash + probe) & (kSlotCount - 1)];
+			const auto  key = slot.key.load(std::memory_order_acquire);
+			if (key == 0) {
+				break;
+			}
+			if (key == source.key) {
+				if (slot.state.load(std::memory_order_acquire) == kReady && slot.check.load(std::memory_order_relaxed) == source.check) {
+					a_out.cached = true;
+					a_out.cachedShape = g_shapes[slot.shape.load(std::memory_order_relaxed)];
+				}
+				break;
+			}
+		}
+	}
+
 	void LogStats(std::uint32_t a_frames)
 	{
 		if (!g_enabled) {

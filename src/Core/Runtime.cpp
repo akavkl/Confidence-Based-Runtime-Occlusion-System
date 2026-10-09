@@ -1070,6 +1070,7 @@ namespace CBRO::Core::Runtime
 			using State = Occlusion::FrameContext::Sun::State;
 			a_out = {};
 			Occlusion::SetFarCascade(nullptr);
+			Occlusion::SetSunCascades(nullptr, 0);
 			if (!Settings::Get().sunShadowCulling) {
 				++g_sun.disabled;
 				return;
@@ -1123,6 +1124,7 @@ namespace CBRO::Core::Runtime
 			a_out.spread = 0.0175f;  // sin(1 deg)
 			a_out.margin = 64.0f;
 			a_out.state = State::kOn;
+			Occlusion::SetSunCascades(source.accumulators.data(), std::min<std::uint32_t>(source.cascades, static_cast<std::uint32_t>(source.accumulators.size())));
 			ReadFarCascade(a_camera, source, a_out);
 		}
 
@@ -2590,6 +2592,7 @@ namespace CBRO::Core::Runtime
 					// (the last cascade's registration filter lives from this frame's cull begin to here: never across a
 					// menu, a loading screen or a frame CBRO doesn't cull, whose context it would read)
 					Occlusion::SetFarCascade(nullptr);
+					Occlusion::SetSunCascades(nullptr, 0);
 					ShadowLights::LampLoopEnd();  // (nothing unless LampLoopBegin ran this frame)
 					ShadowLights::SetLampStage(false);
 					g_timing.marks[6] = Qpc();

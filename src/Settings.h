@@ -32,6 +32,9 @@ namespace CBRO
 		bool          spotShadowCulling{ true };   // spot lights: the shadow map draws nothing while the lit volume (shadow frustum) is hidden
 		bool          spotCullWindow{ true };      // CBRO frames: previs suspended around a spot light's group-0 cull, so its frustum test runs (else stale results)
 		bool          spotCasterTrim{ true };      // kept spot lights: casters that can't shadow a visible pixel are left out of the shadow map (as point lights' are)
+		bool          emptiedSpotTrim{ true };     // sun up: group 0 keeps no entry for a spot lamp whose shadow map stays empty this frame (v1.81)
+		bool          spotOnlyCascadeTrim{ true }; // sun up: a group-0 entry kept for a spot lamp alone is left out of the sun's cascades (v1.82)
+		bool          scolRootBounds{ true };      // a static collection's pieces are judged (and filed) with the collection's bound, not their own (v1.83)
 		bool          cellNodePruning{ true };     // a cell's static-object node outside the view (and its sun shadow) is never walked
 		bool          cellArtNode9{ true };        // CBRO frames: a cell's node 9 (precombined art) the engine has AppCulled is filed anyway, as previs draws it by id
 		bool          interiorOutsideRooms{ true };  // CBRO frames, camera in an interior room bound: what lies outside every room bound is filed anyway (previs ignores rooms)

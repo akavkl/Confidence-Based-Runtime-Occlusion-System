@@ -45,6 +45,11 @@ namespace CBRO::Core::ShadowLights
 		RE::NiPoint3 position{};
 		float        reach{ 0.0f };
 		bool         spot{ false };
+		// Spot lamps (v1.81): the lit volume the shadow-map test read, whether the map was emptied, and whether the frame
+		// before recorded the same lamp with the same volume.
+		RE::NiBound  volume{};
+		bool         emptied{ false };
+		bool         steady{ false };
 	};
 	struct LampList
 	{
