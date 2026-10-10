@@ -273,6 +273,7 @@ struct Gpu
 	ComPtr<ID3D11UnorderedAccessView> uavs[kUAVs];
 	OutputLayout                      output;
 	std::string                       driver;
+	std::uint32_t                     texW{ 0 }, texH{ 0 };  // the depth texture; the frame is drawn in its top-left srcW x srcH
 
 	bool CreateDevice()
 	{
@@ -337,9 +338,11 @@ struct Gpu
 		return !a_uav || SUCCEEDED(device->CreateUnorderedAccessView(a_tex.Get(), nullptr, a_uav->ReleaseAndGetAddressOf()));
 	}
 
-	bool Resize(const Model& a_model)
+	bool Resize(const Model& a_model, std::uint32_t a_texScale)
 	{
-		if (!Texture(a_model.srcW, a_model.srcH, 1, depth, nullptr) ||
+		texW = a_model.srcW * a_texScale;
+		texH = a_model.srcH * a_texScale;
+		if (!Texture(texW, texH, 1, depth, nullptr) ||
 			FAILED(device->CreateShaderResourceView(depth.Get(), nullptr, depthSRV.ReleaseAndGetAddressOf())) ||
 			!Texture(a_model.dstW, a_model.dstH, kRingSize, ringNear, &uavs[0]) ||
 			!Texture(a_model.dstW, a_model.dstH, kRingSize, ringFar, &uavs[1]) ||
@@ -377,7 +380,12 @@ struct Gpu
 	// Runs both dispatches like HiZ::Capture and reads the whole output buffer back (blocking: this is a test).
 	std::vector<std::uint8_t> Run(const Model& a_model, const Scene& a_scene, std::uint32_t a_captureIndex, std::uint32_t a_mergeCount, std::uint32_t a_ringCur, std::uint32_t a_flags)
 	{
-		context->UpdateSubresource(depth.Get(), 0, nullptr, a_scene.depth.data(), a_scene.w * 4, 0);
+		// Outside the drawn region (dynamic resolution) a near surface: it would show in the pyramid if the shader read it.
+		std::vector<float> texels(static_cast<std::size_t>(texW) * texH, 0.02f);
+		for (std::uint32_t y = 0; y < a_scene.h; ++y) {
+			std::copy_n(a_scene.depth.data() + static_cast<std::size_t>(y) * a_scene.w, a_scene.w, texels.data() + static_cast<std::size_t>(y) * texW);
+		}
+		context->UpdateSubresource(depth.Get(), 0, nullptr, texels.data(), texW * 4, 0);
 		Params p{};
 		p.srcSize[0] = a_model.srcW;
 		p.srcSize[1] = a_model.srcH;
@@ -518,8 +526,9 @@ int main()
 	struct Config
 	{
 		std::uint32_t w, h, factor;
+		std::uint32_t texScale{ 1 };  // depth texture size / drawn size (Upscaling without ENB: 1280x800 drawn in 2560x1600)
 	};
-	const Config configs[]{ { 1280, 800, 4 }, { 321, 203, 2 }, { 100, 60, 8 }, { 25, 20, 8 }, { 1920, 1080, 4 }, { 640, 360, 1 } };
+	const Config configs[]{ { 1280, 800, 4 }, { 321, 203, 2 }, { 100, 60, 8 }, { 25, 20, 8 }, { 1920, 1080, 4 }, { 640, 360, 1 }, { 1280, 800, 4, 2 }, { 161, 102, 2, 2 } };
 	const Wall   wallA{ 0.10f, 0.30f, 0.35f, 0.90f, 120.0f };
 	const Wall   wallB{ 0.55f, 0.25f, 0.75f, 0.70f, 60.0f };
 	const Wall   wallC{ 0.40f, 0.10f, 0.50f, 0.60f, 900.0f };  // in the sky band too
@@ -527,12 +536,12 @@ int main()
 	Totals totals;
 	for (const auto& config : configs) {
 		Model model(config.w, config.h, config.factor);
-		if (!gpu.Resize(model)) {
+		if (!gpu.Resize(model, config.texScale)) {
 			std::printf("resize %ux%u failed\n", config.w, config.h);
 			return 1;
 		}
-		std::printf("depth %ux%u / %u -> hi-z %ux%u, %u levels, blocks %ux%u, output %u bytes%s\n",
-			config.w, config.h, config.factor, model.dstW, model.dstH, model.layout.levels, model.blocksW, model.blocksH, gpu.output.bytes,
+		std::printf("depth %ux%u (in %ux%u) / %u -> hi-z %ux%u, %u levels, blocks %ux%u, output %u bytes%s\n",
+			config.w, config.h, gpu.texW, gpu.texH, config.factor, model.dstW, model.dstH, model.layout.levels, model.blocksW, model.blocksH, gpu.output.bytes,
 			model.layout.levels > kGroupLevels ? "" : " (no tail pass)");
 
 		// A capture sequence the way Runtime + HiZ::Capture would drive it (ring wraps after 8).

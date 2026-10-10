@@ -64,7 +64,9 @@ namespace CBRO::Core::HiZ
 			std::array<Slot, kSlots>          slots;
 			Build::Layout                     layout;
 			Build::OutputLayout               output;
-			std::uint32_t                     srcWidth{ 0 };
+			std::uint32_t                     copyWidth{ 0 };   // the engine's depth texture (the private copy's size)
+			std::uint32_t                     copyHeight{ 0 };
+			std::uint32_t                     srcWidth{ 0 };    // the region of it the frame was drawn in (top-left)
 			std::uint32_t                     srcHeight{ 0 };
 			std::uint32_t                     dstWidth{ 0 };
 			std::uint32_t                     dstHeight{ 0 };
@@ -245,16 +247,19 @@ namespace CBRO::Core::HiZ
 			return true;
 		}
 
-		bool EnsureTargets(ID3D11Device* a_device, ID3D11DeviceContext* a_context, const D3D11_TEXTURE2D_DESC& a_depthDesc, ID3D11ShaderResourceView* a_depthSRV)
+		bool EnsureTargets(ID3D11Device* a_device, ID3D11DeviceContext* a_context, const D3D11_TEXTURE2D_DESC& a_depthDesc, ID3D11ShaderResourceView* a_depthSRV, std::uint32_t a_srcWidth, std::uint32_t a_srcHeight)
 		{
-			const auto srcWidth = a_depthDesc.Width;
-			const auto srcHeight = a_depthDesc.Height;
-			if (srcWidth == g_gpu.srcWidth && srcHeight == g_gpu.srcHeight && g_gpu.out && g_gpu.depthCopySRV) {
+			const auto srcWidth = a_srcWidth;
+			const auto srcHeight = a_srcHeight;
+			if (a_depthDesc.Width == g_gpu.copyWidth && a_depthDesc.Height == g_gpu.copyHeight &&
+				srcWidth == g_gpu.srcWidth && srcHeight == g_gpu.srcHeight && g_gpu.out && g_gpu.depthCopySRV) {
 				return true;
 			}
 
 			Reset();  // (unmaps whatever the old slots held)
 			const auto factor = std::max(1u, Settings::Get().hiZDownsample);
+			g_gpu.copyWidth = a_depthDesc.Width;
+			g_gpu.copyHeight = a_depthDesc.Height;
 			g_gpu.srcWidth = srcWidth;
 			g_gpu.srcHeight = srcHeight;
 			g_gpu.dstWidth = (srcWidth + factor - 1) / factor;
@@ -344,8 +349,8 @@ namespace CBRO::Core::HiZ
 			}
 
 			logger::info(
-				"hi-z: depth {}x{} -> hi-z {}x{} (factor {}; nearest and farthest per texel, and level 0's farthest drawn), {} levels and the {}x{} block map built on the GPU, read from a private copy; readback {} KB x {} slots",
-				srcWidth, srcHeight, g_gpu.dstWidth, g_gpu.dstHeight, factor, g_gpu.layout.levels, g_blocksW, g_blocksH, g_gpu.output.bytes / 1024, kSlots);
+				"hi-z: depth {}x{} (drawn in the top-left of a {}x{} texture) -> hi-z {}x{} (factor {}; nearest and farthest per texel, and level 0's farthest drawn), {} levels and the {}x{} block map built on the GPU, read from a private copy; readback {} KB x {} slots",
+				srcWidth, srcHeight, a_depthDesc.Width, a_depthDesc.Height, g_gpu.dstWidth, g_gpu.dstHeight, factor, g_gpu.layout.levels, g_blocksW, g_blocksH, g_gpu.output.bytes / 1024, kSlots);
 			return true;
 		}
 
@@ -643,7 +648,19 @@ namespace CBRO::Core::HiZ
 		if (depthSRV && depthTex) {
 			D3D11_TEXTURE2D_DESC desc{};
 			depthTex->GetDesc(&desc);
-			if (EnsureTargets(device, context, desc, depthSRV)) {
+			// The engine's dynamic resolution (Upscaling without ENB) draws a smaller frame into the top-left of the
+			// full-size depth; the rest stays cleared. The world camera's viewport, still bound here, is that region.
+			// (With ENB, Upscaling swaps in a render-size texture instead, and the viewport covers all of it.)
+			auto           srcWidth = desc.Width;
+			auto           srcHeight = desc.Height;
+			UINT           viewportCount = 1;
+			D3D11_VIEWPORT viewport{};
+			context->RSGetViewports(&viewportCount, &viewport);
+			if (viewportCount > 0 && viewport.TopLeftX == 0.0f && viewport.TopLeftY == 0.0f && viewport.Width >= 1.0f && viewport.Height >= 1.0f) {
+				srcWidth = std::min(srcWidth, static_cast<UINT>(viewport.Width + 0.5f));
+				srcHeight = std::min(srcHeight, static_cast<UINT>(viewport.Height + 0.5f));
+			}
+			if (EnsureTargets(device, context, desc, depthSRV, srcWidth, srcHeight)) {
 				Slot* slot = nullptr;
 				for (auto& candidate : g_gpu.slots) {
 					if (candidate.state == Slot::State::kFree) {
