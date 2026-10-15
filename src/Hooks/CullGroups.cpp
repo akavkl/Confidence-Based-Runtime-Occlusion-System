@@ -706,6 +706,47 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<std::uint64_t> g_roomlessFiled{ 0 };
 		std::atomic<std::uint64_t> g_roomsSeen{ 0 };
 		std::atomic<std::uint64_t> g_roomsTotal{ 0 };
+		std::atomic<std::uint64_t> g_roomObjectsLeftOut{ 0 };
+		std::atomic<std::uint64_t> g_outsideLeftOut{ 0 };
+
+		// An object CBRO files itself (a room's, a portal's shared geometry, what lies outside every room) is offered to the
+		// same early filter as the walk's own adds (v1.88): one nothing needs (out of view or confirmed hidden; in group 0,
+		// its sun shadow unneeded too) is never filed, so neither the engine nor Block::Add processes it. As in GroupAdd,
+		// only with no group marker pending. (Up to v1.87 all ~4,400 room objects were filed every walk: most out of view.)
+		bool LeaveOut(void* a_group, RE::NiAVObject* a_object, GroupKind a_kind) noexcept
+		{
+			const auto filter = g_groupFilter.load(std::memory_order_relaxed);
+			if (!filter || !a_object || !g_mainCullActive.load(std::memory_order_relaxed)) {
+				return false;
+			}
+			const auto block = ReadAt<const std::uint8_t*>(a_group, a_object->IsGeometry() ? kGroupGeometryBlockOffset : kGroupNodeBlockOffset);
+			if (!block || block[kBlockMarkerBegin] || block[kBlockMarkerEnd] || block[kBlockMarkerExtra]) {
+				return false;
+			}
+			g_groupAddsConsidered.fetch_add(1, std::memory_order_relaxed);
+			return filter(a_object, &a_object->worldBound, a_kind);
+		}
+
+		// The main view's own frustum (v1.87, bIgnoreOccluders). Each frame Main::OnIdle (1013897 +0x9F calls 1281872, which
+		// calls 759713) rebuilds the main culler's portal entry. Its BSCompoundFrustum at +0x68, the owner DrawWorld gives
+		// groups 0 and 1 (so every block filed there), starts as the camera's planes (SetCamera: no ops) and gains ops for
+		// the portal graph's occluders (camera outside every room), or for the portals onto the outside and their occluders
+		// (camera in a room). A block whose owner has ops is culled by ProcessCompoundFrustum. Previs frames never meet
+		// them (their main-view entries are force-visible); in CBRO frames they culled whole rooms in plain view (Fallout
+		// London). DrawWorld's cull begins after OnIdle, so the frustum is set back to the camera's planes there.
+		constexpr std::uint64_t    kCompoundSetCameraID = 645668;     // BSCompoundFrustum::SetCamera(frustum, camera)
+		constexpr std::size_t      kEntryFrustumOffset = 0x68;        // BSPortalGraphEntry: the camera's BSCompoundFrustum
+		constexpr std::size_t      kFrustumCameraOffset = 0xB0;       // BSCompoundFrustum: its camera
+		constexpr std::size_t      kFrustumOpCountOffset = 0xC4;      // ... its op count (0: the camera's planes alone)
+		constexpr std::size_t      kSceneGraphOffset = 0x238;         // scene root (ShadowSceneNode): its BSPortalGraph
+		constexpr std::size_t      kGraphOccluderCountOffset = 0x20;  // graph: its occluders outside every room
+		std::uintptr_t             g_compoundSetCamera{ 0 };
+		std::uintptr_t             g_viewCuller{ 0 };  // the main culler's global
+		bool                       g_ignoreOccluders{ false };
+		std::atomic<std::uint64_t> g_viewFrames{ 0 };
+		std::atomic<std::uint64_t> g_viewCleared{ 0 };
+		std::atomic<std::uint64_t> g_viewOps{ 0 };
+		std::atomic<std::uint64_t> g_viewGraphOccluders{ 0 };
 
 		// The walk is adding a_object: true when its parent is a room filed whole into group 1 in this walk.
 		bool InFiledRoom(const RE::NiAVObject* a_object) noexcept
@@ -732,7 +773,7 @@ namespace CBRO::Hooks::CullGroups
 			const auto listed = state ? ReadAt<void* const*>(reinterpret_cast<const void*>(state), kStateRoomListOffset) : nullptr;
 			const auto listedCount = listed ? ReadAt<std::uint32_t>(reinterpret_cast<const void*>(state), kStateRoomCountOffset) : 0u;
 			const auto isListed = [&](const void* a_room) { return std::find(listed, listed + listedCount, a_room) != listed + listedCount; };
-			std::uint64_t rooms = 0, filed = 0, objects = 0;
+			std::uint64_t rooms = 0, filed = 0, objects = 0, leftOut = 0;
 			const auto node = a_cell->children.size() > 7 && a_cell->children[7] ? a_cell->children[7]->IsNode() : nullptr;
 			if (node && !(node->GetFlags() & 1)) {
 				for (auto& entry : node->children) {
@@ -752,7 +793,11 @@ namespace CBRO::Hooks::CullGroups
 					++filed;
 					for (auto& inner : roomNode->children) {
 						if (const auto item = inner.get(); item && !(item->GetFlags() & 1)) {
-							AddDirect(reinterpret_cast<void*>(g_group1), item, &item->worldBound, 0);
+							if (LeaveOut(reinterpret_cast<void*>(g_group1), item, GroupKind::kMainOnly)) {
+								++leftOut;
+							} else {
+								AddDirect(reinterpret_cast<void*>(g_group1), item, &item->worldBound, 0);
+							}
 							++objects;
 						}
 					}
@@ -774,7 +819,11 @@ namespace CBRO::Hooks::CullGroups
 					++sharedNodes;
 					for (auto& inner : sharedNode->children) {
 						if (const auto item = inner.get(); item && !(item->GetFlags() & 1)) {
-							AddDirect(reinterpret_cast<void*>(g_group1), item, &item->worldBound, 0);
+							if (LeaveOut(reinterpret_cast<void*>(g_group1), item, GroupKind::kMainOnly)) {
+								++leftOut;
+							} else {
+								AddDirect(reinterpret_cast<void*>(g_group1), item, &item->worldBound, 0);
+							}
 							++sharedObjects;
 						}
 					}
@@ -783,6 +832,7 @@ namespace CBRO::Hooks::CullGroups
 			std::sort(g_filedRooms.begin(), g_filedRooms.begin() + static_cast<std::ptrdiff_t>(g_filedRoomCount));
 			g_sharedNodesFiled.fetch_add(sharedNodes, std::memory_order_relaxed);
 			g_sharedObjectsFiled.fetch_add(sharedObjects, std::memory_order_relaxed);
+			g_roomObjectsLeftOut.fetch_add(leftOut, std::memory_order_relaxed);
 			g_roomsSeen.fetch_add(listedCount, std::memory_order_relaxed);
 			g_roomsTotal.fetch_add(rooms, std::memory_order_relaxed);
 			g_hiddenRoomsFiled.fetch_add(filed, std::memory_order_relaxed);
@@ -817,7 +867,14 @@ namespace CBRO::Hooks::CullGroups
 					const auto object = cell->children.size() > a_index ? cell->children[a_index].get() : nullptr;
 					return object ? object->IsNode() : nullptr;
 				};
-				const auto file = [&](RE::NiAVObject* a_object) { AddDirect(group, a_object, &a_object->worldBound, 0); };
+				std::uint64_t leftOut = 0;
+				const auto    file = [&](RE::NiAVObject* a_object) {
+					if (LeaveOut(group, a_object, GroupKind::kSunShared)) {
+						++leftOut;
+					} else {
+						AddDirect(group, a_object, &a_object->worldBound, 0);
+					}
+				};
 				std::uint64_t unbound = 0, art = 0, roomless = 0;
 				if (const auto node = child(3); node && !(node->GetFlags() & 1)) {
 					for (auto& entry : node->children) {
@@ -862,6 +919,7 @@ namespace CBRO::Hooks::CullGroups
 				g_unboundFiled.fetch_add(unbound, std::memory_order_relaxed);
 				g_artFiled.fetch_add(art, std::memory_order_relaxed);
 				g_roomlessFiled.fetch_add(roomless, std::memory_order_relaxed);
+				g_outsideLeftOut.fetch_add(leftOut, std::memory_order_relaxed);
 			}
 			// The camera's rooms are the portal path's (+0xC28), unless room bounds are off: then every room.
 			if (g_hiddenRooms) {
@@ -1353,6 +1411,12 @@ namespace CBRO::Hooks::CullGroups
 		if (!Settings::Get().interiorOutsideRooms) {
 			logger::info("cullgroups: an interior's objects outside its room bounds left to the engine ([Occlusion] bInteriorOutsideRooms=0): undrawn in CBRO frames while the camera is in a room");
 		}
+		g_compoundSetCamera = CBRO::Engine::OG(kCompoundSetCameraID).address();
+		g_viewCuller = CBRO::Engine::OG(kMainCullerID).address();
+		g_ignoreOccluders = Settings::Get().ignoreOccluders;
+		logger::info("cullgroups: the main view's frustum in CBRO frames: {}", g_ignoreOccluders ?
+			"the camera's alone (the cells' occlusion planes and boxes and the portals onto the outside taken off at the cull begin; CBRO judges)" :
+			"the engine's ([Occlusion] bIgnoreOccluders=0: authored occluders and the portals onto the outside clip it)");
 		logger::info("cullgroups: interior room bounds in CBRO frames: {}", g_disableRoomBounds ?
 			"off (every room filed whole with the camera's frustum, none through portals; CBRO judges its objects)" :
 			Settings::Get().disableRoomBounds ? "on (the walk's room adds couldn't be verified)" : "on ([Occlusion] bDisableRoomBounds=0: the engine's room and portal culling)");
@@ -1460,7 +1524,7 @@ namespace CBRO::Hooks::CullGroups
 		return { g_restrictedFrames.exchange(0), g_unboundFiled.exchange(0), g_artFiled.exchange(0), g_artCulled.exchange(0),
 			g_roomlessFiled.exchange(0), g_roomsSeen.exchange(0), g_roomsTotal.exchange(0), g_hiddenRoomsFiled.exchange(0),
 			g_hiddenRoomObjects.exchange(0), g_portalAddsSkipped.exchange(0), g_roomFrames.exchange(0), g_openRoomFrames.exchange(0),
-			g_sharedNodesFiled.exchange(0), g_sharedObjectsFiled.exchange(0) };
+			g_sharedNodesFiled.exchange(0), g_sharedObjectsFiled.exchange(0), g_roomObjectsLeftOut.exchange(0), g_outsideLeftOut.exchange(0) };
 	}
 
 	void SetRoomWalk(bool a_open) noexcept
@@ -1472,6 +1536,38 @@ namespace CBRO::Hooks::CullGroups
 	bool RoomBoundsOff() noexcept
 	{
 		return g_disableRoomBounds;
+	}
+
+	void PlainViewFrustum() noexcept
+	{
+		if (!g_ignoreOccluders || !g_compoundSetCamera || !g_viewCuller || !g_shadowSceneNode) {
+			return;
+		}
+		__try {
+			const auto culler = *reinterpret_cast<const std::uintptr_t*>(g_viewCuller);
+			const auto entry = culler ? *reinterpret_cast<const std::uintptr_t*>(culler + kCullerStateOffset) : 0;
+			if (!entry) {
+				return;
+			}
+			const auto frustum = entry + kEntryFrustumOffset;
+			const auto ops = *reinterpret_cast<const std::int32_t*>(frustum + kFrustumOpCountOffset);
+			const auto root = *reinterpret_cast<const std::uintptr_t*>(g_shadowSceneNode);
+			const auto graph = root ? *reinterpret_cast<const std::uintptr_t*>(root + kSceneGraphOffset) : 0;
+			g_viewFrames.fetch_add(1, std::memory_order_relaxed);
+			g_viewGraphOccluders.fetch_add(graph ? *reinterpret_cast<const std::uint32_t*>(graph + kGraphOccluderCountOffset) : 0, std::memory_order_relaxed);
+			if (ops > 0) {
+				using SetCameraFn = void (*)(std::uintptr_t, std::uintptr_t);
+				reinterpret_cast<SetCameraFn>(g_compoundSetCamera)(frustum, *reinterpret_cast<const std::uintptr_t*>(frustum + kFrustumCameraOffset));
+				g_viewCleared.fetch_add(1, std::memory_order_relaxed);
+				g_viewOps.fetch_add(static_cast<std::uint64_t>(ops), std::memory_order_relaxed);
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+		}
+	}
+
+	ViewFrustumCounts TakeViewFrustumCounts() noexcept
+	{
+		return { g_viewFrames.exchange(0), g_viewCleared.exchange(0), g_viewOps.exchange(0), g_viewGraphOccluders.exchange(0) };
 	}
 
 	bool IsSky(const RE::NiAVObject* a_object) noexcept

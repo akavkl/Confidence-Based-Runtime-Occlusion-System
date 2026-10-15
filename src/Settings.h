@@ -39,6 +39,9 @@ namespace CBRO
 		bool          cellArtNode9{ true };        // CBRO frames: a cell's node 9 (precombined art) the engine has AppCulled is filed anyway, as previs draws it by id
 		bool          interiorOutsideRooms{ true };  // CBRO frames, camera in an interior room bound: what lies outside every room bound is filed anyway (previs ignores rooms)
 		bool          disableRoomBounds{ true };     // CBRO frames, interiors: every room is filed whole with the camera's own frustum, never through portals, and so is every portal's shared geometry (v1.85-v1.86)
+		bool          ignoreOccluders{ true };       // CBRO frames: the main view's frustum is the camera's alone, without the cells' occlusion planes/boxes or the portals onto the outside (v1.87)
+		bool          parallaxMargin{ true };        // while the camera moves: an object's screen box widens by a near occluder's parallax since the depth frame (v1.88)
+		bool          keepFadeState{ true };         // fade nodes left out of the main view keep their fade, so a revealed object doesn't fade in again from 0 (v1.88.2)
 		bool          firstPersonAfterWorld{ true };  // CBRO frames: the pre-pass draws first person after the world, whose depth CBRO captures in between
 		bool          previsFeed{ true };          // previs is never switched off: suspended (flush-free) while CBRO is on (Core/Feed)
 		bool          skipPrevisQuery{ true };     // CBRO frames: previs's per-frame query is neither launched nor collected (Hooks/PrevisFeed)

@@ -68,6 +68,10 @@ namespace CBRO::Core::ShadowLights
 	// many it cleared. Main thread. a_countFrame: this call counts as the frame's (the stats are per frame; the cull
 	// begin's call counts, the deferred-lights stage's does not).
 	std::uint32_t UnoccludeLights(bool a_countFrame) noexcept;
+	// Diagnostic (bLampDiagnostic, v1.88): at the deferred-lights stage of a CBRO frame, each light of the main list is
+	// tested as a light's reach (Occlusion::TestSphere), and nothing is changed: how many lamps whose light pass draws
+	// nothing visible CBRO frames still shade (previs marks those occluded). Main thread.
+	void SurveyMainLights() noexcept;
 
 	// Diagnostic (bLampDiagnostic): what the engine's shadow-light loop (DeferredLightsImpl, FO4-ENGINE-NOTES 6.4/6.8)
 	// decides for each shadow light of a CBRO frame. Begin runs right before the loop (the deferred-lights stage begin):

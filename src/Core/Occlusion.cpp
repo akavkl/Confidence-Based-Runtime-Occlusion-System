@@ -34,6 +34,7 @@ namespace CBRO::Core::Occlusion
 			bool          emptiedSpotTrim{ true };  // sun up: spot lamps whose shadow map stays empty keep no group-0 entry (v1.81)
 			bool          spotOnlyCascadeTrim{ true };  // sun up: entries kept for spot lamps alone stay out of the sun's cascades (v1.82)
 			bool          scolRootBounds{ true };  // static collection pieces judged and filed with the collection's bound (v1.83)
+			bool          keepFadeState{ true };   // fade nodes left out of the main view keep their fade, as previs's would (v1.88.2)
 			float         viewOverhang{ 0.03f };  // objects and sun shadows: how far (NDC) the view may overhang the depth frame and still be judged by its edge
 			float         viewOverhangTurn{ 0.0f };  // ... up to this much where a turned view reaches that far past it (FrameContext::overhang)
 		};
@@ -156,6 +157,7 @@ namespace CBRO::Core::Occlusion
 			kCacheEpoch,          // ... re-evaluated: the camera left the epoch
 			kCacheBound,          // ... re-evaluated: the object's bound changed
 			kCacheDepth,          // ... re-evaluated: a Hi-Z block it read changed
+			kCacheMoved,          // ... re-evaluated: a hidden outcome judged from a camera position this one has moved from (v1.88.1)
 			kCacheNoCache,        // ... re-evaluated: the record was marked never-reuse (a light's reach, table full)
 			kCacheRecheck,        // hidden verdicts reused after their evidence was re-checked against the current depth (their blocks had changed)
 			kCacheKeptRecheck,    // kept (drawn) verdicts re-evaluated on their periodic turn (never because the depth changed)
@@ -163,6 +165,8 @@ namespace CBRO::Core::Occlusion
 			kStreakFromBackup,    // hidden verdicts without last frame's record whose streak the table's backup continued
 			kOverhangHidden,      // objects hidden with part of them in a thin overhang of the view, judged by the depth frame's edge (fViewOverhang)
 			kSunOverhang,         // sun shadows found behind surfaces the same way
+			kParallaxWidened,     // tests whose screen box widened for a near occluder's parallax since the depth frame (v1.88)
+			kFadeKeptSeen,        // fade nodes left out (hidden or out of view) whose frame counter was kept current (v1.88.2)
 			kSunPiecewise,        // sun shadows found behind surfaces stretch by stretch where the whole sweep's box said needed (v1.79)
 			kSunFarTests,         // needed sun shadows tested again for the last cascade alone (v1.80)
 			kSunFarUnneeded,      // ... that find nothing visible in its slab
@@ -728,6 +732,37 @@ namespace CBRO::Core::Occlusion
 			bool          emptyReach{ false };  // out: hidden though not behind the depth: no visible surface lies inside it
 		};
 
+		// Parallax (v1.88, bParallaxMargin). The depth was rendered from a camera parallaxMove units from this one. Against an
+		// occluder at view depth d, an object at depth z then shifts on screen by up to parallaxMove * (1/d - 1/z) (tangent
+		// units); the bound's growth by the move (dilateMove) covers only the 1/z part. So where the nearest surface over
+		// the object's screen box lies nearer than the object, the box widens by that much: an object a near occluder's
+		// edge has just uncovered (strafing past a pillar) is no longer judged by the old depth behind that edge, which
+		// drew it a frame late. The object's own depth is unchanged. a_x0..a_y1: the box in NDC, before clipping.
+		constexpr float kParallaxMinDepth = 16.0f;  // nearer surfaces count as this far (the near plane, first person)
+
+		float ParallaxTan(const FrameContext& a_context, float a_x0, float a_x1, float a_y0, float a_y1, float a_z) noexcept
+		{
+			if (!(a_context.parallaxMove > 0.0f) || !(a_z > kParallaxMinDepth)) {
+				return 0.0f;
+			}
+			const auto& snapshot = *a_context.snapshot;
+			const float width = static_cast<float>(snapshot.width[0]);
+			const float height = static_cast<float>(snapshot.height[0]);
+			const float buffer = snapshot.MinDepth((a_x0 * 0.5f + 0.5f) * width, (0.5f - a_y1 * 0.5f) * height, (a_x1 * 0.5f + 0.5f) * width, (0.5f - a_y0 * 0.5f) * height);
+			if (!(buffer >= 0.0f)) {
+				return 0.0f;  // (no nearest pyramid)
+			}
+			float nearest = LinearDepth(snapshot.camera, buffer);
+			if (!(nearest >= kParallaxMinDepth)) {
+				nearest = kParallaxMinDepth;
+			}
+			if (!(nearest < a_z)) {
+				return 0.0f;
+			}
+			Bump(kParallaxWidened);
+			return a_context.parallaxMove * (1.0f / nearest - 1.0f / a_z);
+		}
+
 		Verdict TestViewSpace(const FrameContext& a_context, const RE::NiBound& a_bound, float a_radius, DepthRect* a_rect = nullptr, LightTest* a_light = nullptr, VisibleEvidence* a_evidence = nullptr) noexcept
 		{
 			const auto& snapshot = *a_context.snapshot;
@@ -763,6 +798,12 @@ namespace CBRO::Core::Occlusion
 			x1 *= camera.scaleX;
 			y0 *= camera.scaleY;
 			y1 *= camera.scaleY;
+			// (v1.88: a near occluder's parallax since the depth frame widens the box, and the rays below)
+			const float parallax = ParallaxTan(a_context, x0, x1, y0, y1, z);
+			x0 -= parallax * camera.scaleX;
+			x1 += parallax * camera.scaleX;
+			y0 -= parallax * camera.scaleY;
+			y1 += parallax * camera.scaleY;
 			bool overhung = false;
 			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1, a_light ? a_light->overhang : g_tunables.viewOverhang, &overhung, a_light ? nullptr : a_context.overhang);
 				clip != Verdict::kHidden) {
@@ -796,7 +837,7 @@ namespace CBRO::Core::Occlusion
 			rays.centerX = (camera.scaleX * x / z * 0.5f + 0.5f) * width;
 			rays.centerY = (0.5f - camera.scaleY * y / z * 0.5f) * height;
 			rays.depth = z;
-			rays.radius = a_radius;
+			rays.radius = a_radius + parallax * z;
 			rays.texelsPerTanX = camera.scaleX * width * 0.5f;
 			rays.texelsPerTanY = camera.scaleY * height * 0.5f;
 			rays.axisX = width * 0.5f;
@@ -1013,6 +1054,12 @@ namespace CBRO::Core::Occlusion
 				if (a_extent) {
 					*a_extent = std::max(x1 - x0, y1 - y0);
 				}
+				// (v1.88: a near occluder's parallax since the depth frame, at the stretch's farthest depth)
+				const float parallax = ParallaxTan(a_context, x0, x1, y0, y1, std::max(q0[2] + ra, q1[2] + rb));
+				x0 -= parallax * camera.scaleX;
+				x1 += parallax * camera.scaleX;
+				y0 -= parallax * camera.scaleY;
+				y1 += parallax * camera.scaleY;
 				bool overhung = false;
 				switch (ClipToView(a_context, x0, x1, y0, y1, g_tunables.viewOverhang, &overhung, a_context.overhang)) {
 				case Verdict::kOutside:
@@ -1224,6 +1271,12 @@ namespace CBRO::Core::Occlusion
 					y1 = std::max(y1, y);
 				}
 			}
+			// (v1.88: a near occluder's parallax since the depth frame, at the box's farthest depth: the widest shift)
+			const float parallax = ParallaxTan(a_context, x0, x1, y0, y1, zFar);
+			x0 -= parallax * camera.scaleX;
+			x1 += parallax * camera.scaleX;
+			y0 -= parallax * camera.scaleY;
+			y1 += parallax * camera.scaleY;
 			if (const auto clip = ClipToView(a_context, x0, x1, y0, y1, g_tunables.viewOverhang, nullptr, a_context.overhang); clip != Verdict::kHidden) {
 				return clip;
 			}
@@ -3303,6 +3356,29 @@ namespace CBRO::Core::Occlusion
 		//     verified against; otherwise the evidence rectangle is re-checked against the current depth at its own
 		//     threshold (one coarse query; a pass is as good as a re-evaluation, and cheaper than one by the full test's
 		//     refinement, rays and, for mesh shapes, every cell).
+		// The camera's position on the frame each depth readback was judged by (main thread at BeginFrame, by readback
+		// index; read by any thread). A hidden outcome rests on the screen box it was tested with, widened for the parallax
+		// of that frame's move (ParallaxTan); judged from more than kReuseMove away, its box doesn't cover this frame's
+		// shift of a near occluder's edge, so while the camera moves it is judged again (v1.88.1: within one cache epoch,
+		// up to fCacheMove of travel, a reused hidden verdict kept an object a pillar's edge had uncovered undrawn).
+		constexpr float kReuseMove = 0.5f;
+		struct JudgedEye
+		{
+			std::uint32_t readback{ 0 };
+			float         eye[3]{};
+		};
+		std::array<JudgedEye, 64> g_judgedEyes{};
+
+		bool MovedSince(const FrameContext& a_context, std::uint32_t a_readback) noexcept
+		{
+			const auto& at = g_judgedEyes[a_readback & 63];
+			if (at.readback != a_readback) {
+				return true;  // (too old to tell)
+			}
+			const float dx = a_context.eye[0] - at.eye[0], dy = a_context.eye[1] - at.eye[1], dz = a_context.eye[2] - at.eye[2];
+			return dx * dx + dy * dy + dz * dz > kReuseMove * kReuseMove;
+		}
+
 		Reuse ViewValid(const FrameContext& a_context, const Record& a_old, const RE::NiBound& a_bound) noexcept
 		{
 			if (a_old.flags & kRecordNoCache) {
@@ -3329,6 +3405,10 @@ namespace CBRO::Core::Occlusion
 			case Outcome::kHidden:
 				if (!(a_old.flags & kRecordDepth)) {
 					Bump(kCacheDepth);  // no evidence recorded: can't tell
+					return Reuse::kNo;
+				}
+				if (a_context.parallaxMove > 0.0f && a_old.readback != a_context.readback && MovedSince(a_context, a_old.readback)) {
+					Bump(kCacheMoved);
 					return Reuse::kNo;
 				}
 				if (a_old.readback == a_context.readback || !BlocksChanged(a_context, a_old.blocks, a_old.readback)) {
@@ -3565,10 +3645,40 @@ namespace CBRO::Core::Occlusion
 			JudgeRecord(a_context, a_add, record, a_wantSun, a_out);
 		}
 
+		// A fade node the main view leaves out keeps its fade (v1.88.2, bKeepFadeState). BSFadeNode's fade update (id 928617,
+		// from OnVisible) restarts the fade from 0 for a node unseen for over 20 frames (frameCounter +0x1B0 against the frame
+		// number, id 734919), radius under 600, whose distance fade is at or below fFadeInThreshold: an object behind a
+		// pillar for a third of a second faded in again from nothing when the pillar uncovered it ("popping up"). Previs
+		// never let that happen: its entries get OnVisible every frame, even behind the camera. So the counter is kept
+		// current, as OnVisible would; the fade value itself is left as it was. Main thread (the walk).
+		constexpr std::uint64_t kFrameNumberID = 734919;
+		constexpr std::size_t   kFadeFrameCounterOffset = 0x1B0;
+
+		const std::int32_t* FrameNumber() noexcept
+		{
+			static const auto frame = reinterpret_cast<const std::int32_t*>(CBRO::Engine::OG(kFrameNumberID).address());
+			return frame;
+		}
+
+		void KeepFadeSeen(RE::NiAVObject* a_object) noexcept
+		{
+			const auto frame = FrameNumber();
+			__try {
+				if (a_object->IsFadeNode()) {
+					*reinterpret_cast<std::int32_t*>(reinterpret_cast<std::uintptr_t>(a_object) + kFadeFrameCounterOffset) = *frame;
+					Bump(kFadeKeptSeen);
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+		}
+
 		// The walk's outcome for the entry, counted as decided (the turn table's own share of what the main view keeps).
 		void JudgeOrLookup(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
 		{
 			JudgeOrLookupRecord(a_context, a_stream, a_add, a_wantSun, a_out);
+			if (g_tunables.keepFadeState && a_add.object && (a_out.outcome == Outcome::kHidden || a_out.outcome == Outcome::kOutside)) {
+				KeepFadeSeen(const_cast<RE::NiAVObject*>(a_add.object));
+			}
 			if (a_out.outcome == Outcome::kKept && a_out.verdict == static_cast<std::uint8_t>(Verdict::kEdge)) {
 				Bump(kFinalEdge);
 			} else if (a_out.outcome == Outcome::kHidden && a_out.streak < g_tunables.confirmFrames) {
@@ -4381,6 +4491,7 @@ namespace CBRO::Core::Occlusion
 		g_tunables.emptiedSpotTrim = settings.emptiedSpotTrim && settings.spotShadowCulling;
 		g_tunables.spotOnlyCascadeTrim = settings.spotOnlyCascadeTrim;
 		g_tunables.scolRootBounds = settings.scolRootBounds;
+		g_tunables.keepFadeState = settings.keepFadeState;
 		g_tunables.viewOverhang = settings.viewOverhang;
 		g_tunables.viewOverhangTurn = settings.viewOverhangTurn;
 		g_mergedVtable = RE::VTABLE::BSMergeInstancedTriShape[0].address();
@@ -4484,6 +4595,11 @@ namespace CBRO::Core::Occlusion
 		}
 		MeshProxy::BeginFrame();
 
+		if (a_context.parallaxMove > 0.0f || a_context.readback) {
+			auto& at = g_judgedEyes[a_context.readback & 63];
+			at.readback = a_context.readback;
+			std::copy_n(a_context.eye, 3, at.eye);
+		}
 		const auto next = (g_context.load() + 1 + 2) % 2;
 		g_contexts[next] = a_context;
 		SetOverhangs(g_contexts[next]);
@@ -5253,12 +5369,12 @@ namespace CBRO::Core::Occlusion
 		g_lastLightsRejected.store(static_cast<float>(per(kLightsRejected)));
 
 		logger::info(
-			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f} | judged by the depth frame's edge through a view overhang of up to {:.3f}: hidden objects {:.0f}, sun shadows behind surfaces {:.0f} (evaluations, not reuses)",
+			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f} | judged by the depth frame's edge through a view overhang of up to {:.3f}: hidden objects {:.0f}, sun shadows behind surfaces {:.0f} (evaluations, not reuses) | screen boxes widened for a near occluder's parallax {:.0f} | fade nodes left out kept seen (no fade restart) {:.0f}",
 			per(kTested), per(kRejected),
 			observing ? std::format(" (decide-only: would reject {:.0f})", per(kWouldReject)) : std::string{},
 			per(kConfirming), per(kVisible), per(kEdge), per(kNear), per(kOutside), per(kBehind),
 			per(kExemptType), per(kExemptLight), per(kExemptActor),
-			per(kInvalid), per(kNoContext), per(kTableFull), g_tunables.viewOverhang, per(kOverhangHidden), per(kSunOverhang));
+			per(kInvalid), per(kNoContext), per(kTableFull), g_tunables.viewOverhang, per(kOverhangHidden), per(kSunOverhang), per(kParallaxWidened), per(kFadeKeptSeen));
 		const auto sky = Hooks::CullGroups::TakeSkyCounts();
 		logger::info(
 			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f} || sky meshes given previs's force-visible mark {:.2f}, CBRO drops of them ignored {:.2f}",
@@ -5272,17 +5388,23 @@ namespace CBRO::Core::Occlusion
 			const auto perFrame = [](std::uint64_t a_count, std::uint64_t a_frames) { return a_frames ? static_cast<double>(a_count) / static_cast<double>(a_frames) : 0.0; };
 			if (rooms.frames) {
 				logger::info(
-					"interior outside its rooms ({} frames with the camera in a room bound; the engine files only the rooms its portals show): filed into group 0 per such frame: unbound node {:.1f}, precombined art {:.1f} (node 9 AppCulled on {} frames), roomless multibounds {:.1f}",
-					rooms.frames, perFrame(rooms.unbound, rooms.frames), perFrame(rooms.art, rooms.frames), rooms.artCulled, perFrame(rooms.roomless, rooms.frames));
+					"interior outside its rooms ({} frames with the camera in a room bound; the engine files only the rooms its portals show): filed into group 0 per such frame: unbound node {:.1f}, precombined art {:.1f} (node 9 AppCulled on {} frames), roomless multibounds {:.1f} (left out early, nothing needs them: {:.1f})",
+					rooms.frames, perFrame(rooms.unbound, rooms.frames), perFrame(rooms.art, rooms.frames), rooms.artCulled, perFrame(rooms.roomless, rooms.frames), perFrame(rooms.outsideLeftOut, rooms.frames));
 			}
 			if (rooms.roomFrames) {
 				logger::info(
-					"interior rooms ({}; {} walks, {} with the camera outside every room) per walk: the camera's list {:.1f} of {:.1f} rooms | filed whole into group 1: rooms {:.1f}, objects {:.1f}; portal shared geometry nodes {:.1f}, objects {:.1f} | the walk's room and portal adds left out (their room filed whole) {:.1f}",
+					"interior rooms ({}; {} walks, {} with the camera outside every room) per walk: the camera's list {:.1f} of {:.1f} rooms | filed whole into group 1: rooms {:.1f}, objects {:.1f}; portal shared geometry nodes {:.1f}, objects {:.1f} (of these objects left out early, out of view or confirmed hidden: {:.1f}) | the walk's room and portal adds left out (their room filed whole) {:.1f}",
 					Hooks::CullGroups::RoomBoundsOff() ? "room bounds off: every room and portal's shared geometry, none through portals" : "rooms the portals don't show", rooms.roomFrames, rooms.openRoomFrames,
 					perFrame(rooms.roomsSeen, rooms.roomFrames), perFrame(rooms.roomsTotal, rooms.roomFrames), perFrame(rooms.hiddenRooms, rooms.roomFrames),
-					perFrame(rooms.hiddenRoomObjects, rooms.roomFrames), perFrame(rooms.sharedNodes, rooms.roomFrames), perFrame(rooms.sharedObjects, rooms.roomFrames),
+					perFrame(rooms.hiddenRoomObjects, rooms.roomFrames), perFrame(rooms.sharedNodes, rooms.roomFrames), perFrame(rooms.sharedObjects, rooms.roomFrames), perFrame(rooms.objectsLeftOut, rooms.roomFrames),
 					perFrame(rooms.portalAddsSkipped, rooms.roomFrames));
 			}
+		}
+		if (const auto view = Hooks::CullGroups::TakeViewFrustumCounts(); view.frames) {
+			logger::info(
+				"main view frustum (CBRO frames, bIgnoreOccluders): {} frames | the engine's occluders or portals on it, taken off: {} frames ({:.1f} ops each) | the portal graph's occluders outside every room {:.1f}",
+				view.frames, view.cleared, view.cleared ? static_cast<double>(view.ops) / static_cast<double>(view.cleared) : 0.0,
+				static_cast<double>(view.graphOccluders) / static_cast<double>(view.frames));
 		}
 		logger::info(
 			"occlusion lights per frame: tested {:.0f} | rejected {:.0f} (point/spot lights whose whole reach is hidden)",
@@ -5306,8 +5428,8 @@ namespace CBRO::Core::Occlusion
 			"occlusion lamp shadow volumes per frame (casters of point lights): outside the view {:.0f} | misses every visible surface {:.0f} | confirming {:.0f} | needed {:.0f} | unknown {:.0f}",
 			per(kLampVolumeOutside), per(kLampVolumeMisses), per(kLampVolumeConfirming), per(kLampVolumeNeeded), per(kLampVolumeUnknown));
 		logger::info(
-			"verdict cache per frame: reused {:.0f} (hidden re-checked against the depth {:.0f}) | evaluated: new {:.0f}, camera epoch {:.0f}, bound changed {:.0f}, depth changed {:.0f}, kept on its turn {:.0f}, never-reuse {:.0f} | sun re-evaluated under a reused view {:.0f} | hidden streaks continued from the backup {:.1f} | async: judged in the walk {:.0f} (no record with this bound, or the map's margins passed; the worker judges them again, so they count twice above), the map's edge and confirming verdicts judged again in the walk {:.0f}, its shadows needed only for its no-depth strip {:.0f}",
-			per(kCacheHits), per(kCacheRecheck), per(kCacheNew), per(kCacheEpoch), per(kCacheBound), per(kCacheDepth), per(kCacheKeptRecheck), per(kCacheNoCache), per(kCacheSunDepth), per(kStreakFromBackup), per(kWalkJudged), per(kWalkUnsettled), per(kWalkSunEdge));
+			"verdict cache per frame: reused {:.0f} (hidden re-checked against the depth {:.0f}) | evaluated: new {:.0f}, camera epoch {:.0f}, bound changed {:.0f}, depth changed {:.0f}, hidden but judged from elsewhere (camera moving) {:.0f}, kept on its turn {:.0f}, never-reuse {:.0f} | sun re-evaluated under a reused view {:.0f} | hidden streaks continued from the backup {:.1f} | async: judged in the walk {:.0f} (no record with this bound, or the map's margins passed; the worker judges them again, so they count twice above), the map's edge and confirming verdicts judged again in the walk {:.0f}, its shadows needed only for its no-depth strip {:.0f}",
+			per(kCacheHits), per(kCacheRecheck), per(kCacheNew), per(kCacheEpoch), per(kCacheBound), per(kCacheDepth), per(kCacheMoved), per(kCacheKeptRecheck), per(kCacheNoCache), per(kCacheSunDepth), per(kStreakFromBackup), per(kWalkJudged), per(kWalkUnsettled), per(kWalkSunEdge));
 		logger::info(
 			"per-frame spread over culled frames (min/avg/max, sd, avg change between consecutive frames): main view kept {} | other views' registrations {} | rejected {} | confirming (verdict flips) {}",
 			g_spreadKept.Describe(), g_spreadOther.Describe(), g_spreadRejected.Describe(), g_spreadConfirming.Describe());

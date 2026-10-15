@@ -13,13 +13,14 @@ endif()
 set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "")
 
-project(CBRO VERSION 1.86.0 LANGUAGES CXX)
+project(CBRO VERSION 1.88.2 LANGUAGES CXX)
 
 if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
 	message(FATAL_ERROR "in-source builds are not allowed")
 endif()
 
-# MO2 mod folder the plugin (DLL, PDB, CBRO.ini, meta.ini) is copied into after every build; empty disables it.
+# MO2 mod folder the plugin (DLL, PDB) is copied into after every build, its meta.ini version and CBRO.ini settings
+# brought up to date (see below); empty disables it.
 set(CBRO_INSTALL_DIR "D:/MO2/Fallout 4/mods/Confidence-Based Runtime Occlusion" CACHE PATH "MO2 mod folder to install CBRO into")
 
 # ---- dependencies ----------------------------------------------------------------------------------------
@@ -75,14 +76,25 @@ endif()
 
 # ---- install into the MO2 mod folder ----------------------------------------------------------------------
 if(CBRO_INSTALL_DIR)
+	# res/CBRO.ini is never copied over the user's INI in the mod folder: only the settings it lacks are added, with
+	# their comments (tools/sync_mod_ini.py; needs Python 3). meta.ini is MO2's: only its version line is set.
+	set(CBRO_SYNC_INI "")
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(Python3_Interpreter_FOUND)
+		set(CBRO_SYNC_INI COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/sync_mod_ini.py"
+			"${CMAKE_CURRENT_SOURCE_DIR}/res/CBRO.ini" "${CBRO_INSTALL_DIR}/F4SE/Plugins/CBRO.ini")
+	else()
+		message(WARNING "Python 3 not found: settings new in res/CBRO.ini won't be added to the mod folder's CBRO.ini")
+	endif()
 	add_custom_command(
 		TARGET CBRO
 		POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${CBRO_INSTALL_DIR}/F4SE/Plugins"
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:CBRO>" "${CBRO_INSTALL_DIR}/F4SE/Plugins/"
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_PDB_FILE:CBRO>" "${CBRO_INSTALL_DIR}/F4SE/Plugins/"
-		# (res/CBRO.ini is NOT copied: the user's INI in the mod folder is theirs; new keys fall back to Settings.h's defaults)
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/res/meta.ini" "${CBRO_INSTALL_DIR}/"
+		COMMAND ${CMAKE_COMMAND} "-DMETA=${CBRO_INSTALL_DIR}/meta.ini" "-DTEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/res/meta.ini"
+			"-DVERSION=${PROJECT_VERSION}.0" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SyncModMeta.cmake"
+		${CBRO_SYNC_INI}
 		COMMENT "Installing CBRO into ${CBRO_INSTALL_DIR}"
 	)
 endif()

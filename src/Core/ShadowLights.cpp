@@ -833,6 +833,84 @@ namespace CBRO::Core::ShadowLights
 		}
 	}
 
+	namespace
+	{
+		std::atomic<std::uint64_t> g_surveyFrames{ 0 };
+		std::atomic<std::uint64_t> g_surveyLights{ 0 };    // main-list lights tested
+		std::atomic<std::uint64_t> g_surveyHidden{ 0 };    // ... reach behind visible surfaces
+		std::atomic<std::uint64_t> g_surveyEmpty{ 0 };     // ... no visible surface inside the reach
+		std::atomic<std::uint64_t> g_surveyOutside{ 0 };   // ... entirely outside the view
+		std::atomic<std::uint64_t> g_surveyVisible{ 0 };
+		std::atomic<std::uint64_t> g_surveyUnknown{ 0 };   // no usable depth, reaches the camera, the view's edge
+		std::atomic<std::uint64_t> g_surveySkipped{ 0 };   // culled NiLight, no NiLight, already occluded
+
+		std::uint32_t ReadMainLights(std::uintptr_t* a_out, std::uint32_t a_max) noexcept
+		{
+			__try {
+				const auto node = *reinterpret_cast<const std::uintptr_t*>(g_shadowSceneNode);
+				if (!node) {
+					return 0;
+				}
+				const auto count = *reinterpret_cast<const std::uint32_t*>(node + kLightsCount);
+				const auto array = *reinterpret_cast<const std::uintptr_t*>(node + kLightsArray);
+				if (!array || count > kMaxLights) {
+					return 0;
+				}
+				const auto n = std::min(count, a_max);
+				for (std::uint32_t i = 0; i < n; ++i) {
+					a_out[i] = reinterpret_cast<const std::uintptr_t*>(array)[i];
+				}
+				return n;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		bool LightCulled(std::uintptr_t a_light) noexcept
+		{
+			__try {
+				const auto niLight = *reinterpret_cast<const std::uintptr_t*>(a_light + kLightNiLightOffset);
+				return !niLight || (reinterpret_cast<const RE::NiAVObject*>(niLight)->GetFlags() & 1) || *reinterpret_cast<const std::uint8_t*>(a_light + kLightOccluded);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return true;
+			}
+		}
+	}
+
+	void SurveyMainLights() noexcept
+	{
+		if (!g_shadowSceneNode) {
+			return;
+		}
+		static std::uintptr_t lights[2048];
+		const auto            count = ReadMainLights(lights, static_cast<std::uint32_t>(std::size(lights)));
+		g_surveyFrames.fetch_add(1, std::memory_order_relaxed);
+		for (std::uint32_t i = 0; i < count; ++i) {
+			RE::NiPoint3 center{};
+			float        reach = 0.0f;
+			if (!lights[i] || LightCulled(lights[i]) || !ReadSpotLight(lights[i], center, reach) || !(reach > 0.0f)) {
+				g_surveySkipped.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			g_surveyLights.fetch_add(1, std::memory_order_relaxed);
+			Occlusion::SphereReason reason = Occlusion::SphereReason::kNone;
+			switch (Occlusion::TestSphere(center, reach, &reason)) {
+			case Occlusion::SphereVerdict::kHidden:
+				(reason == Occlusion::SphereReason::kEmptyReach ? g_surveyEmpty : g_surveyHidden).fetch_add(1, std::memory_order_relaxed);
+				break;
+			case Occlusion::SphereVerdict::kOutOfView:
+				g_surveyOutside.fetch_add(1, std::memory_order_relaxed);
+				break;
+			case Occlusion::SphereVerdict::kVisible:
+				g_surveyVisible.fetch_add(1, std::memory_order_relaxed);
+				break;
+			default:
+				g_surveyUnknown.fetch_add(1, std::memory_order_relaxed);
+				break;
+			}
+		}
+	}
+
 	std::uint32_t UnoccludeLights(bool a_countFrame) noexcept
 	{
 		if (!g_shadowSceneNode) {
@@ -1533,6 +1611,12 @@ namespace CBRO::Core::ShadowLights
 		logger::info(
 			"lights un-occluded (previs's bOccluded cleared at the cull begin and before the deferred-lights stage): {:.0f} CBRO frames | cleared per frame: shadow list {:.2f}, main list {:.2f} | main list holds {:.0f} lights",
 			unoccludeFrames, unoccludeFrames > 0 ? unoccluded / unoccludeFrames : 0.0, unoccludeFrames > 0 ? unoccludedMain / unoccludeFrames : 0.0, unoccludeCalls > 0 ? mainLights / unoccludeCalls : 0.0);
+		if (const auto surveyFrames = take(g_surveyFrames); surveyFrames > 0) {
+			logger::info(
+				"main-list lights in CBRO frames (diagnostic, decide-only: nothing changed) per frame: tested {:.1f} | outside the view {:.1f} | reach behind visible surfaces {:.1f}, no visible surface inside it {:.1f} (light passes that draw nothing visible) | visible {:.1f} | unknown {:.1f} | not tested (culled, occluded, no NiLight) {:.1f}",
+				take(g_surveyLights) / surveyFrames, take(g_surveyOutside) / surveyFrames, take(g_surveyHidden) / surveyFrames, take(g_surveyEmpty) / surveyFrames,
+				take(g_surveyVisible) / surveyFrames, take(g_surveyUnknown) / surveyFrames, take(g_surveySkipped) / surveyFrames);
+		}
 		if (g_loopFrames > 0) {
 			const double loopFrames = static_cast<double>(g_loopFrames);
 			std::string  fates;

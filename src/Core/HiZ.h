@@ -109,6 +109,9 @@ namespace CBRO::Core::HiZ
 
 		// Farthest depth over a level-0 texel-space rectangle, using the level where it spans <= 4 texels.
 		[[nodiscard]] float MaxDepth(float a_x0, float a_y0, float a_x1, float a_y1) const noexcept;
+		// Nearest depth over the same rectangle from the min-reduced pyramid (same level choice: coarse texels cover a
+		// little more than the rectangle). -1 without that pyramid.
+		[[nodiscard]] float MinDepth(float a_x0, float a_y0, float a_x1, float a_y1) const noexcept;
 
 		// True if every texel covering the rectangle has its nearest surface at or beyond a_threshold (buffer
 		// depth): nothing visible there is nearer. Same level choice and refinement as AllNearer.

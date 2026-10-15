@@ -2296,6 +2296,14 @@ namespace CBRO::Core::Runtime
 				const float maxAngle = settings.maxCameraAngle * 3.14159265f / 180.0f;
 				context.cull = Occlusion::Active() && g_state.hooksIn && age <= settings.maxSnapshotAge && move <= settings.maxCameraMove && angle <= maxAngle;
 				context.dilateMove = move + snapshot->mergeMove + 1.0f;  // (older merged frames' cameras lie within mergeMove of this one)
+				context.parallaxMove = settings.parallaxMargin ? move + snapshot->mergeMove : 0.0f;
+				if (const auto root = RE::Main::WorldRootCamera()) {
+					context.eye[0] = root->world.translate.x;
+					context.eye[1] = root->world.translate.y;
+					context.eye[2] = root->world.translate.z;
+				} else {
+					context.parallaxMove = 0.0f;
+				}
 				if (settings.verdictCache) {
 					const float toRadians = 3.14159265f / 180.0f;
 					float zoom[2]{};
@@ -2482,6 +2490,9 @@ namespace CBRO::Core::Runtime
 					// doesn't cull (previs mode, stale depth, camera jump) every hook stays a pass-through.
 					Hooks::CullGroups::SetMainCullActive(g_state.cullingThisFrame);
 					Hooks::CullGroups::SetRoomWalk(true);
+					if (g_timing.mode != 0 && g_state.hooksIn) {
+						Hooks::CullGroups::PlainViewFrustum();  // (previs off or suspended: the engine's occluders would cull the main view)
+					}
 					break;
 				}
 				case Stage::kPrePass:
@@ -2494,6 +2505,9 @@ namespace CBRO::Core::Runtime
 					// had marked occluded stays marked and dark (FO4-ENGINE-NOTES 6.7); clear the mark, as previs-off vanilla.
 					if (Settings::Get().unoccludeLights && Occlusion::Active() && g_state.hooksIn) {
 						ShadowLights::UnoccludeLights(false);  // (again: the cull begin's clear is the frame's main one)
+						if (Settings::Get().lampDiagnostic) {
+							ShadowLights::SurveyMainLights();  // (decide-only: which lamps a CBRO light test would leave unlit)
+						}
 					}
 					if (Settings::Get().lampDiagnostic && Occlusion::Active() && g_state.hooksIn) {
 						ShadowLights::LampLoopBegin();
@@ -2547,6 +2561,9 @@ namespace CBRO::Core::Runtime
 						auto  worker = g_asyncFrame.context;
 						auto& job = g_asyncFrame.next;
 						worker.dilateMove += g_asyncFrame.moveMargin;
+						if (Settings::Get().parallaxMargin) {
+							worker.parallaxMove += g_asyncFrame.moveMargin;
+						}
 						worker.asyncValid = false;
 						std::copy_n(job.box, 4, worker.view);
 						// The epoch's slack covers the camera's turn within it, not a box grown past the last job's: a side

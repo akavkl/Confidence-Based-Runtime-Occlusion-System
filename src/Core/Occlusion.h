@@ -39,6 +39,8 @@ namespace CBRO::Core::Occlusion
 		std::uint32_t        clock{ 0 };          // advances once per frame; drives the confirmation streaks
 		bool                 cull{ false };       // false: nothing is rejected this frame
 		float                dilateMove{ 0.0f };  // camera translation since the depth frame (game units)
+		float                parallaxMove{ 0.0f };  // ... without the cache's tolerance: a near occluder's parallax (v1.88; 0 = off)
+		float                eye[3]{};              // the current camera's position (with parallaxMove: a hidden verdict judged elsewhere isn't reused)
 		RE::NiBound          reject{};            // bound the engine's frustum test is certain to reject
 
 		// The current camera's view in the depth frame's NDC {x0, x1, y0, y1}: a conservative box

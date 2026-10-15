@@ -414,6 +414,39 @@ namespace CBRO::Core::HiZ
 		return farthest;
 	}
 
+	float Snapshot::MinDepth(float a_x0, float a_y0, float a_x1, float a_y1) const noexcept
+	{
+		if (!nearest) {
+			return -1.0f;
+		}
+		auto          span = std::max(a_x1 - a_x0, a_y1 - a_y0);
+		std::uint32_t level = 0;
+		while (span > 4.0f && level + 1 < levels) {
+			span *= 0.5f;
+			++level;
+		}
+
+		const float scale = 1.0f / static_cast<float>(1u << level);
+		const auto  w = width[level];
+		const auto  h = height[level];
+		const auto  clampX = [&](float a_v) { return static_cast<std::uint32_t>(std::clamp(a_v * scale, 0.0f, static_cast<float>(w - 1))); };
+		const auto  clampY = [&](float a_v) { return static_cast<std::uint32_t>(std::clamp(a_v * scale, 0.0f, static_cast<float>(h - 1))); };
+		const auto  x0 = clampX(a_x0);
+		const auto  x1 = clampX(a_x1);
+		const auto  y0 = clampY(a_y0);
+		const auto  y1 = clampY(a_y1);
+
+		const auto* base = nearest + offset[level];
+		float       closest = 1.0f;
+		for (auto y = y0; y <= y1; ++y) {
+			const auto* row = base + y * w;
+			for (auto x = x0; x <= x1; ++x) {
+				closest = std::min(closest, row[x]);
+			}
+		}
+		return closest;
+	}
+
 	bool SphereRays::Misses(float a_x0, float a_y0, float a_x1, float a_y1) const noexcept
 	{
 		// The ray in the rectangle closest to the center's direction (per-axis scaling keeps the

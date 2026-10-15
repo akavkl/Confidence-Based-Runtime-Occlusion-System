@@ -281,12 +281,28 @@ namespace CBRO::Hooks::CullGroups
 		std::uint64_t openRoomFrames{ 0 };     // ... of them with the camera outside every room
 		std::uint64_t sharedNodes{ 0 };        // portal shared nodes filed whole (room bounds off)
 		std::uint64_t sharedObjects{ 0 };      // ... their objects
+		std::uint64_t objectsLeftOut{ 0 };     // rooms' and shared nodes' objects left out before filing (out of view, confirmed hidden; v1.88)
+		std::uint64_t outsideLeftOut{ 0 };     // ... and of the unbound/art/roomless objects filed into group 0 (nothing needs them)
 	};
 	[[nodiscard]] OutsideRoomsCounts TakeOutsideRoomsCounts() noexcept;
 	// DrawWorld's cull stage begins (true) / ends (false); main thread. Rooms filed whole belong to one walk.
 	void SetRoomWalk(bool a_open) noexcept;
 	// Interior room bounds are off in CBRO frames (bDisableRoomBounds, its adds verified).
 	[[nodiscard]] bool RoomBoundsOff() noexcept;
+	// bIgnoreOccluders (v1.87): at DrawWorld's cull begin in a CBRO frame, the main culler's portal entry's compound
+	// frustum (the owner of groups 0 and 1) goes back to the camera's planes, without the ops the engine gave it this
+	// frame (authored occluders; the portals onto the outside). Main thread.
+	void PlainViewFrustum() noexcept;
+	// CBRO frames that reached PlainViewFrustum, those whose frustum had ops (cleared), their ops, and the portal
+	// graph's occluders outside every room summed over the frames. Taken per summary.
+	struct ViewFrustumCounts
+	{
+		std::uint64_t frames{ 0 };
+		std::uint64_t cleared{ 0 };
+		std::uint64_t ops{ 0 };
+		std::uint64_t graphOccluders{ 0 };
+	};
+	[[nodiscard]] ViewFrustumCounts TakeViewFrustumCounts() noexcept;
 	[[nodiscard]] bool      IsSky(const RE::NiAVObject* a_object) noexcept;
 
 	// Block entry bounds (SoA: groups of 4 entries, x[4] y[4] z[4] radius[4], at block + 0x60).
