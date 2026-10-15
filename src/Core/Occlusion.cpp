@@ -2406,7 +2406,10 @@ namespace CBRO::Core::Occlusion
 					std::uint8_t  hint = 0;
 					item.shaped = true;
 					item.shapeNow = TestShape(a_context, a_object, model, *shape, cells, hint);
-					if (RayWindowHit(camera, a_bound.center.x, a_bound.center.y, a_bound.center.z, a_bound.fRadius) >= 0.0f) {
+					// (2026-10-15: also every mesh its shape alone settles: Runtime Combiner chunks went missing in an interior
+					// while their spheres were in view)
+					if (RayWindowHit(camera, a_bound.center.x, a_bound.center.y, a_bound.center.z, a_bound.fRadius) >= 0.0f ||
+						item.shapeNow == Verdict::kHidden || item.shapeNow == Verdict::kOutside) {
 						BruteShape(a_context, a_object, item);
 					}
 				}
@@ -4761,7 +4764,8 @@ namespace CBRO::Core::Occlusion
 				const auto verdict = a_item.shaped && a_item.shapeNow != Verdict::kInvalid ? a_item.shapeNow : a_item.now;
 				const bool seenNow = verdict != Verdict::kHidden && verdict != Verdict::kOutside && verdict != Verdict::kBehind;
 				const bool ownOff = a_item.ownOffset > std::max(1.0f, a_item.bound[3] * 0.01f) || std::abs(a_item.ownRadius - a_item.bound[3]) > std::max(1.0f, a_item.bound[3] * 0.01f);
-				return seenNow || a_item.verticesOutside > 0 || ownOff;
+				const bool shapeWrong = a_item.bruteRead > 0 && (a_item.shapeNow == Verdict::kOutside ? a_item.bruteInView > 0 : a_item.bruteVisible > 0);
+				return seenNow || a_item.verticesOutside > 0 || ownOff || shapeWrong;
 			};
 			for (const auto& item : a_items) {
 				++byPath[static_cast<std::size_t>(item.path)];
@@ -5264,12 +5268,21 @@ namespace CBRO::Core::Occlusion
 		logger::info(
 			"cell art node 9 per frame (AppCulled by the engine, previs draws its chunks by id): nodes {:.2f} | children filed into group 0 {:.1f}",
 			static_cast<double>(art.nodes) / frames, static_cast<double>(art.filed) / frames);
-		if (const auto rooms = Hooks::CullGroups::TakeOutsideRoomsCounts(); rooms.frames) {
-			const auto perRoomFrame = [&](std::uint64_t a_count) { return static_cast<double>(a_count) / static_cast<double>(rooms.frames); };
-			logger::info(
-				"interior outside its rooms ({} frames with the camera in a room bound; the engine files only the rooms its portals show): filed into group 0 per such frame: unbound node {:.1f}, precombined art {:.1f} (node 9 AppCulled on {} frames), roomless multibounds {:.1f} | rooms the camera sees {:.1f} of {:.1f}; the others filed whole into group 1: rooms {:.1f}, objects {:.1f} | portal adds left out (their room filed whole) {:.1f}",
-				rooms.frames, perRoomFrame(rooms.unbound), perRoomFrame(rooms.art), rooms.artCulled, perRoomFrame(rooms.roomless), perRoomFrame(rooms.roomsSeen), perRoomFrame(rooms.roomsTotal),
-				perRoomFrame(rooms.hiddenRooms), perRoomFrame(rooms.hiddenRoomObjects), perRoomFrame(rooms.portalAddsSkipped));
+		if (const auto rooms = Hooks::CullGroups::TakeOutsideRoomsCounts(); rooms.frames || rooms.roomFrames) {
+			const auto perFrame = [](std::uint64_t a_count, std::uint64_t a_frames) { return a_frames ? static_cast<double>(a_count) / static_cast<double>(a_frames) : 0.0; };
+			if (rooms.frames) {
+				logger::info(
+					"interior outside its rooms ({} frames with the camera in a room bound; the engine files only the rooms its portals show): filed into group 0 per such frame: unbound node {:.1f}, precombined art {:.1f} (node 9 AppCulled on {} frames), roomless multibounds {:.1f}",
+					rooms.frames, perFrame(rooms.unbound, rooms.frames), perFrame(rooms.art, rooms.frames), rooms.artCulled, perFrame(rooms.roomless, rooms.frames));
+			}
+			if (rooms.roomFrames) {
+				logger::info(
+					"interior rooms ({}; {} walks, {} with the camera outside every room) per walk: the camera's list {:.1f} of {:.1f} rooms | filed whole into group 1: rooms {:.1f}, objects {:.1f}; portal shared geometry nodes {:.1f}, objects {:.1f} | the walk's room and portal adds left out (their room filed whole) {:.1f}",
+					Hooks::CullGroups::RoomBoundsOff() ? "room bounds off: every room and portal's shared geometry, none through portals" : "rooms the portals don't show", rooms.roomFrames, rooms.openRoomFrames,
+					perFrame(rooms.roomsSeen, rooms.roomFrames), perFrame(rooms.roomsTotal, rooms.roomFrames), perFrame(rooms.hiddenRooms, rooms.roomFrames),
+					perFrame(rooms.hiddenRoomObjects, rooms.roomFrames), perFrame(rooms.sharedNodes, rooms.roomFrames), perFrame(rooms.sharedObjects, rooms.roomFrames),
+					perFrame(rooms.portalAddsSkipped, rooms.roomFrames));
+			}
 		}
 		logger::info(
 			"occlusion lights per frame: tested {:.0f} | rejected {:.0f} (point/spot lights whose whole reach is hidden)",

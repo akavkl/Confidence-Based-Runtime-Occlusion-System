@@ -2481,6 +2481,7 @@ namespace CBRO::Core::Runtime
 					// stage: only then may the main accumulator's registrations be filtered. On a frame CBRO
 					// doesn't cull (previs mode, stale depth, camera jump) every hook stays a pass-through.
 					Hooks::CullGroups::SetMainCullActive(g_state.cullingThisFrame);
+					Hooks::CullGroups::SetRoomWalk(true);
 					break;
 				}
 				case Stage::kPrePass:
@@ -2515,6 +2516,7 @@ namespace CBRO::Core::Runtime
 				switch (a_stage) {
 				case Stage::kCull:
 					Hooks::CullGroups::SetMainCullActive(false);
+					Hooks::CullGroups::SetRoomWalk(false);
 					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations, Hooks::CullGroups::ReadDroppedRegistrations());
 					if (g_state.cullingThisFrame) {
 						NoteMotion(g_stillness.lastTurn, g_asyncFrame.frameMove, g_asyncFrame.context.asyncValid);

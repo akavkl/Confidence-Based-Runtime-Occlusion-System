@@ -473,10 +473,11 @@ namespace CBRO::Hooks::CullGroups
 		}
 
 		void FileOutsideRooms() noexcept;
-		bool InFiledRoom(const RE::NiAVObject* a_object) noexcept;
-		bool                       g_interiorOutsideRooms{ false };
-		std::uintptr_t             g_restrictedAddReturn{ 0 };  // the scene walk's in-a-room add (ResolveRestrictedAdd)
-		std::uintptr_t             g_portalAddReturn{ 0 };      // its portal path's add (0 = off)
+		bool SkipRoomAdd(const void* a_group, const RE::NiAVObject* a_object, std::uintptr_t a_returnAddress) noexcept;
+		bool                          g_interiorOutsideRooms{ false };
+		bool                          g_disableRoomBounds{ false };
+		std::uintptr_t                g_restrictedAddReturn{ 0 };  // the scene walk's in-a-room add (ResolveRestrictedAdd)
+		std::array<std::uintptr_t, 4> g_roomAddReturns{};         // its room adds: child 7's rooms, the camera's rooms, behind a portal, the graph's list (0 = off)
 
 		void GroupAdd(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags, std::uintptr_t a_returnAddress)
 		{
@@ -519,11 +520,11 @@ namespace CBRO::Hooks::CullGroups
 		void GroupAddThunk(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags)
 		{
 			const auto returnAddress = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
-			if (returnAddress == g_portalAddReturn && InFiledRoom(a_object)) {
-				return;  // (its room went whole into group 1 this frame)
+			if (SkipRoomAdd(a_group, a_object, returnAddress)) {
+				return;  // (its room went whole into group 1 in this walk)
 			}
 			GroupAdd(a_group, a_object, a_bound, a_flags, returnAddress);
-			if (returnAddress == g_restrictedAddReturn && g_interiorOutsideRooms && reinterpret_cast<std::uintptr_t>(a_group) == g_group1) {
+			if (returnAddress == g_restrictedAddReturn && (g_interiorOutsideRooms || g_disableRoomBounds) && reinterpret_cast<std::uintptr_t>(a_group) == g_group1) {
 				FileOutsideRooms();  // (the walk DrawWorld runs: its group 1 here, so its group 0 is DrawWorld's)
 			}
 		}
@@ -645,30 +646,60 @@ namespace CBRO::Hooks::CullGroups
 		// main view 227 registrations a frame against previs' ~470, CBRO hid 3). So every room not in the list goes
 		// whole into DrawWorld's group 1 (main-only, as the engine's room groups and previs' list are), and the
 		// portal path's add of a child of a room filed that way is left out (no object filed twice).
-		std::uintptr_t             g_interiorRoot{ 0 };   // address of the global (127974)
-		std::uintptr_t             g_mainCuller{ 0 };     // address of the global (865470)
-		std::uintptr_t             g_niNodeRtti{ 0 };
-		std::uintptr_t             g_frameCounter{ 0 };   // address of the engine's frame counter (734919)
-		bool                       g_hiddenRooms{ false };
-		constexpr std::uint64_t    kInteriorRootID = 127974;
-		constexpr std::uint64_t    kMainCullerID = 865470;
-		constexpr std::uint64_t    kNiNodeRttiID = 191219;
-		constexpr std::uint64_t    kFrameCounterID = 734919;
-		constexpr std::size_t      kRestrictedNodeLoad = 0xADE;  // mov rdx,[rip+disp32] (the global node it adds)
-		constexpr std::size_t      kRestrictedAddCall = 0xAF2;   // call Group::Add
-		constexpr std::size_t      kListedRoomAddCall = 0xC28;   // call Group::Add: a child of one of the camera's rooms
-		constexpr std::size_t      kPortalAddCall = 0xD48;       // call Group::Add: a child of the node behind a portal
-		constexpr std::size_t      kCullerStateOffset = 0x150;   // BSCullingProcess -> BSPortalGraphEntry
-		constexpr std::size_t      kStateRoomListOffset = 0x18;  // entry: the camera's rooms (pointer array)
-		constexpr std::size_t      kStateRoomCountOffset = 0x28; // ... their count (u32)
-		constexpr std::size_t      kRoomSlot = 0x218 / 8;        // BSMultiBoundNode: its room (null = none)
-		std::array<const RE::NiNode*, 64> g_filedRooms{};        // rooms filed whole this frame (main thread)
-		std::size_t                g_filedRoomCount{ 0 };
-		std::uint32_t              g_filedRoomsFrame{ 0 };
-		std::atomic<std::uint64_t> g_hiddenRoomsFiled{ 0 };
-		std::atomic<std::uint64_t> g_hiddenRoomObjects{ 0 };
-		std::atomic<std::uint64_t> g_portalAddsSkipped{ 0 };
-		std::atomic<std::uint64_t> g_restrictedFrames{ 0 };
+		//
+		// Room bounds off (v1.85, bDisableRoomBounds): every room is filed that way, in both branches, and none of the
+		// walk's room adds is left in. Read in 1138818 (Ghidra, 2026-10-15): each room add takes a fresh group of
+		// DrawWorld's group array whose compound frustum is the portal visibility map's entry for the room (id 158202
+		// stores it; BSPortalGraphEntry::GetVisibilityFromMap returns null for a room the map lacks): +0x948 every
+		// room of child 7 (unrestricted branch, in its child loop, which reaches child 3 first), +0xC28 the camera's
+		// rooms (restricted branch), +0xD48 the node behind each portal the culler passes, +0xE88 the graph's list
+		// (unrestricted). Fallout London's portals don't show rooms in plain view with the camera outside every room
+		// either (2026-10-15, Fallon's Department Store: the camera's list held 5-7 of 18 rooms; walls, floors and
+		// ceilings missing, sky behind). The unrestricted branch's rooms are filed from its child-3 loop (CellNodeThunk).
+		// The portal adds (+0xD48 for the camera's rooms' portals, +0xE88 for the graph's list, also of portals) file
+		// not a room but the portal's shared geometry: TESObjectCELL::AttachReference3D gives each portal reference a
+		// BSPortalSharedNode named "Portal Shared Geometry" (constructor 628293), stores it at portal +0x140 (135289) and
+		// attaches it under the graph's +0x70 node "Shared Portal Geometry" (made by TESObjectCELL::Load3D; in an interior
+		// AttachToPortalGraph hangs it under cell child 6); the walk files its children the first time a portal passes
+		// (247600: the culler's visited set). BSPortalSharedNode::OnVisible (vtable slot 57) culls its children only with
+		// a visibility-map entry for the node itself or in cull mode 1 or 3. Walls, floors and ceilings that lie on a room
+		// boundary hang there, so with room bounds off (v1.86) every shared node is filed whole as well (2026-10-15: the
+		// rooms came back, but the wall that had been missing was still a hole onto them).
+		std::uintptr_t                g_interiorRoot{ 0 };   // address of the global (127974)
+		std::uintptr_t                g_mainCuller{ 0 };     // address of the global (865470)
+		std::uintptr_t                g_niNodeRtti{ 0 };
+		bool                          g_hiddenRooms{ false };
+		constexpr std::uint64_t       kInteriorRootID = 127974;
+		constexpr std::uint64_t       kMainCullerID = 865470;
+		constexpr std::uint64_t       kNiNodeRttiID = 191219;
+		constexpr std::size_t         kRestrictedNodeLoad = 0xADE;  // mov rdx,[rip+disp32] (the global node it adds)
+		constexpr std::size_t         kRestrictedAddCall = 0xAF2;   // call Group::Add
+		constexpr std::size_t         kChildRoomAddCall = 0x948;    // call Group::Add: a child of a room of child 7 (unrestricted)
+		constexpr std::size_t         kListedRoomAddCall = 0xC28;   // call Group::Add: a child of one of the camera's rooms
+		constexpr std::size_t         kPortalAddCall = 0xD48;       // call Group::Add: a child of a camera's room's portal's shared node
+		constexpr std::size_t         kGraphRoomAddCall = 0xE88;    // call Group::Add: a child of the shared node of a portal in the graph's list
+		constexpr std::size_t         kCullerStateOffset = 0x150;   // BSCullingProcess -> BSPortalGraphEntry
+		constexpr std::size_t         kStateRoomListOffset = 0x18;  // entry: the camera's rooms (pointer array)
+		constexpr std::size_t         kStateRoomCountOffset = 0x28; // ... their count (u32)
+		constexpr std::size_t         kStateUnrestrictedOffset = 0x138;  // entry: camera outside every room
+		constexpr std::size_t         kRoomSlot = 0x218 / 8;        // BSMultiBoundNode: its room (null = none)
+		constexpr std::size_t         kStateGraphOffset = 0x10;     // entry: its BSPortalGraph
+		constexpr std::size_t         kGraphSharedOffset = 0x70;    // graph: the "Shared Portal Geometry" node
+		constexpr std::uint64_t       kPortalSharedRttiID = 524304; // BSPortalSharedNode's NiRTTI
+		std::uintptr_t                g_portalSharedRtti{ 0 };
+		std::array<const RE::NiNode*, 2048> g_filedRooms{};         // rooms and portal shared nodes filed whole in this walk, sorted (main thread)
+		std::size_t                   g_filedRoomCount{ 0 };
+		std::uint64_t                 g_roomWalk{ 0 };              // DrawWorld cull stages begun (SetRoomWalk)
+		bool                          g_roomWalkOpen{ false };      // inside one now
+		std::uint64_t                 g_filedRoomsWalk{ 0 };        // the stage g_filedRooms belongs to (0 = none)
+		std::atomic<std::uint64_t>    g_hiddenRoomsFiled{ 0 };
+		std::atomic<std::uint64_t>    g_hiddenRoomObjects{ 0 };
+		std::atomic<std::uint64_t>    g_portalAddsSkipped{ 0 };
+		std::atomic<std::uint64_t>    g_roomFrames{ 0 };            // walks that filed rooms
+		std::atomic<std::uint64_t>    g_openRoomFrames{ 0 };        // ... of them with the camera outside every room
+		std::atomic<std::uint64_t>    g_sharedNodesFiled{ 0 };
+		std::atomic<std::uint64_t>    g_sharedObjectsFiled{ 0 };
+		std::atomic<std::uint64_t>    g_restrictedFrames{ 0 };
 		std::atomic<std::uint64_t> g_unboundFiled{ 0 };
 		std::atomic<std::uint64_t> g_artFiled{ 0 };
 		std::atomic<std::uint64_t> g_artCulled{ 0 };
@@ -676,115 +707,188 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<std::uint64_t> g_roomsSeen{ 0 };
 		std::atomic<std::uint64_t> g_roomsTotal{ 0 };
 
-		void FileOutsideRooms() noexcept
+		// The walk is adding a_object: true when its parent is a room filed whole into group 1 in this walk.
+		bool InFiledRoom(const RE::NiAVObject* a_object) noexcept
 		{
-			const auto root = *reinterpret_cast<RE::NiAVObject* const*>(g_interiorRoot);
-			const auto cell = root ? root->IsNode() : nullptr;
-			if (!cell || (cell->GetFlags() & 1)) {
+			if (!a_object || g_filedRoomCount == 0 || !g_roomWalkOpen || g_filedRoomsWalk != g_roomWalk) {
+				return false;
+			}
+			const auto end = g_filedRooms.begin() + static_cast<std::ptrdiff_t>(g_filedRoomCount);
+			return std::binary_search(g_filedRooms.begin(), end, static_cast<const RE::NiNode*>(a_object->parent));
+		}
+
+		// The interior cell's rooms (child 7's multibounds that have one) go whole into DrawWorld's group 1: every room
+		// (room bounds off), else (v1.77) those the camera's list lacks. Once per walk; main thread, inside DrawWorld's
+		// cull stage (SetRoomWalk), so no other walk finds its room adds left out.
+		void FileRooms(RE::NiNode* a_cell, bool a_all, bool a_open) noexcept
+		{
+			if (!a_cell || !g_roomWalkOpen || g_filedRoomsWalk == g_roomWalk) {
 				return;
 			}
-			const auto group = reinterpret_cast<void*>(g_mainGroup);
-			const auto child = [&](std::uint16_t a_index) -> RE::NiNode* {
-				const auto object = cell->children.size() > a_index ? cell->children[a_index].get() : nullptr;
-				return object ? object->IsNode() : nullptr;
-			};
-			const auto file = [&](RE::NiAVObject* a_object) { AddDirect(group, a_object, &a_object->worldBound, 0); };
-			std::uint64_t unbound = 0, art = 0, roomless = 0, rooms = 0;
-			if (const auto node = child(3); node && !(node->GetFlags() & 1)) {
-				for (auto& entry : node->children) {
-					const auto object = entry.get();
-					if (!object || (object->GetFlags() & 1)) {
-						continue;
-					}
-					if (reinterpret_cast<std::uintptr_t>(object->GetRTTI()) == g_niNodeRtti) {  // (exact NiNodes are expanded)
-						for (auto& inner : static_cast<RE::NiNode*>(object)->children) {
-							if (inner) {
-								file(inner.get());
-								++unbound;
-							}
-						}
-					} else {
-						file(object);
-						++unbound;
-					}
-				}
-			}
-			if (const auto node = child(9)) {
-				g_artCulled.fetch_add(node->GetFlags() & 1, std::memory_order_relaxed);
-				for (auto& entry : node->children) {
-					if (const auto object = entry.get(); object && !(object->GetFlags() & 1)) {
-						file(object);
-						++art;
-					}
-				}
-			}
-			// The camera's rooms (the entry's list) are the portal path's; every other room goes whole into group 1.
+			g_filedRoomsWalk = g_roomWalk;
+			g_filedRoomCount = 0;
 			const auto culler = *reinterpret_cast<const std::uintptr_t*>(g_mainCuller);
 			const auto state = culler ? ReadAt<std::uintptr_t>(reinterpret_cast<const void*>(culler), kCullerStateOffset) : 0;
 			const auto listed = state ? ReadAt<void* const*>(reinterpret_cast<const void*>(state), kStateRoomListOffset) : nullptr;
 			const auto listedCount = listed ? ReadAt<std::uint32_t>(reinterpret_cast<const void*>(state), kStateRoomCountOffset) : 0u;
 			const auto isListed = [&](const void* a_room) { return std::find(listed, listed + listedCount, a_room) != listed + listedCount; };
-			std::uint64_t hiddenRooms = 0, roomObjects = 0;
-			g_filedRoomCount = 0;
-			g_filedRoomsFrame = *reinterpret_cast<const std::uint32_t*>(g_frameCounter);
-			if (const auto node = child(7); node && !(node->GetFlags() & 1)) {
+			std::uint64_t rooms = 0, filed = 0, objects = 0;
+			const auto node = a_cell->children.size() > 7 && a_cell->children[7] ? a_cell->children[7]->IsNode() : nullptr;
+			if (node && !(node->GetFlags() & 1)) {
 				for (auto& entry : node->children) {
 					const auto object = entry.get();
-					if (!object) {
-						continue;
-					}
-					const auto multiBound = object->IsMultiBoundNode();
+					const auto multiBound = object ? object->IsMultiBoundNode() : nullptr;
 					using RoomFn = RE::NiAVObject* (*)(void*);
 					const auto room = multiBound ? (*reinterpret_cast<RoomFn* const*>(multiBound))[kRoomSlot](multiBound) : nullptr;
 					if (!room) {
-						if (!(object->GetFlags() & 1)) {
-							file(object);
-							++roomless;
-						}
-						continue;
+						continue;  // (a roomless multibound: the walk's own, or FileOutsideRooms')
 					}
 					++rooms;
 					const auto roomNode = room->IsNode();
-					if (!g_hiddenRooms || isListed(room) || !roomNode || (roomNode->GetFlags() & 1) || g_filedRoomCount >= g_filedRooms.size()) {
+					if ((!a_all && isListed(room)) || !roomNode || (roomNode->GetFlags() & 1) || g_filedRoomCount >= g_filedRooms.size()) {
 						continue;
 					}
 					g_filedRooms[g_filedRoomCount++] = roomNode;
-					++hiddenRooms;
+					++filed;
 					for (auto& inner : roomNode->children) {
 						if (const auto item = inner.get(); item && !(item->GetFlags() & 1)) {
 							AddDirect(reinterpret_cast<void*>(g_group1), item, &item->worldBound, 0);
-							++roomObjects;
+							++objects;
 						}
 					}
 				}
 			}
+			// Room bounds off: each portal's shared geometry too (the portal adds +0xD48 / +0xE88 file nothing else).
+			std::uint64_t sharedNodes = 0, sharedObjects = 0;
+			const auto graph = a_all && state ? ReadAt<std::uintptr_t>(reinterpret_cast<const void*>(state), kStateGraphOffset) : 0;
+			const auto sharedRoot = graph ? ReadAt<RE::NiAVObject*>(reinterpret_cast<const void*>(graph), kGraphSharedOffset) : nullptr;
+			if (const auto shared = sharedRoot ? sharedRoot->IsNode() : nullptr; shared && !(shared->GetFlags() & 1) && g_portalSharedRtti) {
+				for (auto& entry : shared->children) {
+					const auto object = entry.get();
+					if (!object || (object->GetFlags() & 1) || reinterpret_cast<std::uintptr_t>(object->GetRTTI()) != g_portalSharedRtti ||
+						g_filedRoomCount >= g_filedRooms.size()) {
+						continue;
+					}
+					const auto sharedNode = static_cast<RE::NiNode*>(object);
+					g_filedRooms[g_filedRoomCount++] = sharedNode;
+					++sharedNodes;
+					for (auto& inner : sharedNode->children) {
+						if (const auto item = inner.get(); item && !(item->GetFlags() & 1)) {
+							AddDirect(reinterpret_cast<void*>(g_group1), item, &item->worldBound, 0);
+							++sharedObjects;
+						}
+					}
+				}
+			}
+			std::sort(g_filedRooms.begin(), g_filedRooms.begin() + static_cast<std::ptrdiff_t>(g_filedRoomCount));
+			g_sharedNodesFiled.fetch_add(sharedNodes, std::memory_order_relaxed);
+			g_sharedObjectsFiled.fetch_add(sharedObjects, std::memory_order_relaxed);
 			g_roomsSeen.fetch_add(listedCount, std::memory_order_relaxed);
 			g_roomsTotal.fetch_add(rooms, std::memory_order_relaxed);
-			g_hiddenRoomsFiled.fetch_add(hiddenRooms, std::memory_order_relaxed);
-			g_hiddenRoomObjects.fetch_add(roomObjects, std::memory_order_relaxed);
-			g_restrictedFrames.fetch_add(1, std::memory_order_relaxed);
-			g_unboundFiled.fetch_add(unbound, std::memory_order_relaxed);
-			g_artFiled.fetch_add(art, std::memory_order_relaxed);
-			g_roomlessFiled.fetch_add(roomless, std::memory_order_relaxed);
+			g_hiddenRoomsFiled.fetch_add(filed, std::memory_order_relaxed);
+			g_hiddenRoomObjects.fetch_add(objects, std::memory_order_relaxed);
+			g_roomFrames.fetch_add(1, std::memory_order_relaxed);
+			g_openRoomFrames.fetch_add(a_open ? 1 : 0, std::memory_order_relaxed);
 		}
 
-		// The portal path is adding a_object: true when its parent is a room FileOutsideRooms filed whole this frame.
-		bool InFiledRoom(const RE::NiAVObject* a_object) noexcept
+		RE::NiNode* InteriorCell() noexcept
 		{
-			if (!a_object || g_filedRoomCount == 0 || g_filedRoomsFrame != *reinterpret_cast<const std::uint32_t*>(g_frameCounter)) {
+			const auto root = g_interiorRoot ? *reinterpret_cast<RE::NiAVObject* const*>(g_interiorRoot) : nullptr;
+			const auto cell = root ? root->IsNode() : nullptr;
+			return cell && !(cell->GetFlags() & 1) ? cell : nullptr;
+		}
+
+		bool CameraOutsideRooms() noexcept
+		{
+			const auto culler = *reinterpret_cast<const std::uintptr_t*>(g_mainCuller);
+			const auto state = culler ? ReadAt<std::uintptr_t>(reinterpret_cast<const void*>(culler), kCullerStateOffset) : 0;
+			return state && ReadAt<std::uint8_t>(reinterpret_cast<const void*>(state), kStateUnrestrictedOffset) != 0;
+		}
+
+		void FileOutsideRooms() noexcept
+		{
+			const auto cell = InteriorCell();
+			if (!cell) {
+				return;
+			}
+			if (g_interiorOutsideRooms) {
+				const auto group = reinterpret_cast<void*>(g_mainGroup);
+				const auto child = [&](std::uint16_t a_index) -> RE::NiNode* {
+					const auto object = cell->children.size() > a_index ? cell->children[a_index].get() : nullptr;
+					return object ? object->IsNode() : nullptr;
+				};
+				const auto file = [&](RE::NiAVObject* a_object) { AddDirect(group, a_object, &a_object->worldBound, 0); };
+				std::uint64_t unbound = 0, art = 0, roomless = 0;
+				if (const auto node = child(3); node && !(node->GetFlags() & 1)) {
+					for (auto& entry : node->children) {
+						const auto object = entry.get();
+						if (!object || (object->GetFlags() & 1)) {
+							continue;
+						}
+						if (reinterpret_cast<std::uintptr_t>(object->GetRTTI()) == g_niNodeRtti) {  // (exact NiNodes are expanded)
+							for (auto& inner : static_cast<RE::NiNode*>(object)->children) {
+								if (inner) {
+									file(inner.get());
+									++unbound;
+								}
+							}
+						} else {
+							file(object);
+							++unbound;
+						}
+					}
+				}
+				if (const auto node = child(9)) {
+					g_artCulled.fetch_add(node->GetFlags() & 1, std::memory_order_relaxed);
+					for (auto& entry : node->children) {
+						if (const auto object = entry.get(); object && !(object->GetFlags() & 1)) {
+							file(object);
+							++art;
+						}
+					}
+				}
+				if (const auto node = child(7); node && !(node->GetFlags() & 1)) {
+					for (auto& entry : node->children) {
+						const auto object = entry.get();
+						const auto multiBound = object ? object->IsMultiBoundNode() : nullptr;
+						using RoomFn = RE::NiAVObject* (*)(void*);
+						if (object && !(object->GetFlags() & 1) && !(multiBound && (*reinterpret_cast<RoomFn* const*>(multiBound))[kRoomSlot](multiBound))) {
+							file(object);
+							++roomless;
+						}
+					}
+				}
+				g_restrictedFrames.fetch_add(1, std::memory_order_relaxed);
+				g_unboundFiled.fetch_add(unbound, std::memory_order_relaxed);
+				g_artFiled.fetch_add(art, std::memory_order_relaxed);
+				g_roomlessFiled.fetch_add(roomless, std::memory_order_relaxed);
+			}
+			// The camera's rooms are the portal path's (+0xC28), unless room bounds are off: then every room.
+			if (g_hiddenRooms) {
+				FileRooms(cell, g_disableRoomBounds, false);
+			}
+		}
+
+		// One of the walk's room adds (into a group of DrawWorld's array) of a child of a room filed whole in this walk:
+		// left out. With room bounds off, the first such add files the rooms if the child-3 loop didn't.
+		bool SkipRoomAdd(const void* a_group, const RE::NiAVObject* a_object, std::uintptr_t a_returnAddress) noexcept
+		{
+			if (std::find(g_roomAddReturns.begin(), g_roomAddReturns.end(), a_returnAddress) == g_roomAddReturns.end() ||
+				reinterpret_cast<std::uintptr_t>(a_group) == g_group1 || ClassifyGroup(a_group) != GroupKind::kMainOnly) {
 				return false;
 			}
-			const auto parent = a_object->parent;
-			const auto end = g_filedRooms.begin() + static_cast<std::ptrdiff_t>(g_filedRoomCount);
-			if (std::find(g_filedRooms.begin(), end, parent) == end) {
+			if (g_disableRoomBounds) {
+				FileRooms(InteriorCell(), true, CameraOutsideRooms());
+			}
+			if (!InFiledRoom(a_object)) {
 				return false;
 			}
 			g_portalAddsSkipped.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
 
-		// Checks the restricted branch's adds are where 1138818 had them (a global node's load, then calls to
-		// Group::Add) before the Group::Add hook acts on their return addresses.
+		// Checks the walk's adds are where 1138818 had them (a global node's load, then calls to Group::Add) before the
+		// Group::Add hook acts on their return addresses.
 		bool ResolveRestrictedAdd() noexcept
 		{
 			const auto walk = CBRO::Engine::OG(kSceneWalkID).address();
@@ -802,13 +906,19 @@ namespace CBRO::Hooks::CullGroups
 			g_interiorRoot = CBRO::Engine::OG(kInteriorRootID).address();
 			g_mainCuller = CBRO::Engine::OG(kMainCullerID).address();
 			g_niNodeRtti = CBRO::Engine::OG(kNiNodeRttiID).address();
-			g_frameCounter = CBRO::Engine::OG(kFrameCounterID).address();
-			g_hiddenRooms = callsGroupAdd(kListedRoomAddCall) && callsGroupAdd(kPortalAddCall);
+			g_portalSharedRtti = CBRO::Engine::OG(kPortalSharedRttiID).address();
+			const std::array<std::size_t, 4> roomAdds{ kChildRoomAddCall, kListedRoomAddCall, kPortalAddCall, kGraphRoomAddCall };
+			g_hiddenRooms = std::ranges::all_of(roomAdds, callsGroupAdd);
 			if (g_hiddenRooms) {
-				g_portalAddReturn = walk + kPortalAddCall + 5;
+				// (with room bounds on, only rooms the camera's list lacks are filed: the camera's rooms' adds never meet one)
+				for (std::size_t i = 0; i < roomAdds.size(); ++i) {
+					g_roomAddReturns[i] = walk + roomAdds[i] + 5;
+				}
 			} else {
-				logger::warn("cullgroups: the scene walk's portal adds aren't at {} / {} as expected: interior rooms no portal shows stay undrawn in CBRO frames",
-					Util::DescribeCodeAddress(walk + kListedRoomAddCall), Util::DescribeCodeAddress(walk + kPortalAddCall));
+				g_disableRoomBounds = false;
+				logger::warn("cullgroups: the scene walk's room adds aren't at {} / {} / {} / {} as expected: interior rooms no portal shows stay undrawn in CBRO frames, room bounds stay on",
+					Util::DescribeCodeAddress(walk + kChildRoomAddCall), Util::DescribeCodeAddress(walk + kListedRoomAddCall),
+					Util::DescribeCodeAddress(walk + kPortalAddCall), Util::DescribeCodeAddress(walk + kGraphRoomAddCall));
 			}
 			return true;
 		}
@@ -823,6 +933,10 @@ namespace CBRO::Hooks::CullGroups
 			}
 			if (a_index == 3 && g_cellArtNode9) {
 				FileCulledCellArt(a_node);
+			}
+			// (the unrestricted interior branch: the override root is the cell; its child loop reaches child 7's rooms later)
+			if (a_index == 3 && g_disableRoomBounds && a_node->parent && a_node->parent == InteriorCell()) {
+				FileRooms(a_node->parent, true, true);
 			}
 			if (!g_cellNodePruning || !g_mainCullActive.load(std::memory_order_relaxed)) {
 				return false;
@@ -1216,9 +1330,11 @@ namespace CBRO::Hooks::CullGroups
 		g_childPushOriginal = Util::DetourSwitchable(g_childPushHook, CBRO::Engine::OG(kChildPushID).address(), Util::FnAddr(&ChildPushThunk), kChildPushPrologue, "cullgroups:ChildPush");
 		g_registerOriginal = Util::WriteVFuncSwitchable(g_registerHook, CBRO::Engine::OG(kAccumulatorVtableID).address(), kRegisterObjectSlot, Util::FnAddr(&RegisterObjectThunk), "cullgroups:BSShaderAccumulator::RegisterObject");
 		// The walk's node loops carry two things: cell-node pruning and the AppCulled node-9 art (FileCulledCellArt).
+		// (and, room bounds off, the unrestricted interior branch's rooms: FileRooms from its child-3 loop)
 		g_cellNodePruning = Settings::Get().cellNodePruning;
 		g_cellArtNode9 = Settings::Get().cellArtNode9;
-		if (g_cellNodePruning || g_cellArtNode9) {
+		g_disableRoomBounds = Settings::Get().disableRoomBounds && g_groupAddOriginal;
+		if (g_cellNodePruning || g_cellArtNode9 || g_disableRoomBounds) {
 			if (!InstallCellNodePrune()) {
 				logger::warn("cullgroups: the scene walk's node loops couldn't be hooked: no cell-node pruning, and a cell's AppCulled node 9 (precombined art previs draws) stays undrawn in CBRO frames");
 				g_cellNodePruning = false;
@@ -1231,10 +1347,15 @@ namespace CBRO::Hooks::CullGroups
 		if (!Settings::Get().cellArtNode9) {
 			logger::info("cullgroups: a cell's AppCulled node 9 left to the engine ([Occlusion] bCellArtNode9=0): its precombined art is undrawn in CBRO frames");
 		}
-		g_interiorOutsideRooms = Settings::Get().interiorOutsideRooms && g_groupAddOriginal && ResolveRestrictedAdd();
+		const bool rooms = (Settings::Get().interiorOutsideRooms || g_disableRoomBounds) && g_groupAddOriginal && ResolveRestrictedAdd();
+		g_interiorOutsideRooms = Settings::Get().interiorOutsideRooms && rooms;
+		g_disableRoomBounds = g_disableRoomBounds && rooms;  // (ResolveRestrictedAdd may have turned it off)
 		if (!Settings::Get().interiorOutsideRooms) {
 			logger::info("cullgroups: an interior's objects outside its room bounds left to the engine ([Occlusion] bInteriorOutsideRooms=0): undrawn in CBRO frames while the camera is in a room");
 		}
+		logger::info("cullgroups: interior room bounds in CBRO frames: {}", g_disableRoomBounds ?
+			"off (every room filed whole with the camera's frustum, none through portals; CBRO judges its objects)" :
+			Settings::Get().disableRoomBounds ? "on (the walk's room adds couldn't be verified)" : "on ([Occlusion] bDisableRoomBounds=0: the engine's room and portal culling)");
 
 		// Without a group hook, Block::Add can't tell which group it serves: those entries count as shared
 		// (dropped from the main view only), and nothing is left out early. Safe, but less culling.
@@ -1338,7 +1459,19 @@ namespace CBRO::Hooks::CullGroups
 	{
 		return { g_restrictedFrames.exchange(0), g_unboundFiled.exchange(0), g_artFiled.exchange(0), g_artCulled.exchange(0),
 			g_roomlessFiled.exchange(0), g_roomsSeen.exchange(0), g_roomsTotal.exchange(0), g_hiddenRoomsFiled.exchange(0),
-			g_hiddenRoomObjects.exchange(0), g_portalAddsSkipped.exchange(0) };
+			g_hiddenRoomObjects.exchange(0), g_portalAddsSkipped.exchange(0), g_roomFrames.exchange(0), g_openRoomFrames.exchange(0),
+			g_sharedNodesFiled.exchange(0), g_sharedObjectsFiled.exchange(0) };
+	}
+
+	void SetRoomWalk(bool a_open) noexcept
+	{
+		g_roomWalk += a_open ? 1 : 0;
+		g_roomWalkOpen = a_open;
+	}
+
+	bool RoomBoundsOff() noexcept
+	{
+		return g_disableRoomBounds;
 	}
 
 	bool IsSky(const RE::NiAVObject* a_object) noexcept

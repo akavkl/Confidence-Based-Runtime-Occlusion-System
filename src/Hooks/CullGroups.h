@@ -276,9 +276,17 @@ namespace CBRO::Hooks::CullGroups
 		std::uint64_t roomsTotal{ 0 };
 		std::uint64_t hiddenRooms{ 0 };
 		std::uint64_t hiddenRoomObjects{ 0 };
-		std::uint64_t portalAddsSkipped{ 0 };
+		std::uint64_t portalAddsSkipped{ 0 };  // the walk's room adds left out (their room filed whole)
+		std::uint64_t roomFrames{ 0 };         // walks that filed rooms whole
+		std::uint64_t openRoomFrames{ 0 };     // ... of them with the camera outside every room
+		std::uint64_t sharedNodes{ 0 };        // portal shared nodes filed whole (room bounds off)
+		std::uint64_t sharedObjects{ 0 };      // ... their objects
 	};
 	[[nodiscard]] OutsideRoomsCounts TakeOutsideRoomsCounts() noexcept;
+	// DrawWorld's cull stage begins (true) / ends (false); main thread. Rooms filed whole belong to one walk.
+	void SetRoomWalk(bool a_open) noexcept;
+	// Interior room bounds are off in CBRO frames (bDisableRoomBounds, its adds verified).
+	[[nodiscard]] bool RoomBoundsOff() noexcept;
 	[[nodiscard]] bool      IsSky(const RE::NiAVObject* a_object) noexcept;
 
 	// Block entry bounds (SoA: groups of 4 entries, x[4] y[4] z[4] radius[4], at block + 0x60).
