@@ -66,10 +66,11 @@ namespace CBRO::Core::HiZ
 			Build::OutputLayout               output;
 			std::uint32_t                     copyWidth{ 0 };   // the engine's depth texture (the private copy's size)
 			std::uint32_t                     copyHeight{ 0 };
-			std::uint32_t                     srcWidth{ 0 };    // the region of it the frame was drawn in (top-left)
-			std::uint32_t                     srcHeight{ 0 };
-			std::uint32_t                     dstWidth{ 0 };
-			std::uint32_t                     dstHeight{ 0 };
+			std::uint32_t                     srcWidth{ 0 };    // the region of it the last capture was drawn in (top-left;
+			std::uint32_t                     srcHeight{ 0 };   // dynamic resolution changes it from frame to frame)
+			std::uint32_t                     dstWidth{ 0 };    // level 0: the texture's size over the downsample factor, so
+			std::uint32_t                     dstHeight{ 0 };   // the grid never follows the drawn region
+			bool                              rebuild{ false }; // the depth texture changed size: rebuild at the next Poll
 			bool                              initialized{ false };
 			bool                              failed{ false };
 		};
@@ -247,23 +248,29 @@ namespace CBRO::Core::HiZ
 			return true;
 		}
 
-		bool EnsureTargets(ID3D11Device* a_device, ID3D11DeviceContext* a_context, const D3D11_TEXTURE2D_DESC& a_depthDesc, ID3D11ShaderResourceView* a_depthSRV, std::uint32_t a_srcWidth, std::uint32_t a_srcHeight)
+		// Sized by the depth texture alone: the drawn region inside it (dynamic resolution) changes from frame to frame and
+		// only goes to the shader with each capture. A texture of another size (a resolution change, ENB toggled) is never
+		// rebuilt here, mid-frame: this frame's readers still hold the published snapshot (the cull stage's FrameContext,
+		// the lamp surveys after the pre-pass). Capture skips and Poll, at the next cull start, drops everything first.
+		bool EnsureTargets(ID3D11Device* a_device, ID3D11DeviceContext* a_context, const D3D11_TEXTURE2D_DESC& a_depthDesc, ID3D11ShaderResourceView* a_depthSRV)
 		{
-			const auto srcWidth = a_srcWidth;
-			const auto srcHeight = a_srcHeight;
-			if (a_depthDesc.Width == g_gpu.copyWidth && a_depthDesc.Height == g_gpu.copyHeight &&
-				srcWidth == g_gpu.srcWidth && srcHeight == g_gpu.srcHeight && g_gpu.out && g_gpu.depthCopySRV) {
-				return true;
+			if (g_gpu.out && g_gpu.depthCopySRV) {
+				if (a_depthDesc.Width == g_gpu.copyWidth && a_depthDesc.Height == g_gpu.copyHeight) {
+					return true;
+				}
+				if (!g_gpu.rebuild) {
+					logger::info("hi-z: depth texture {}x{} -> {}x{}: rebuilding at the next frame", g_gpu.copyWidth, g_gpu.copyHeight, a_depthDesc.Width, a_depthDesc.Height);
+				}
+				g_gpu.rebuild = true;
+				return false;
 			}
 
-			Reset();  // (unmaps whatever the old slots held)
+			Reset();  // (nothing is published or in flight: first use, or Poll dropped the old targets)
 			const auto factor = std::max(1u, Settings::Get().hiZDownsample);
 			g_gpu.copyWidth = a_depthDesc.Width;
 			g_gpu.copyHeight = a_depthDesc.Height;
-			g_gpu.srcWidth = srcWidth;
-			g_gpu.srcHeight = srcHeight;
-			g_gpu.dstWidth = (srcWidth + factor - 1) / factor;
-			g_gpu.dstHeight = (srcHeight + factor - 1) / factor;
+			g_gpu.dstWidth = (a_depthDesc.Width + factor - 1) / factor;
+			g_gpu.dstHeight = (a_depthDesc.Height + factor - 1) / factor;
 			g_blocksW = (g_gpu.dstWidth + 7) / 8;
 			g_blocksH = (g_gpu.dstHeight + 7) / 8;
 			g_blockChangedAt.assign(static_cast<std::size_t>(g_blocksW) * g_blocksH, 0);
@@ -349,8 +356,8 @@ namespace CBRO::Core::HiZ
 			}
 
 			logger::info(
-				"hi-z: depth {}x{} (drawn in the top-left of a {}x{} texture) -> hi-z {}x{} (factor {}; nearest and farthest per texel, and level 0's farthest drawn), {} levels and the {}x{} block map built on the GPU, read from a private copy; readback {} KB x {} slots",
-				srcWidth, srcHeight, a_depthDesc.Width, a_depthDesc.Height, g_gpu.dstWidth, g_gpu.dstHeight, factor, g_gpu.layout.levels, g_blocksW, g_blocksH, g_gpu.output.bytes / 1024, kSlots);
+				"hi-z: depth texture {}x{} -> hi-z {}x{} (factor {}; each capture's drawn region, which dynamic resolution changes, maps onto the whole grid; nearest and farthest per texel, and level 0's farthest drawn), {} levels and the {}x{} block map built on the GPU, read from a private copy; readback {} KB x {} slots",
+				a_depthDesc.Width, a_depthDesc.Height, g_gpu.dstWidth, g_gpu.dstHeight, factor, g_gpu.layout.levels, g_blocksW, g_blocksH, g_gpu.output.bytes / 1024, kSlots);
 			return true;
 		}
 
@@ -682,7 +689,8 @@ namespace CBRO::Core::HiZ
 			D3D11_TEXTURE2D_DESC desc{};
 			depthTex->GetDesc(&desc);
 			// The engine's dynamic resolution (Upscaling without ENB) draws a smaller frame into the top-left of the
-			// full-size depth; the rest stays cleared. The world camera's viewport, still bound here, is that region.
+			// full-size depth; the rest stays cleared. The world camera's viewport, still bound here, is that region. It
+			// changes from frame to frame, so only this capture's shader parameters follow it (the grid is the texture's).
 			// (With ENB, Upscaling swaps in a render-size texture instead, and the viewport covers all of it.)
 			auto           srcWidth = desc.Width;
 			auto           srcHeight = desc.Height;
@@ -693,7 +701,7 @@ namespace CBRO::Core::HiZ
 				srcWidth = std::min(srcWidth, static_cast<UINT>(viewport.Width + 0.5f));
 				srcHeight = std::min(srcHeight, static_cast<UINT>(viewport.Height + 0.5f));
 			}
-			if (EnsureTargets(device, context, desc, depthSRV, srcWidth, srcHeight)) {
+			if (EnsureTargets(device, context, desc, depthSRV)) {
 				Slot* slot = nullptr;
 				for (auto& candidate : g_gpu.slots) {
 					if (candidate.state == Slot::State::kFree) {
@@ -726,8 +734,8 @@ namespace CBRO::Core::HiZ
 					const bool reset = !g_refValid || g_refDepthA != a_camera.depthA || g_refDepthB != a_camera.depthB;
 
 					Build::Params params{};
-					params.srcSize[0] = g_gpu.srcWidth;
-					params.srcSize[1] = g_gpu.srcHeight;
+					params.srcSize[0] = srcWidth;
+					params.srcSize[1] = srcHeight;
 					params.dstSize[0] = g_gpu.dstWidth;
 					params.dstSize[1] = g_gpu.dstHeight;
 					params.factor = std::max(1u, settings.hiZDownsample);
@@ -798,6 +806,8 @@ namespace CBRO::Core::HiZ
 					slot->mergeMove = mergeMove;
 					slot->firstPersonAfter = a_firstPersonAfter;
 					slot->state = Slot::State::kPending;
+					g_gpu.srcWidth = srcWidth;
+					g_gpu.srcHeight = srcHeight;
 					++g_counters.captures;
 					ok = true;
 				}
@@ -826,6 +836,14 @@ namespace CBRO::Core::HiZ
 	{
 		const auto context = Util::GetContext();
 		if (!context || g_gpu.failed) {
+			return;
+		}
+		if (g_gpu.rebuild) {
+			// The depth texture changed size (EnsureTargets): drop every snapshot and target now, before this frame's
+			// readers take one; the next Capture builds the targets for the new size.
+			Reset();
+			g_gpu.out.Reset();
+			g_gpu.rebuild = false;
 			return;
 		}
 
@@ -997,8 +1015,8 @@ namespace CBRO::Core::HiZ
 		}
 		g_counters.spans = {};
 		return std::format(
-			"hi-z {}x{} ({} levels, GPU-built) captures={} readbacks={} noFreeSlot={} latest=frame {} | temporal: {} readbacks merged with {} earlier captures in all; this interval's depths by frames spanned:{}",
-			g_gpu.dstWidth, g_gpu.dstHeight, g_gpu.layout.levels, g_counters.captures, g_counters.readbacks, g_counters.noFreeSlot,
+			"hi-z {}x{} ({} levels, GPU-built, last drawn region {}x{}) captures={} readbacks={} noFreeSlot={} latest=frame {} | temporal: {} readbacks merged with {} earlier captures in all; this interval's depths by frames spanned:{}",
+			g_gpu.dstWidth, g_gpu.dstHeight, g_gpu.layout.levels, g_gpu.srcWidth, g_gpu.srcHeight, g_counters.captures, g_counters.readbacks, g_counters.noFreeSlot,
 			snapshot ? snapshot->frame : 0, g_counters.merges, g_counters.mergedFrames, spans.empty() ? " none" : spans);
 	}
 }

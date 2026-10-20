@@ -1,7 +1,9 @@
 // Offline brute-force check of the GPU Hi-Z build (src/Core/HiZBuild.h, compiled as is): the two compute shaders run
 // on a D3D11 device (hardware, else WARP) over synthetic depth frames, and their output buffer (far pyramid, near
 // pyramid, block-change map) is compared with a CPU model of what HiZ.cpp computed at readback time until v1.24:
-//  1. level 0 = per-texel min/max over factor x factor depth texels, first person (d < 0.01) as near 0 / far 1;
+//  1. level 0 = per-texel min/max over the texel's share of the drawn region, first person (d < 0.01) as near 0 / far 1.
+//     The grid is the depth texture's size over the factor; the drawn region (top-left, dynamic resolution) may change
+//     from capture to capture on the same targets (v1.88.3) and maps onto the whole grid;
 //  2. the temporal merge over the previous captures the CPU says to merge (min of nearest, max of farthest), through
 //     a ring that wraps;
 //  3. every pyramid level = min/max over 2x2 of the level below, odd sizes clamped; bit-exact;
@@ -115,7 +117,7 @@ static Scene MakeScene(std::uint32_t a_w, std::uint32_t a_h, const std::vector<W
 
 struct Model
 {
-	std::uint32_t                                srcW, srcH, factor, dstW, dstH, blocksW, blocksH;
+	std::uint32_t                                texW, texH, factor, dstW, dstH, blocksW, blocksH;
 	Layout                                       layout;
 	std::array<std::vector<float>, kRingSize>    ringNear, ringFar, ringDrawn;
 	std::vector<float>                           refFar, refNear;
@@ -127,11 +129,11 @@ struct Model
 	std::vector<float>                           refFarBefore, refNearBefore;  // the references before this capture (to adopt a borderline GPU decision)
 	std::uint32_t                                lastCapture{ 0 };
 
-	Model(std::uint32_t a_srcW, std::uint32_t a_srcH, std::uint32_t a_factor) :
-		srcW(a_srcW), srcH(a_srcH), factor(a_factor)
+	Model(std::uint32_t a_texW, std::uint32_t a_texH, std::uint32_t a_factor) :
+		texW(a_texW), texH(a_texH), factor(a_factor)
 	{
-		dstW = (srcW + factor - 1) / factor;
-		dstH = (srcH + factor - 1) / factor;
+		dstW = (texW + factor - 1) / factor;
+		dstH = (texH + factor - 1) / factor;
 		blocksW = (dstW + 7) / 8;
 		blocksH = (dstH + 7) / 8;
 		ComputeLayout(layout, dstW, dstH);
@@ -155,13 +157,17 @@ struct Model
 		auto& near0 = ringNear[a_ringCur];
 		auto& far0 = ringFar[a_ringCur];
 		auto& drawn0 = ringDrawn[a_ringCur];
+		const auto srcW = a_scene.w;
+		const auto srcH = a_scene.h;
 		for (std::uint32_t y = 0; y < dstH; ++y) {
 			for (std::uint32_t x = 0; x < dstW; ++x) {
-				float farthest = 0.0f, nearest = 1.0f, drawnDepth = 0.0f;
-				for (std::uint32_t dy = 0; dy < factor; ++dy) {
-					for (std::uint32_t dx = 0; dx < factor; ++dx) {
-						const auto px = std::min(x * factor + dx, srcW - 1);
-						const auto py = std::min(y * factor + dy, srcH - 1);
+				float      farthest = 0.0f, nearest = 1.0f, drawnDepth = 0.0f;
+				const auto x0 = x * srcW / dstW;
+				const auto y0 = y * srcH / dstH;
+				const auto x1 = std::min(std::max(((x + 1) * srcW + dstW - 1) / dstW, x0 + 1), srcW);
+				const auto y1 = std::min(std::max(((y + 1) * srcH + dstH - 1) / dstH, y0 + 1), srcH);
+				for (std::uint32_t py = y0; py < y1; ++py) {
+					for (std::uint32_t px = x0; px < x1; ++px) {
 						const float d = a_scene.depth[static_cast<std::size_t>(py) * srcW + px];
 						const bool  firstPerson = d < kDepthMin;
 						farthest = std::max(farthest, firstPerson ? 1.0f : d);
@@ -273,7 +279,7 @@ struct Gpu
 	ComPtr<ID3D11UnorderedAccessView> uavs[kUAVs];
 	OutputLayout                      output;
 	std::string                       driver;
-	std::uint32_t                     texW{ 0 }, texH{ 0 };  // the depth texture; the frame is drawn in its top-left srcW x srcH
+	std::uint32_t                     texW{ 0 }, texH{ 0 };  // the depth texture; each frame is drawn in its top-left (scene size)
 
 	bool CreateDevice()
 	{
@@ -338,10 +344,10 @@ struct Gpu
 		return !a_uav || SUCCEEDED(device->CreateUnorderedAccessView(a_tex.Get(), nullptr, a_uav->ReleaseAndGetAddressOf()));
 	}
 
-	bool Resize(const Model& a_model, std::uint32_t a_texScale)
+	bool Resize(const Model& a_model)
 	{
-		texW = a_model.srcW * a_texScale;
-		texH = a_model.srcH * a_texScale;
+		texW = a_model.texW;
+		texH = a_model.texH;
 		if (!Texture(texW, texH, 1, depth, nullptr) ||
 			FAILED(device->CreateShaderResourceView(depth.Get(), nullptr, depthSRV.ReleaseAndGetAddressOf())) ||
 			!Texture(a_model.dstW, a_model.dstH, kRingSize, ringNear, &uavs[0]) ||
@@ -387,8 +393,8 @@ struct Gpu
 		}
 		context->UpdateSubresource(depth.Get(), 0, nullptr, texels.data(), texW * 4, 0);
 		Params p{};
-		p.srcSize[0] = a_model.srcW;
-		p.srcSize[1] = a_model.srcH;
+		p.srcSize[0] = a_scene.w;
+		p.srcSize[1] = a_scene.h;
 		p.dstSize[0] = a_model.dstW;
 		p.dstSize[1] = a_model.dstH;
 		p.factor = a_model.factor;
@@ -527,21 +533,25 @@ int main()
 	{
 		std::uint32_t w, h, factor;
 		std::uint32_t texScale{ 1 };  // depth texture size / drawn size (Upscaling without ENB: 1280x800 drawn in 2560x1600)
+		bool          dynamic{ false };  // the drawn region changes from capture to capture (dynamic resolution)
 	};
-	const Config configs[]{ { 1280, 800, 4 }, { 321, 203, 2 }, { 100, 60, 8 }, { 25, 20, 8 }, { 1920, 1080, 4 }, { 640, 360, 1 }, { 1280, 800, 4, 2 }, { 161, 102, 2, 2 } };
+	const Config configs[]{ { 1280, 800, 4 }, { 321, 203, 2 }, { 100, 60, 8 }, { 25, 20, 8 }, { 1920, 1080, 4 }, { 640, 360, 1 }, { 1280, 800, 4, 2 }, { 161, 102, 2, 2 },
+		{ 1280, 800, 4, 2, true }, { 161, 102, 2, 2, true }, { 1366, 768, 4, 1, true } };
+	// Drawn region per capture of a dynamic config, in percent of the texture (odd ratios: texels share pixels).
+	constexpr std::uint32_t kDynamic[]{ 50, 37, 71, 100, 58, 50, 83, 44, 66, 100, 29 };
 	const Wall   wallA{ 0.10f, 0.30f, 0.35f, 0.90f, 120.0f };
 	const Wall   wallB{ 0.55f, 0.25f, 0.75f, 0.70f, 60.0f };
 	const Wall   wallC{ 0.40f, 0.10f, 0.50f, 0.60f, 900.0f };  // in the sky band too
 
 	Totals totals;
 	for (const auto& config : configs) {
-		Model model(config.w, config.h, config.factor);
-		if (!gpu.Resize(model, config.texScale)) {
+		Model model(config.w * config.texScale, config.h * config.texScale, config.factor);
+		if (!gpu.Resize(model)) {
 			std::printf("resize %ux%u failed\n", config.w, config.h);
 			return 1;
 		}
-		std::printf("depth %ux%u (in %ux%u) / %u -> hi-z %ux%u, %u levels, blocks %ux%u, output %u bytes%s\n",
-			config.w, config.h, gpu.texW, gpu.texH, config.factor, model.dstW, model.dstH, model.layout.levels, model.blocksW, model.blocksH, gpu.output.bytes,
+		std::printf("depth %ux%u%s (in %ux%u) / %u -> hi-z %ux%u, %u levels, blocks %ux%u, output %u bytes%s\n",
+			config.w, config.h, config.dynamic ? " varying per capture" : "", gpu.texW, gpu.texH, config.factor, model.dstW, model.dstH, model.layout.levels, model.blocksW, model.blocksH, gpu.output.bytes,
 			model.layout.levels > kGroupLevels ? "" : " (no tail pass)");
 
 		// A capture sequence the way Runtime + HiZ::Capture would drive it (ring wraps after 8).
@@ -553,17 +563,25 @@ int main()
 			std::uint32_t flags;
 		};
 		std::vector<Step> steps;
-		steps.push_back({ "first (reset)", MakeScene(config.w, config.h, { wallA, wallB }, 0.002f), 0, kFlagReset | kFlagLinear });
-		steps.push_back({ "jitter, merge 1", MakeScene(config.w, config.h, { wallA, wallB }, 0.002f), 1, kFlagLinear });
-		steps.push_back({ "jitter, merge 2", MakeScene(config.w, config.h, { wallA, wallB }, 0.002f), 2, kFlagLinear });
-		steps.push_back({ "wall B gone (farther), merge 3", MakeScene(config.w, config.h, { wallA }, 0.002f), 3, kFlagLinear });
-		steps.push_back({ "wall C appears (nearer in the sky band), merge 0", MakeScene(config.w, config.h, { wallA, wallC }, 0.002f), 0, kFlagLinear });
-		steps.push_back({ "same, merge 1", MakeScene(config.w, config.h, { wallA, wallC }, 0.002f), 1, kFlagLinear });
-		steps.push_back({ "no linear form (all changed, references kept)", MakeScene(config.w, config.h, { wallA, wallC }, 0.002f), 0, 0 });
-		steps.push_back({ "reset after no-linear", MakeScene(config.w, config.h, { wallA, wallC }, 0.002f), 0, kFlagReset | kFlagLinear });
-		steps.push_back({ "jitter, merge 4 (ring wraps)", MakeScene(config.w, config.h, { wallA, wallC }, 0.002f), 4, kFlagLinear });
-		steps.push_back({ "big jitter (some blocks move), merge 7", MakeScene(config.w, config.h, { wallA, wallC }, 0.02f), 7, kFlagLinear });
-		steps.push_back({ "walls A+B back, merge 2", MakeScene(config.w, config.h, { wallA, wallB }, 0.002f), 2, kFlagLinear });
+		// The next step's frame: the config's drawn size, or under dynamic resolution a share of the texture.
+		const auto frame = [&](const std::vector<Wall>& a_walls, float a_noise) {
+			if (!config.dynamic) {
+				return MakeScene(config.w, config.h, a_walls, a_noise);
+			}
+			const auto percent = kDynamic[steps.size() % std::size(kDynamic)];
+			return MakeScene(std::max(1u, model.texW * percent / 100), std::max(1u, model.texH * percent / 100), a_walls, a_noise);
+		};
+		steps.push_back({ "first (reset)", frame({ wallA, wallB }, 0.002f), 0, kFlagReset | kFlagLinear });
+		steps.push_back({ "jitter, merge 1", frame({ wallA, wallB }, 0.002f), 1, kFlagLinear });
+		steps.push_back({ "jitter, merge 2", frame({ wallA, wallB }, 0.002f), 2, kFlagLinear });
+		steps.push_back({ "wall B gone (farther), merge 3", frame({ wallA }, 0.002f), 3, kFlagLinear });
+		steps.push_back({ "wall C appears (nearer in the sky band), merge 0", frame({ wallA, wallC }, 0.002f), 0, kFlagLinear });
+		steps.push_back({ "same, merge 1", frame({ wallA, wallC }, 0.002f), 1, kFlagLinear });
+		steps.push_back({ "no linear form (all changed, references kept)", frame({ wallA, wallC }, 0.002f), 0, 0 });
+		steps.push_back({ "reset after no-linear", frame({ wallA, wallC }, 0.002f), 0, kFlagReset | kFlagLinear });
+		steps.push_back({ "jitter, merge 4 (ring wraps)", frame({ wallA, wallC }, 0.002f), 4, kFlagLinear });
+		steps.push_back({ "big jitter (some blocks move), merge 7", frame({ wallA, wallC }, 0.02f), 7, kFlagLinear });
+		steps.push_back({ "walls A+B back, merge 2", frame({ wallA, wallB }, 0.002f), 2, kFlagLinear });
 
 		std::uint32_t captureIndex = 100u * static_cast<std::uint32_t>(&config - configs);  // any monotonic sequence
 		std::uint32_t ringCur = 0;

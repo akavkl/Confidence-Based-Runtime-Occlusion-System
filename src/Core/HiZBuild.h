@@ -4,7 +4,7 @@
 // and runs the shaders against a CPU model. Everything the CPU used to do at readback time runs on the GPU at capture,
 // in two dispatches:
 //   build: one 8x8 thread group per 8x8 block of Hi-Z texels (= one verdict-cache block = one level-3 texel). Each
-//          thread reduces its factor x factor depth texels to (nearest, farthest), stores them in this capture's ring
+//          thread reduces its share of the drawn depth region to (nearest, farthest), stores them in this capture's ring
 //          slice, merges the previous captures of a still camera in (min/max over the ring), writes level 0, and
 //          compares its linear depths against the block's reference; the group then reduces levels 1-3 through
 //          groupshared memory and, if any texel moved past the tolerance, marks the block with this capture's index
@@ -40,9 +40,9 @@ RWTexture2DArray<float> g_ringDrawn : register(u5); // level 0's farthest drawn 
 
 cbuffer Params : register(b0)
 {
-	uint2 g_srcSize;
-	uint2 g_dstSize;
-	uint  g_factor;
+	uint2 g_srcSize;        // this capture's drawn region (top-left of the depth texture; dynamic resolution changes it)
+	uint2 g_dstSize;        // level 0, fixed by the depth texture's size
+	uint  g_factor;         // (unused by the shaders: the grid's downsample of the full texture)
 	float g_nearReject;     // depth below this is first-person geometry: it must not occlude the world
 	float g_depthMin;       // viewport depth range of the world, for the linear conversion
 	float g_invRange;
@@ -102,11 +102,13 @@ void build(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : S
 	                       // counts as nearest): a texel mixing a wall with a crack into the void keeps the wall's depth
 	bool  changed = false;
 	if (inside) {
-		uint2 base = id.xy * g_factor;
-		for (uint y = 0; y < g_factor; ++y) {
-			for (uint x = 0; x < g_factor; ++x) {
-				uint2 p = min(base + uint2(x, y), g_srcSize - 1);
-				float d = g_depth.Load(int3(p, 0));
+		// The texel's share of the drawn region, at least one pixel (neighbours may share a pixel: conservative both
+		// ways). The grid is the full texture's; dynamic resolution changes the drawn region from capture to capture.
+		uint2 lo = id.xy * g_srcSize / g_dstSize;
+		uint2 hi = min(max(((id.xy + 1) * g_srcSize + g_dstSize - 1) / g_dstSize, lo + 1), g_srcSize);
+		for (uint y = lo.y; y < hi.y; ++y) {
+			for (uint x = lo.x; x < hi.x; ++x) {
+				float d = g_depth.Load(int3(x, y, 0));
 				bool  firstPerson = d < g_nearReject;
 				farthest = max(farthest, firstPerson ? 1.0 : d);
 				nearest = min(nearest, firstPerson ? 0.0 : d);

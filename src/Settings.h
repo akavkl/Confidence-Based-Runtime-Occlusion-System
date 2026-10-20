@@ -17,7 +17,7 @@ namespace CBRO
 		std::uint32_t diagnosticHotkey{ 0 };       // cycles normal / decide-only / decide-only without depth capture (unbound)
 		std::uint32_t startDiagnostic{ 0 };        // the diagnostic state at load: 0 normal, 1 decide-only (hides nothing), 2 decide-only without the depth capture
 		bool          notify{ true };              // on-screen message when the mode changes
-		std::uint32_t hiZDownsample{ 4 };          // depth pixels per Hi-Z texel edge (1280x800 -> 320x200)
+		std::uint32_t hiZDownsample{ 4 };          // depth texture pixels per Hi-Z texel edge (1280x800 -> 320x200; not the drawn region, which dynamic resolution changes)
 		std::uint32_t confirmFrames{ 2 };          // consecutive hidden verdicts before an object is rejected
 		std::uint32_t maxSnapshotAge{ 6 };         // frames; older depth is not trusted
 		float         maxCameraMove{ 256.0f };     // game units since the depth frame; beyond this, cull nothing
