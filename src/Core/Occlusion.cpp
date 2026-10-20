@@ -29,6 +29,7 @@ namespace CBRO::Core::Occlusion
 			float         depthRange{ 0.99f };
 			bool          observeOnly{ false };
 			bool          cullActors{ false };
+			bool          cullPlayer{ false };  // the player's own 3D may be culled too (v1.89, bCullPlayer)
 			bool          meshShapes{ true };
 			bool          lampGroupTrim{ true };  // sun off: a group-0 entry the main view doesn't need is left out when no lamp's shadow of it can reach a visible surface
 			bool          emptiedSpotTrim{ true };  // sun up: spot lamps whose shadow map stays empty keep no group-0 entry (v1.81)
@@ -92,6 +93,7 @@ namespace CBRO::Core::Occlusion
 			kExemptType,
 			kExemptLight,
 			kExemptActor,
+			kExemptPlayer,  // offers of the player's 3D left untested (bCullPlayer=0)
 			kLightsTested,
 			kLightsRejected,
 			kNoContext,
@@ -495,6 +497,66 @@ namespace CBRO::Core::Occlusion
 					return true;
 				}
 				node = node->parent;
+			}
+			return false;
+		}
+
+		// The player (bCullPlayer=0, v1.89). Its third-person 3D (PlayerCharacter::Get3D(false), notes 7.17) and everything
+		// under it are never left out of any view or shadow map. A full-body first-person mod shows this same root in first
+		// person (True First Person also hangs its shadow clone under it, notes 2.3), and a path tracer that builds its scene
+		// from each frame's registrations loses a piece in the frames nothing files it: Renderer Replacer removes the
+		// player's pieces after two such frames, and the player's traced shadows lost a piece whenever CBRO judged it hidden
+		// or out of view with no sun shadow needed (group 0's rejection from every view), or trimmed it from a lamp's map.
+		// The root comes with the frame context (read on the main thread by BeginFrame, compared by address only, its bound
+		// copied). A node's world bound holds its children's, so the parent walk runs only for objects whose bound meets it.
+		// v1.89.1: not judging them was not enough. Previs files the player (one of its dynamic objects) force-visible, so
+		// the main view registers every piece whatever the frustum says; in a CBRO frame the frustum test ran, and a piece
+		// out of view (or the head, its sphere around the eye) went unfiled, its traced shadow coming and going with the
+		// camera's angle. Their main-view entries get previs's mark back (Hooks/CullGroups ForceVisible).
+		constexpr float kPlayerSlack = 256.0f;  // the root's bound may be a frame older than a part's
+		constexpr int   kPlayerDepth = 64;
+
+		void ReadPlayer(FrameContext& a_context) noexcept
+		{
+			a_context.playerRoot = nullptr;
+			if (g_tunables.cullPlayer) {
+				return;
+			}
+			__try {
+				const auto player = RE::PlayerCharacter::GetSingleton();
+				const auto loaded = player ? player->loadedData : nullptr;
+				if (const auto root = loaded ? loaded->data3D.get() : nullptr) {
+					a_context.playerRoot = root;
+					a_context.playerBound = root->worldBound;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				a_context.playerRoot = nullptr;
+			}
+		}
+
+		bool PlayerPart(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			const auto root = a_context.playerRoot;
+			if (!root || !a_object) {
+				return false;
+			}
+			const auto& b = a_context.playerBound;
+			if (b.fRadius > 0.0f && b.fRadius < 1.0e5f && a_bound.fRadius >= 0.0f && a_bound.fRadius < 1.0e5f) {
+				const float dx = a_bound.center.x - b.center.x, dy = a_bound.center.y - b.center.y, dz = a_bound.center.z - b.center.z;
+				const float reach = b.fRadius + a_bound.fRadius + kPlayerSlack;
+				if (dx * dx + dy * dy + dz * dz > reach * reach) {
+					return false;
+				}
+			}  // (an unusable bound, or NaN: walked)
+			__try {
+				auto node = a_object;
+				for (int depth = 0; node && depth < kPlayerDepth; ++depth) {
+					if (node == root) {
+						return true;
+					}
+					node = node->parent;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
 			}
 			return false;
 		}
@@ -2593,6 +2655,7 @@ namespace CBRO::Core::Occlusion
 			const RE::NiAVObject* object{ nullptr };
 			std::uint32_t         clock{ 0 };
 			const RE::NiBound*    result{ nullptr };
+			bool                  forceVisible{ false };  // the player's 3D: filed force-visible (v1.89.1)
 		};
 		thread_local TopDecision t_top;
 
@@ -3729,6 +3792,11 @@ namespace CBRO::Core::Occlusion
 
 		const RE::NiBound* FilterDecide(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add)
 		{
+			if (PlayerPart(a_context, a_add.object, *a_add.bound)) {
+				Bump(kExemptPlayer);
+				Hooks::CullGroups::ForceVisible();  // (filed whatever the frustum says, as previs files it)
+				return nullptr;  // (nor a drop: its children and the main accumulator file it too)
+			}
 			auto&  streams = Streams(a_context);
 			Record out{};
 			switch (a_add.kind) {
@@ -3906,6 +3974,9 @@ namespace CBRO::Core::Occlusion
 			// Decided at Group::Add already (same thread): not again.
 			if (t_top.object == a_in.object && t_top.clock == context->clock) {
 				t_top.object = nullptr;
+				if (t_top.forceVisible) {
+					Hooks::CullGroups::ForceVisible();
+				}
 				if (!t_top.result) {
 					RecordKeptRegion(*context, a_in);  // (diagnostic, one frame per still location)
 				}
@@ -3972,8 +4043,11 @@ namespace CBRO::Core::Occlusion
 			const auto start = timed ? __rdtsc() : 0;
 			NoteOffered(*context, a_object, 2);  // (diagnostic, one frame per still location)
 
-			bool skip = false;
-			if (!((a_object->GetFlags() >> 11) & 1) && !Hooks::CullGroups::IsSky(a_object)) {
+			bool       skip = false;
+			const bool player = PlayerPart(*context, a_object, *a_bound);
+			if (player) {
+				Bump(kExemptPlayer);
+			} else if (!((a_object->GetFlags() >> 11) & 1) && !Hooks::CullGroups::IsSky(a_object)) {
 				auto&      streams = Streams(*context);
 				const bool group0 = a_kind == Hooks::CullGroups::GroupKind::kSunShared;
 				const Hooks::CullGroups::BlockAdd add{ nullptr, a_object, a_bound, -1, 0, true, a_kind, 0 };
@@ -4017,7 +4091,7 @@ namespace CBRO::Core::Occlusion
 				}
 			}
 			if (!skip) {
-				t_top = { a_object, context->clock, nullptr };
+				t_top = { a_object, context->clock, nullptr, player };
 			}
 			if (timed) {
 				Bump(kCycles, (__rdtsc() - start) * kTimingStride);
@@ -4486,6 +4560,7 @@ namespace CBRO::Core::Occlusion
 		g_tunables.depthRange = settings.worldDepthMax - settings.worldDepthMin;
 		g_tunables.observeOnly = settings.observeOnly;
 		g_tunables.cullActors = settings.cullActors;
+		g_tunables.cullPlayer = settings.cullPlayer;
 		g_tunables.meshShapes = settings.meshShapes;
 		g_tunables.lampGroupTrim = settings.lampGroupTrim;
 		g_tunables.emptiedSpotTrim = settings.emptiedSpotTrim && settings.spotShadowCulling;
@@ -4602,6 +4677,7 @@ namespace CBRO::Core::Occlusion
 		}
 		const auto next = (g_context.load() + 1 + 2) % 2;
 		g_contexts[next] = a_context;
+		ReadPlayer(g_contexts[next]);
 		SetOverhangs(g_contexts[next]);
 		SetSunPlanes(g_contexts[next]);
 		SetLampPlanes(g_contexts[next]);
@@ -4805,6 +4881,12 @@ namespace CBRO::Core::Occlusion
 		const auto streak = HiddenStreak(entry->lamp.load(std::memory_order_relaxed), context->clock);
 		entry->lamp.store((static_cast<std::uint64_t>(streak) << 32) | context->clock, std::memory_order_relaxed);
 		return streak < g_tunables.confirmFrames ? LampVerdict::kConfirming : LampVerdict::kMisses;
+	}
+
+	bool IsPlayerPart(const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+	{
+		const auto context = CurrentContext();
+		return context && PlayerPart(*context, a_object, a_bound);
 	}
 
 	void CountLampVerdict(LampVerdict a_verdict) noexcept
@@ -5369,17 +5451,18 @@ namespace CBRO::Core::Occlusion
 		g_lastLightsRejected.store(static_cast<float>(per(kLightsRejected)));
 
 		logger::info(
-			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f} | judged by the depth frame's edge through a view overhang of up to {:.3f}: hidden objects {:.0f}, sun shadows behind surfaces {:.0f} (evaluations, not reuses) | screen boxes widened for a near occluder's parallax {:.0f} | fade nodes left out kept seen (no fade restart) {:.0f}",
+			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | the player's 3D, never judged {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f} | judged by the depth frame's edge through a view overhang of up to {:.3f}: hidden objects {:.0f}, sun shadows behind surfaces {:.0f} (evaluations, not reuses) | screen boxes widened for a near occluder's parallax {:.0f} | fade nodes left out kept seen (no fade restart) {:.0f}",
 			per(kTested), per(kRejected),
 			observing ? std::format(" (decide-only: would reject {:.0f})", per(kWouldReject)) : std::string{},
 			per(kConfirming), per(kVisible), per(kEdge), per(kNear), per(kOutside), per(kBehind),
-			per(kExemptType), per(kExemptLight), per(kExemptActor),
+			per(kExemptType), per(kExemptLight), per(kExemptActor), per(kExemptPlayer),
 			per(kInvalid), per(kNoContext), per(kTableFull), g_tunables.viewOverhang, per(kOverhangHidden), per(kSunOverhang), per(kParallaxWidened), per(kFadeKeptSeen));
 		const auto sky = Hooks::CullGroups::TakeSkyCounts();
 		logger::info(
-			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f} || sky meshes given previs's force-visible mark {:.2f}, CBRO drops of them ignored {:.2f}",
+			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f} || sky meshes given previs's force-visible mark {:.2f}, CBRO drops of them ignored {:.2f} || the player's 3D entries given it {:.1f}",
 			per(kMerged), per(kMergedRejected), per(kMergedConfirming), per(kInstanceTests), per(kInstanceEntries), per(kInstanceEntriesRejected),
-			static_cast<double>(Hooks::CullGroups::TakeForcedCleared()) / frames, static_cast<double>(sky.forced) / frames, static_cast<double>(sky.kept) / frames);
+			static_cast<double>(Hooks::CullGroups::TakeForcedCleared()) / frames, static_cast<double>(sky.forced) / frames, static_cast<double>(sky.kept) / frames,
+			static_cast<double>(Hooks::CullGroups::TakeForcedVisible()) / frames);
 		const auto art = Hooks::CullGroups::TakeCellArtCounts();
 		logger::info(
 			"cell art node 9 per frame (AppCulled by the engine, previs draws its chunks by id): nodes {:.2f} | children filed into group 0 {:.1f}",

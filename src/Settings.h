@@ -24,6 +24,7 @@ namespace CBRO
 		float         maxCameraAngle{ 60.0f };     // degrees since the depth frame; beyond this, cull nothing (must stay < 90)
 		float         nearDistance{ 8.0f };        // objects with any point closer than this (view depth) stay visible
 		bool          cullActors{ true };          // NPC/creature parts may be hidden too (their shadows stay: main view only)
+		bool          cullPlayer{ false };         // the player's own 3D may be culled too; off: never left out of any view (v1.89)
 		bool          meshShapes{ true };          // big static meshes are judged by their actual geometry (box + occupancy grid)
 		bool          sunShadowCulling{ true };    // skip hidden objects whose sun shadow can't fall on anything visible
 		bool          farCascadeTrim{ true };      // ... and leave a needed shadow out of the sun's last cascade when nothing visible lies in its slab (v1.80)

@@ -42,6 +42,10 @@ namespace CBRO::Core::Occlusion
 		float                parallaxMove{ 0.0f };  // ... without the cache's tolerance: a near occluder's parallax (v1.88; 0 = off)
 		float                eye[3]{};              // the current camera's position (with parallaxMove: a hidden verdict judged elsewhere isn't reused)
 		RE::NiBound          reject{};            // bound the engine's frustum test is certain to reject
+		// The player's third-person root (bCullPlayer=0, v1.89; set by BeginFrame): compared by address only, its world
+		// bound copied. Null: the player may be culled like any actor, or has no 3D.
+		const RE::NiAVObject* playerRoot{ nullptr };
+		RE::NiBound           playerBound{};
 
 		// The current camera's view in the depth frame's NDC {x0, x1, y0, y1}: a conservative box
 		// around where this frame's frustum lands on the depth frame's image plane. Only the part of
@@ -208,6 +212,8 @@ namespace CBRO::Core::Occlusion
 	// The same against a given context (the async worker's).
 	[[nodiscard]] LampVerdict TestLampCasterIn(const FrameContext& a_context, RE::NiAVObject* a_caster, const RE::NiPoint3& a_lamp, float a_reach, const RE::NiBound& a_bound) noexcept;
 	void                      CountLampVerdict(LampVerdict a_verdict) noexcept;  // for the stats (per-thread counters)
+	// Whether an object is the player's third-person 3D or lies under it (never left out of a view with bCullPlayer=0).
+	[[nodiscard]] bool IsPlayerPart(const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept;
 
 	[[nodiscard]] std::uint32_t Clock() noexcept;         // advances once per culled frame
 	[[nodiscard]] bool          Deciding() noexcept;      // observe-only (config or diagnostic): decide but never hide

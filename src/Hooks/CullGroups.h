@@ -102,6 +102,10 @@ namespace CBRO::Hooks::CullGroups
 	// From inside the filter (same thread): when it keeps the entry, the engine files it with this bound in place of
 	// the one offered (a bound that encloses the offered one; v1.83 static collection pieces). Consumed by that add.
 	void WidenBound(const RE::NiBound* a_bound) noexcept;
+	// From inside the filter (same thread): the entry it keeps is filed force-visible, the mark previs's Block::Add gives
+	// main-pass entries, so no frustum test leaves it out of a pass that processes its group (v1.89.1, the player's 3D).
+	// Consumed by that add; ignored when the filter rejects the entry.
+	void ForceVisible() noexcept;
 
 	// Called after a main-pass add into a main-only group that wrote instance entries [a_first, a_end) into
 	// a_add.block (merge-instanced meshes, fresh or continued). Instance k of the mesh is entry
@@ -250,6 +254,9 @@ namespace CBRO::Hooks::CullGroups
 		std::uint64_t kept{ 0 };
 	};
 	[[nodiscard]] SkyCounts TakeSkyCounts() noexcept;
+
+	// Entries given the force-visible mark through ForceVisible (the player's 3D) since the last call.
+	[[nodiscard]] std::uint64_t TakeForcedVisible() noexcept;
 
 	// A cell's node 9 (precombined art) the engine has AppCulled, found by the scene walk in CBRO frames, and its
 	// children CBRO filed into group 0 in its place (previs draws them by id). Taken per summary.

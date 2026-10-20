@@ -231,6 +231,7 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<std::uint64_t> g_forcedCleared{ 0 };
 		std::atomic<std::uint64_t> g_skyForced{ 0 };   // sky entries given previs's force-visible mark (CBRO frames)
 		std::atomic<std::uint64_t> g_skyKept{ 0 };     // ... and reject bounds CBRO's filter would have given them
+		std::atomic<std::uint64_t> g_forcedVisible{ 0 };  // entries the filter had filed force-visible (ForceVisible)
 		std::atomic<std::uint64_t> g_groupAddsConsidered{ 0 };
 
 		std::uintptr_t g_mainGroup{ 0 };
@@ -383,6 +384,7 @@ namespace CBRO::Hooks::CullGroups
 		}
 
 		thread_local const RE::NiBound* t_widened{ nullptr };  // (WidenBound, for the add in progress)
+		thread_local bool               t_forceVisible{ false };  // (ForceVisible, for the add in progress)
 
 		bool IsSkyMesh(const RE::NiAVObject* a_object) noexcept
 		{
@@ -420,6 +422,7 @@ namespace CBRO::Hooks::CullGroups
 			// Continuation calls (startIndex >= 0) only add more instance entries of a merged mesh.
 			const RE::NiBound* replacement = nullptr;
 			t_widened = nullptr;
+			t_forceVisible = false;
 			if (filter && culling && a_startIndex < 0 && a_object && a_bound) {
 				replacement = filter(add);
 				if (add.kind == GroupKind::kUnknown) {
@@ -436,9 +439,20 @@ namespace CBRO::Hooks::CullGroups
 			}
 
 			const bool watchInstances = instanceFilter && culling && add.kind == GroupKind::kMainOnly && a_object;
-			const auto before = (watchInstances || replacement || sky) ? ReadAt<std::uint32_t>(a_block, kBlockCountOffset) : 0u;
+			const bool forceKept = std::exchange(t_forceVisible, false) && !replacement;
+			const auto before = (watchInstances || replacement || sky || forceKept) ? ReadAt<std::uint32_t>(a_block, kBlockCountOffset) : 0u;
 			const auto widened = std::exchange(t_widened, nullptr);
 			const auto result = reinterpret_cast<BlockAddFn>(g_blockAddOriginal)(a_block, a_object, replacement ? replacement : widened ? widened : a_bound, a_startIndex);
+			if (forceKept && before < 0x200 && ReadAt<std::uint32_t>(a_block, kBlockCountOffset) > before) {
+				// Previs's Block::Add marks main-pass entries force-visible (the player as one of its dynamic objects among
+				// them), so the finish loops file them, and walk a node's children, whatever the frustum test says. In a CBRO
+				// frame previs is suspended and the test runs: the filter asks for the mark back.
+				auto* bytes = static_cast<std::uint8_t*>(a_block) + kEntryBytesOffset + before * kEntryBytesStride;
+				if (!bytes[1]) {
+					bytes[1] = 1;  // force-visible
+					g_forcedVisible.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
 			if (sky && add.mainPass && before < 0x200 && ReadAt<std::uint32_t>(a_block, kBlockCountOffset) > before) {
 				auto*      bytes = static_cast<std::uint8_t*>(a_block) + kEntryBytesOffset + before * kEntryBytesStride;
 				const auto mark = bytes[1];
@@ -1514,6 +1528,11 @@ namespace CBRO::Hooks::CullGroups
 		return { g_skyForced.exchange(0), g_skyKept.exchange(0) };
 	}
 
+	std::uint64_t TakeForcedVisible() noexcept
+	{
+		return g_forcedVisible.exchange(0);
+	}
+
 	CellArtCounts TakeCellArtCounts() noexcept
 	{
 		return { g_culledArtNodes.exchange(0), g_culledArtFiled.exchange(0) };
@@ -1578,6 +1597,11 @@ namespace CBRO::Hooks::CullGroups
 	void WidenBound(const RE::NiBound* a_bound) noexcept
 	{
 		t_widened = a_bound;
+	}
+
+	void ForceVisible() noexcept
+	{
+		t_forceVisible = true;
 	}
 
 	bool AddDirect(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags) noexcept

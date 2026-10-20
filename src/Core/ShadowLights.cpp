@@ -537,6 +537,9 @@ namespace CBRO::Core::ShadowLights
 			if (!(a_bound.fRadius > 0.0f) || !(a_bound.fRadius < 1.0e6f) || !std::isfinite(center[0]) || !std::isfinite(center[1]) || !std::isfinite(center[2])) {
 				return CasterFate::kKept;
 			}
+			if (Occlusion::IsPlayerPart(a_object, a_bound)) {
+				return CasterFate::kKept;  // (bCullPlayer=0: the player's 3D stays in every lamp's map)
+			}
 			if (ShadowGeometry::CasterOutside(a_cone, a_push, center, a_bound.fRadius)) {
 				return CasterFate::kOutsideCone;
 			}
