@@ -7,6 +7,7 @@
 #include "Core/HiZ.h"
 #include "Core/Occlusion.h"
 #include "Core/ShadowLights.h"
+#include "Core/TraceFeed.h"
 #include "Hooks/CullGroups.h"
 #include "Hooks/FirstPersonOrder.h"
 #include "Hooks/Precipitation.h"
@@ -2282,6 +2283,7 @@ namespace CBRO::Core::Runtime
 				HiZ::Poll();
 			}
 			const auto snapshot = active ? HiZ::Latest() : nullptr;
+			TraceFeed::BeginFrame();  // (before ReadSunState: the cascades' filter follows it)
 
 			Occlusion::FrameContext context{};
 			context.clock = ++g_state.clock;
@@ -2670,6 +2672,7 @@ namespace CBRO::Core::Runtime
 
 		Occlusion::Install();
 		ShadowLights::Install();
+		TraceFeed::Install();
 		Hooks::PrevisFeed::Install();  // (pass-through wrappers on the engine's two previs feed sites, plus the accessors)
 		Hooks::Precipitation::Install();  // (diagnostic: the rain occlusion pass's runs and cost)
 		Feed::Install();

@@ -4,6 +4,7 @@
 #include "Core/DropSet.h"
 #include "Core/MeshProxy.h"
 #include "Core/ShadowLights.h"
+#include "Core/TraceFeed.h"
 #include "Hooks/CullGroups.h"
 #include "Settings.h"
 #include "Util/Gamebryo.h"
@@ -138,6 +139,12 @@ namespace CBRO::Core::Occlusion
 			kSpotLampsLeftLit,   // ... of those, the lamp's map was drawn after all (its casters may have been missing)
 			kSpotOnlyLeftOut,    // kSpotLampKept entries left out of the sun's cascades (v1.82)
 			kSpotOnlyRegistrations, // ... the cascades' registrations left out for them (their geometry)
+			kTraceFiled,          // objects CBRO would leave out of every view, filed for the trace on their turn (Core/TraceFeed, v1.90)
+			kTraceMoved,          // ... in a frame their bound moved
+			kTraceInherited,      // main-only children of an entry filed so, dropped with it
+			kTraceCellNodes,      // cell nodes walked on their turn though pruning would have left them out whole
+			kTraceForced,         // out-of-view entries no view files, filed force-visible for the trace on their turn (v1.91)
+			kTraceForcedChildren, // ... their children, given the mark with them
 			kScolWidened,         // static collection pieces judged and filed with their collection's bound (v1.83)
 			kCellNodesSeen,       // cells' child node 3 (precombined chunks + static refs) offered by the scene walk
 			kCellNodesSkipped,    // ... left out whole: outside the view, sun shadow can't reach it
@@ -384,6 +391,7 @@ namespace CBRO::Core::Occlusion
 		DropSet       g_drops;
 		DropSet       g_farDrops;  // group-0 entries the sun's last cascade doesn't need this frame (v1.80)
 		DropSet       g_sunDrops;  // group-0 entries kept for spot lamps alone: no cascade needs them this frame (v1.82)
+		DropSet       g_traceForced;  // entries filed force-visible for the trace this frame, out of view, and their children (v1.91)
 		std::uint32_t g_dropCycle{ 0 };  // clock / kTagCycle at the last frame start (main thread)
 
 		// ---- object types -----------------------------------------------------------------------
@@ -2655,7 +2663,7 @@ namespace CBRO::Core::Occlusion
 			const RE::NiAVObject* object{ nullptr };
 			std::uint32_t         clock{ 0 };
 			const RE::NiBound*    result{ nullptr };
-			bool                  forceVisible{ false };  // the player's 3D: filed force-visible (v1.89.1)
+			bool                  forceVisible{ false };  // filed force-visible: the player's 3D (v1.89.1), the trace's out-of-view entries (v1.91)
 		};
 		thread_local TopDecision t_top;
 
@@ -2668,6 +2676,7 @@ namespace CBRO::Core::Occlusion
 			bool                  dropped{ false };
 		};
 		thread_local ParentDecision t_parent;
+		thread_local ParentDecision t_forcedParent;  // (g_traceForced: ParentForced)
 
 		bool ParentDropped(const RE::NiAVObject* a_object, std::uint32_t a_clock, std::uint32_t a_tag) noexcept
 		{
@@ -2679,6 +2688,20 @@ namespace CBRO::Core::Occlusion
 				t_parent = { parent, a_clock, g_drops.Contains(parent, a_tag) };
 			}
 			return t_parent.dropped;
+		}
+
+		// Whether the parent of an object being added was filed force-visible for the trace this frame (out of view: so is
+		// the child; never hidden by implication).
+		bool ParentForced(const RE::NiAVObject* a_object, std::uint32_t a_clock, std::uint32_t a_tag) noexcept
+		{
+			const auto parent = a_object->parent;
+			if (!parent || !TraceFeed::On()) {
+				return false;
+			}
+			if (t_forcedParent.parent != parent || t_forcedParent.clock != a_clock) {
+				t_forcedParent = { parent, a_clock, g_traceForced.Contains(parent, a_tag) };
+			}
+			return t_forcedParent.dropped;
 		}
 
 		// ---- the verdict cache -----------------------------------------------------------------------------
@@ -3563,11 +3586,118 @@ namespace CBRO::Core::Occlusion
 			}
 		}
 
+		// ---- Renderer Replacer's traced scene (Core/TraceFeed) ------------------------------------------------------
+		// t_moved: the thread's last JudgeOrLookup found last frame's record with another bound (the object moved).
+		// t_traceNode: the cell node (or root, container) the walk is expanding for the trace this frame; its entries are
+		// its children or, through a container, its grandchildren (the walk's two levels under a cell's node 3).
+		thread_local bool t_moved{ false };
+		struct TraceNode
+		{
+			const RE::NiAVObject* node{ nullptr };
+			std::uint32_t         clock{ 0 };
+		};
+		thread_local TraceNode t_traceNode{};
+
+		// Whether an object about to be left out of every view is filed for the trace instead this frame: within its
+		// radius, on its turn, in a frame its bound moved, or under a node walked for it.
+		bool TraceRefresh(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			if (!TraceFeed::On() || Observing()) {
+				return false;
+			}
+			const auto parent = a_object->parent;
+			const bool underNode = t_traceNode.node && t_traceNode.clock == a_context.clock && parent &&
+			                       (parent == t_traceNode.node || parent->parent == t_traceNode.node);
+			if (!(t_moved || underNode || TraceFeed::Turn(a_object, a_context.clock)) || !TraceFeed::InReach(a_bound, a_context.eye)) {
+				return false;
+			}
+			Bump(t_moved ? kTraceMoved : kTraceFiled);
+			return true;
+		}
+
+		// A main-only entry (the main accumulator alone registers its group) filed for the trace: a main-view drop. False
+		// (not its turn, or the drop table full): left out as before.
+		bool TraceDrop(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			if (!TraceRefresh(a_context, a_object, a_bound)) {
+				return false;
+			}
+			if (!g_drops.Insert(a_object, DropSet::Tag(a_context.clock))) {
+				Bump(kDropFull);
+				return false;
+			}
+			return true;
+		}
+
+		// An entry filed force-visible for the trace (out of the main view, refused there; Hooks::CullGroups ForceVisible, or
+		// TopDecision::forceVisible at Group::Add): its children get the mark with it (ParentForced). The engine's frustum
+		// test alone leaves an out-of-view entry out (FO4-ENGINE-NOTES 5.2: result byte or force-visible byte), so without the
+		// mark no view would file it. Only the main view meets the children's marks: a lamp's or a cascade's group pass
+		// rebuilds group 0's child list and tests it with its own planes (5.2, 6.2a); the entry itself it walks again.
+		void MarkForced(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
+		{
+			Bump(kTraceForced);
+			if (!g_traceForced.Insert(a_object, DropSet::Tag(a_context.clock))) {
+				Bump(kDropFull);
+			}
+		}
+
+		// A child of an entry filed force-visible for the trace: the same mark (out of view as its parent, not hidden by
+		// implication) and a main-view drop.
+		void ForcedChild(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			const auto tag = DropSet::Tag(a_context.clock);
+			Bump(kTraceForcedChildren);
+			if (!g_drops.Insert(a_object, tag) || !g_traceForced.Insert(a_object, tag)) {
+				Bump(kDropFull);
+			}
+			Hooks::CullGroups::ForceVisible();
+			RecordLeftOut(a_context, a_object, a_bound, LeftOutPath::kInherited, nullptr);
+		}
+
+		// An out-of-view entry no view files (a main-only group's; group 0's with the sun down, when no shadow pass is known
+		// to file it) filed for the trace on its turn: a main-view drop the caller files force-visible. False: left as before.
+		bool TraceOutside(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			if (!TraceRefresh(a_context, a_object, a_bound)) {
+				return false;
+			}
+			if (!g_drops.Insert(a_object, DropSet::Tag(a_context.clock))) {
+				Bump(kDropFull);
+				return false;
+			}
+			MarkForced(a_context, a_object);
+			return true;
+		}
+
+		// A group-0 entry nothing needs (GroupZeroUnneeded) filed for the trace: a main-view drop and, with the sun up, out of
+		// the sun's cascades (SunCascade, on while the feed is). Out of view (a_hidden false) the caller files it
+		// force-visible (marked here). False: left out as before.
+		bool TraceKeep(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound, bool a_hidden, const Record& a_record) noexcept
+		{
+			const bool sunUp = a_context.sun.state == FrameContext::Sun::State::kOn;
+			if (!TraceRefresh(a_context, a_object, a_bound)) {
+				return false;
+			}
+			const auto tag = DropSet::Tag(a_context.clock);
+			if (!g_drops.Insert(a_object, tag) || (sunUp && !g_sunDrops.Insert(a_object, tag))) {
+				Bump(kDropFull);
+				return false;
+			}
+			if (!a_hidden) {
+				MarkForced(a_context, a_object);
+			}
+			RecordLeftOut(a_context, a_object, a_bound, LeftOutPath::kDropped, &a_record);
+			return true;
+		}
+
 		// The object's outcome for this frame: reused from its last record (a_old, or null) when everything it depended
 		// on still holds, evaluated otherwise; the sun part too when a_wantSun and the main view doesn't need the
 		// object.
 		void JudgeRecord(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add, const Record* old, bool a_wantSun, Record& a_out)
 		{
+			t_moved = old && (old->bound[0] != a_add.bound->center.x || old->bound[1] != a_add.bound->center.y || old->bound[2] != a_add.bound->center.z ||
+			                   old->bound[3] != a_add.bound->fRadius);
 			const bool    reusable = a_context.cacheEnabled && a_context.clock != g_dumpClock.load(std::memory_order_relaxed);
 			const bool    timed = Timed(a_context);
 			const bool    parts = BucketTimed(a_context);
@@ -3738,6 +3868,7 @@ namespace CBRO::Core::Occlusion
 		// The walk's outcome for the entry, counted as decided (the turn table's own share of what the main view keeps).
 		void JudgeOrLookup(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
 		{
+			t_moved = false;
 			JudgeOrLookupRecord(a_context, a_stream, a_add, a_wantSun, a_out);
 			if (g_tunables.keepFadeState && a_add.object && (a_out.outcome == Outcome::kHidden || a_out.outcome == Outcome::kOutside)) {
 				KeepFadeSeen(const_cast<RE::NiAVObject*>(a_add.object));
@@ -3801,12 +3932,35 @@ namespace CBRO::Core::Occlusion
 			Record out{};
 			switch (a_add.kind) {
 			case Hooks::CullGroups::GroupKind::kMainOnly: {
+				// (a child of an entry filed for the trace: main-only entries are main-view drops only then, TraceDrop, TraceOutside)
+				if (ParentForced(a_add.object, a_context.clock, DropSet::Tag(a_context.clock)) && !IsActorRoot(a_add.object)) {
+					ForcedChild(a_context, a_add.object, *a_add.bound);
+					return nullptr;
+				}
+				if (TraceFeed::On() && ParentDropped(a_add.object, a_context.clock, DropSet::Tag(a_context.clock)) && !IsActorRoot(a_add.object)) {
+					Bump(kTraceInherited);
+					if (!g_drops.Insert(a_add.object, DropSet::Tag(a_context.clock))) {
+						Bump(kDropFull);
+					}
+					InheritHidden(a_add.object, a_context.clock, g_tunables.confirmFrames);
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kInherited, nullptr);
+					return nullptr;
+				}
 				JudgeOrLookup(a_context, streams.child, a_add, false, out);
 				if (out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing()) {
+					if (TraceDrop(a_context, a_add.object, *a_add.bound)) {
+						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
+						return nullptr;
+					}
 					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kRejected, &out);
 					return &a_context.reject;
 				}
 				if (out.outcome == Outcome::kOutside) {
+					if (!Observing() && TraceOutside(a_context, a_add.object, *a_add.bound)) {
+						Hooks::CullGroups::ForceVisible();
+						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
+						return nullptr;
+					}
 					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kOutside, &out);
 				}
 				return nullptr;
@@ -3821,6 +3975,10 @@ namespace CBRO::Core::Occlusion
 					return nullptr;  // the engine's always-draw mark: Block::Add forces such entries visible
 				}
 				const auto tag = DropSet::Tag(a_context.clock);
+				if (ParentForced(a_add.object, a_context.clock, tag) && !IsActorRoot(a_add.object)) {
+					ForcedChild(a_context, a_add.object, *a_add.bound);
+					return nullptr;
+				}
 				if (ParentDropped(a_add.object, a_context.clock, tag) && !IsActorRoot(a_add.object)) {
 					Bump(kDropInherited);
 					if (!g_drops.Insert(a_add.object, tag)) {
@@ -3836,6 +3994,12 @@ namespace CBRO::Core::Occlusion
 				}
 				const bool hiddenConfirmed = out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames;
 				if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !(out.flags & kRecordLight) && GroupZeroUnneeded(a_context, out, a_add.object, *a_add.bound)) {
+					if (TraceKeep(a_context, a_add.object, *a_add.bound, hiddenConfirmed, out)) {
+						if (!hiddenConfirmed) {
+							Hooks::CullGroups::ForceVisible();
+						}
+						return nullptr;
+					}
 					Bump(kCasterRejected);
 					SampleLeftOutType(a_context, a_add.object);
 					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kCasterRejected, &out);
@@ -3851,7 +4015,13 @@ namespace CBRO::Core::Occlusion
 						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
 					}
 				} else if (out.outcome == Outcome::kOutside) {
-					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kOutside, &out);
+					// (with the sun up a shadow it may cast keeps it: the cascades file it within their range, 6.1)
+					if (a_context.sun.state != FrameContext::Sun::State::kOn && TraceOutside(a_context, a_add.object, *a_add.bound)) {
+						Hooks::CullGroups::ForceVisible();
+						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
+					} else {
+						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kOutside, &out);
+					}
 				}
 				return nullptr;
 			}
@@ -4044,6 +4214,7 @@ namespace CBRO::Core::Occlusion
 			NoteOffered(*context, a_object, 2);  // (diagnostic, one frame per still location)
 
 			bool       skip = false;
+			bool       force = false;  // filed force-visible for the trace (TraceOutside, TraceKeep)
 			const bool player = PlayerPart(*context, a_object, *a_bound);
 			if (player) {
 				Bump(kExemptPlayer);
@@ -4061,10 +4232,14 @@ namespace CBRO::Core::Occlusion
 				if (!Observing()) {
 					if (group0) {
 						if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !light && GroupZeroUnneeded(*context, out, a_object, *a_bound)) {
-							Bump(kCasterSkipped);
-							SampleLeftOutType(*context, a_object);
-							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipCaster, &out);
-							skip = true;
+							if (TraceKeep(*context, a_object, *a_bound, hiddenConfirmed, out)) {
+								force = !hiddenConfirmed;
+							} else {
+								Bump(kCasterSkipped);
+								SampleLeftOutType(*context, a_object);
+								RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipCaster, &out);
+								skip = true;
+							}
 						} else if (hiddenConfirmed) {
 							NoteFarCascade(*context, a_object, out);
 							if (!g_drops.Insert(a_object, DropSet::Tag(context->clock))) {
@@ -4076,22 +4251,33 @@ namespace CBRO::Core::Occlusion
 							if (!light) {
 								NoteFarCascade(*context, a_object, out);
 							}
-							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kOutside, &out);
+							// (with the sun up a shadow it may cast keeps it: the cascades file it within their range, 6.1)
+							force = context->sun.state != FrameContext::Sun::State::kOn && TraceOutside(*context, a_object, *a_bound);
+							RecordLeftOut(*context, a_object, *a_bound, force ? LeftOutPath::kDropped : LeftOutPath::kOutside, &out);
 						}
 					} else if (hiddenConfirmed) {
-						Bump(kSkippedHidden);
-						RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipHidden, &out);
-						skip = true;
-					} else if (out.outcome == Outcome::kOutside && !light) {
-						// (a light's bound can be off-view while its light still reaches into view)
-						Bump(kSkippedOutside);
-						RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipOutside, &out);
-						skip = true;
+						if (TraceDrop(*context, a_object, *a_bound)) {
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);
+						} else {
+							Bump(kSkippedHidden);
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipHidden, &out);
+							skip = true;
+						}
+					} else if (out.outcome == Outcome::kOutside) {
+						if (TraceOutside(*context, a_object, *a_bound)) {
+							force = true;
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);
+						} else if (!light) {
+							// (a light's bound can be off-view while its light still reaches into view)
+							Bump(kSkippedOutside);
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kSkipOutside, &out);
+							skip = true;
+						}
 					}
 				}
 			}
 			if (!skip) {
-				t_top = { a_object, context->clock, nullptr, player };
+				t_top = { a_object, context->clock, nullptr, player || force };
 			}
 			if (timed) {
 				Bump(kCycles, (__rdtsc() - start) * kTimingStride);
@@ -4279,6 +4465,24 @@ namespace CBRO::Core::Occlusion
 				a_outside ? "all entries outside the view" : "meets the view (or held)", a_entries, a_unionRadius);
 		}
 
+		// A node pruning would leave out whole (outside the view, its sun shadow unneeded), walked for the trace on its turn
+		// with the sun up (TraceKeep files its entries force-visible and keeps them out of every view's draws). A container
+		// under a node walked so is walked too (its entries are the node's grandchildren).
+		bool TraceCellNode(const FrameContext& a_context, RE::NiAVObject* a_node, const RE::NiBound& a_bound) noexcept
+		{
+			if (!TraceFeed::On() || a_context.sun.state != FrameContext::Sun::State::kOn) {
+				return false;
+			}
+			if (t_traceNode.node && t_traceNode.clock == a_context.clock && a_node->parent == t_traceNode.node) {
+				return true;
+			}
+			if (!TraceFeed::Turn(a_node, a_context.clock) || !TraceFeed::InReach(a_bound, a_context.eye)) {
+				return false;
+			}
+			t_traceNode = { a_node, a_context.clock };
+			return true;
+		}
+
 		bool SkipCellNode(RE::NiAVObject* a_node, std::uint32_t a_index)
 		{
 			const auto context = CurrentContext();
@@ -4314,6 +4518,8 @@ namespace CBRO::Core::Occlusion
 				Bump(kCellNodesSunNeeded);
 			} else if (SpotLampMayNeed(*context, nullptr, unionBound)) {
 				Bump(kSpotLampNodesKept);  // (a spot lamp's group pass may file its entries: v1.54)
+			} else if (TraceCellNode(*context, a_node, unionBound)) {
+				Bump(kTraceCellNodes);  // (its entries come to SkipTopLevel and Block::Add, TraceKeep)
 			} else {
 				Bump(kCellNodesSkipped);
 				Bump(kCellNodeEntriesSkipped, entries);
@@ -4540,6 +4746,11 @@ namespace CBRO::Core::Occlusion
 				}
 			}
 			if (reject) {
+				// (the whole mesh is filed when any instance entry passes: a main-view drop then, notes 5.2 item 6)
+				t_moved = false;
+				reject = !TraceDrop(*context, a_add.object, *a_add.bound);
+			}
+			if (reject) {
 				for (auto i = a_first; i < a_end; ++i) {
 					Hooks::CullGroups::WriteEntryBound(a_add.block, i, context->reject);
 				}
@@ -4577,6 +4788,7 @@ namespace CBRO::Core::Occlusion
 		g_drops.Allocate();
 		g_farDrops.Allocate();
 		g_sunDrops.Allocate();
+		g_traceForced.Allocate();
 		Calibrate();
 		Hooks::CullGroups::SetFilter(&Filter);
 		Hooks::CullGroups::SetInstanceFilter(&Instances);
@@ -4667,6 +4879,7 @@ namespace CBRO::Core::Occlusion
 			g_drops.Clear();
 			g_farDrops.Clear();
 			g_sunDrops.Clear();
+			g_traceForced.Clear();
 		}
 		MeshProxy::BeginFrame();
 
@@ -4709,7 +4922,7 @@ namespace CBRO::Core::Occlusion
 
 	void SetSunCascades(const void* const* a_accumulators, std::uint32_t a_count) noexcept
 	{
-		const bool on = a_accumulators && a_count && g_tunables.spotOnlyCascadeTrim;
+		const bool on = a_accumulators && a_count && (g_tunables.spotOnlyCascadeTrim || TraceFeed::On());
 		Hooks::CullGroups::SetSunCascades(on ? a_accumulators : nullptr, on ? a_count : 0, on ? &SunCascade : nullptr);
 	}
 
@@ -5502,6 +5715,10 @@ namespace CBRO::Core::Occlusion
 		logger::info(
 			"occlusion early skips per frame (main-view-only groups, never filed with the engine): hidden {:.0f} | out of view {:.0f} | top-level adds considered {:.0f}",
 			per(kSkippedHidden), per(kSkippedOutside), static_cast<double>(Hooks::CullGroups::TakeGroupAddsConsidered()) / frames);
+		logger::info(
+			"trace feed per frame (Renderer Replacer's scene; {}): refused registrations handed over {:.0f} | objects left out of every view otherwise, filed for it: on their turn {:.1f}, moved {:.1f}, main-only children with them {:.1f}, cell nodes walked {:.2f} (their sun-cascade registrations count with the spot-only ones above) | of those, out of view and filed force-visible {:.1f}, their children with the mark {:.1f}",
+			TraceFeed::On() ? "on"sv : "off"sv, static_cast<double>(Hooks::CullGroups::TakeRefusedRegistrations()) / frames, per(kTraceFiled), per(kTraceMoved), per(kTraceInherited), per(kTraceCellNodes),
+			per(kTraceForced), per(kTraceForcedChildren));
 		logger::info("occlusion static collection pieces per frame (judged and filed with the collection's bound): {:.1f}", per(kScolWidened));
 		logger::info(
 			"occlusion node pruning per frame: offered by the scene walk: cell node 3 {:.1f}, container {:.1f}; by DrawWorld's root loop {:.1f} | skipped whole {:.1f} ({:.0f} entries never filed) | walked: an entry meets the view {:.1f}, holds an always-draw entry or an actor {:.1f}, sun shadow may reach the view {:.1f} || cell node 9 seen {:.1f} (never pruned) | nodes with their own always-draw bit {:.1f}",

@@ -216,6 +216,7 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<GroupFilter>    g_groupFilter{ nullptr };
 		std::atomic<MainViewFilter> g_mainViewFilter{ nullptr };
 		std::atomic<MainRegistrationObserver> g_mainRegistrationObserver{ nullptr };
+		std::atomic<RefusedObserver>          g_refusedObserver{ nullptr };
 		std::atomic<CellNodeFilter>     g_cellNodeFilter{ nullptr };
 		std::atomic<bool>           g_mainCullActive{ false };
 		std::atomic<const void*>    g_droppedAccumulator{ nullptr };
@@ -279,6 +280,7 @@ namespace CBRO::Hooks::CullGroups
 			std::atomic<std::uint64_t> childPushes{ 0 };
 			std::atomic<std::uint64_t> registrations{ 0 };
 			std::atomic<std::uint64_t> dropped{ 0 };  // registrations into the dropped accumulator
+			std::atomic<std::uint64_t> refused{ 0 };  // refused registrations handed to the refused observer
 		};
 		constexpr std::size_t              kCountSlots = 64;
 		std::array<CallCounts, kCountSlots> g_callCounts{};
@@ -550,6 +552,17 @@ namespace CBRO::Hooks::CullGroups
 			return reinterpret_cast<ChildPushFn>(g_childPushOriginal)(a_group, a_object, a_bound, a_flag, a_arg5, a_arg6, a_context);
 		}
 
+		// A registration the filters below refuse (all four register loops ignore the result, FO4-ENGINE-NOTES 5.2 item 6):
+		// the refused observer gets the call first, as the engine's own entry (1447420) would have got it.
+		bool Refuse(void* a_accumulator, RE::NiAVObject* a_object, CallCounts& a_counts) noexcept
+		{
+			if (const auto observer = g_refusedObserver.load(std::memory_order_relaxed)) {
+				Count(a_counts.refused);
+				observer(a_accumulator, a_object);
+			}
+			return true;
+		}
+
 		bool RegisterObjectThunk(void* a_accumulator, RE::NiAVObject* a_object)
 		{
 			auto& counts = LocalCounts();
@@ -562,16 +575,16 @@ namespace CBRO::Hooks::CullGroups
 			}
 			if (a_accumulator && a_accumulator == g_droppedAccumulator.load(std::memory_order_relaxed)) {
 				Count(counts.dropped);
-				return true;  // an emptied lamp shadow map (callers ignore the result)
+				return Refuse(a_accumulator, a_object, counts);  // an emptied lamp shadow map (callers ignore the result)
 			}
 			if (a_accumulator && a_accumulator == g_filteredAccumulator.load(std::memory_order_relaxed)) {
 				if (const auto filter = g_casterFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
-					return true;  // a caster that can't shadow a visible pixel (callers ignore the result)
+					return Refuse(a_accumulator, a_object, counts);  // a caster that can't shadow a visible pixel (callers ignore the result)
 				}
 			}
 			if (a_accumulator && a_accumulator == g_farAccumulator.load(std::memory_order_relaxed)) {
 				if (const auto filter = g_farFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
-					return true;  // a caster whose shadow lands on nothing visible in the sun's last cascade
+					return Refuse(a_accumulator, a_object, counts);  // a caster whose shadow lands on nothing visible in the sun's last cascade
 				}
 			}
 			if (const auto filter = g_sunFilter.load(std::memory_order_relaxed); filter && a_accumulator) {
@@ -582,7 +595,7 @@ namespace CBRO::Hooks::CullGroups
 					}
 					if (value == a_accumulator) {
 						if (filter(a_object)) {
-							return true;  // a caster kept in group 0 for a spot lamp alone: the sun doesn't need its shadow
+							return Refuse(a_accumulator, a_object, counts);  // a caster kept in group 0 for a spot lamp alone: the sun doesn't need its shadow
 						}
 						break;
 					}
@@ -591,7 +604,7 @@ namespace CBRO::Hooks::CullGroups
 			if (g_mainCullActive.load(std::memory_order_relaxed) && a_accumulator &&
 				a_accumulator == *reinterpret_cast<void* const*>(g_mainAccumulator)) {
 				if (const auto filter = g_mainViewFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
-					return true;  // left out of the main view (callers ignore the result)
+					return Refuse(a_accumulator, a_object, counts);  // left out of the main view (callers ignore the result)
 				}
 			}
 			// (both modes, after CBRO's main-view filter: the diagnostic compares what each mode draws)
@@ -1252,6 +1265,23 @@ namespace CBRO::Hooks::CullGroups
 	void SetMainRegistrationObserver(MainRegistrationObserver a_observer)
 	{
 		g_mainRegistrationObserver.store(a_observer);
+	}
+
+	void SetRefusedObserver(RefusedObserver a_observer) noexcept
+	{
+		g_refusedObserver.store(a_observer, std::memory_order_release);
+	}
+
+	std::uint64_t TakeRefusedRegistrations() noexcept
+	{
+		static std::uint64_t reported = 0;
+		std::uint64_t        total = 0;
+		for (const auto& slot : g_callCounts) {
+			total += slot.refused.load(std::memory_order_relaxed);
+		}
+		const auto since = total - reported;
+		reported = total;
+		return since;
 	}
 
 	void SetDroppedAccumulator(const void* a_accumulator) noexcept

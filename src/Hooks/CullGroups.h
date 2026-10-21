@@ -144,6 +144,12 @@ namespace CBRO::Hooks::CullGroups
 	// pointer, on whichever thread registers it. Null = none.
 	using MainRegistrationObserver = void (*)(RE::NiAVObject* a_object);
 	void SetMainRegistrationObserver(MainRegistrationObserver a_observer);
+	// Every registration the accumulator hook refuses (the dropped accumulator, the caster, far-cascade and sun-cascade
+	// filters, the main-view filter), on the registering thread, before the refusal returns: the call the engine's own
+	// RegisterObject (1447420) would have received (Core/TraceFeed). Null = none.
+	using RefusedObserver = void (*)(const void* a_accumulator, RE::NiAVObject* a_object);
+	void SetRefusedObserver(RefusedObserver a_observer) noexcept;
+	[[nodiscard]] std::uint64_t TakeRefusedRegistrations() noexcept;  // handed to it since the last call (main thread)
 	void SetCellNodeFilter(CellNodeFilter a_filter);
 	[[nodiscard]] std::uint64_t TakeGroupAddsConsidered() noexcept;  // main-only Group::Adds offered to the group filter
 	[[nodiscard]] std::string   TakeGroupAddSites(double a_frames);  // their callers (return addresses) since the last call, most frequent first
