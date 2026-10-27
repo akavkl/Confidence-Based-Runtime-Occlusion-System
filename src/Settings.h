@@ -63,6 +63,7 @@ namespace CBRO
 		bool          setDiff{ false };             // diagnostic: main-view registrations compared between the modes at each A/B location (Core/SetDiff)
 		bool          sampler{ false };            // diagnostic: the main thread's instruction pointer sampled by mode and stage (Core/Sampler)
 		bool          async{ true };               // verdicts judged by a worker after the cull, looked up by the walk a frame later (Core/Async); 0 = inside the walk
+		std::int32_t  cullingBatch{ 0 };           // CBRO frames: the engine's batched culling path, its groups processed as BSJobs jobs (v2.1): 1 on, 0 off, -1 as Fallout4.ini's bCullingBatch
 		bool          lampGroupTrim{ true };       // sun off: group-0 entries the main view doesn't need are left out when no lamp's shadow of them can reach a visible surface
 		bool          unoccludeLights{ true };     // CBRO frames: clear the previs-driven BSLight::bOccluded mark before the deferred-lights stage (dark lamps otherwise)
 		bool          lampDiagnostic{ false };      // diagnostic: the engine's shadow-light loop decisions per light in CBRO frames (Core/ShadowLights)

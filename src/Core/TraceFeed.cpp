@@ -36,6 +36,7 @@ namespace CBRO::Core::TraceFeed
 		bool                 g_on{ false };
 		bool                 g_retains{ false };
 		bool                 g_linked{ false };
+		bool                 g_jobCascades{ false };  // the linked tracer takes the batched cascades' job-thread registrations itself
 		std::uint32_t        g_mask{ 0 };
 		std::uint32_t        g_resend{ 0 };
 		float                g_radius{ 0.0f };
@@ -52,6 +53,44 @@ namespace CBRO::Core::TraceFeed
 		std::uint32_t                 g_lost{ 0 };
 
 		thread_local const void* t_lastHanded{ nullptr };
+
+		// The stage (v2.1): records handed over on job threads. A thread reserves kStageChunk slots at a time (one shared
+		// atomic add per chunk, not per record) and fills them in order; a reserved slot it never fills stays zero, which the
+		// merge skips. The merge runs only after the jobs that stage are done (their waits are the happens-before), clears what
+		// it read, and starts a new generation so that no thread writes into a chunk reserved before it.
+		constexpr std::uint32_t                kStageRecords = 1u << 15;  // 786 KB
+		constexpr std::uint32_t                kStageChunk = 64;
+		std::unique_ptr<CBRO_TraceRecord[]>    g_stage;
+		std::atomic<std::uint32_t>             g_stageTop{ 0 };
+		std::atomic<std::uint32_t>             g_stageGeneration{ 1 };
+		std::atomic<std::uint64_t>             g_stageLost{ 0 };
+		StageCounts                            g_stageCounts{};  // (main thread: the merge's)
+		struct StageCursor
+		{
+			std::uint32_t next{ 0 };
+			std::uint32_t end{ 0 };
+			std::uint32_t generation{ 0 };
+		};
+		thread_local StageCursor t_stage;
+
+		bool Stage(const CBRO_TraceRecord& a_record) noexcept
+		{
+			if (!g_stage || !a_record.object) {
+				return false;
+			}
+			const auto generation = g_stageGeneration.load(std::memory_order_acquire);
+			if (t_stage.generation != generation || t_stage.next == t_stage.end) {
+				const auto first = g_stageTop.fetch_add(kStageChunk, std::memory_order_relaxed);
+				if (first >= kStageRecords) {
+					t_stage = { 0, 0, generation };
+					g_stageLost.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				}
+				t_stage = { first, std::min(first + kStageChunk, kStageRecords), generation };
+			}
+			g_stage[t_stage.next++] = a_record;
+			return true;
+		}
 
 		Counts                     g_counts{};  // (main thread, but forgetting's)
 		std::atomic<std::uint64_t> g_forgetCalls{ 0 };
@@ -113,6 +152,7 @@ namespace CBRO::Core::TraceFeed
 		if (g_linkAllowed) {
 			g_known = std::make_unique<std::atomic<std::uintptr_t>[]>(std::size_t{ 1 } << kKnownBits);
 			g_batch.reserve(4096);
+			g_stage = std::make_unique<CBRO_TraceRecord[]>(kStageRecords);  // (zeroed: an unfilled slot reads as none)
 		}
 		logger::info("trace feed: {}", !g_allowed ? "off (bTraceFeed=0)" :
 		                               g_linkAllowed ? "on request (a path tracer's scene: Renderer Replacer); a tracer that keeps what it is handed gets each object once, through the direct link (bTraceLink=1)" :
@@ -129,15 +169,18 @@ namespace CBRO::Core::TraceFeed
 		const auto flags = g_linkAllowed ? g_requestedFlags.load(std::memory_order_relaxed) : 0u;
 		const bool retains = on && (flags & CBRO_TRACE_FEED_RETAINS) != 0;
 		const bool linked = retains && (flags & CBRO_TRACE_FEED_LINK) != 0;
+		const bool jobCascades = linked && (flags & CBRO_TRACE_FEED_JOB_CASCADES) != 0;
 		const auto resend = g_requestedResend.load(std::memory_order_relaxed);
 		const auto moverRadius = g_requestedMoverRadius.load(std::memory_order_relaxed);
-		if (on != g_on || (on && (mask != g_mask || radius != g_radius || retains != g_retains || linked != g_linked || resend != g_resend || moverRadius != g_moverRadius))) {
+		if (on != g_on || (on && (mask != g_mask || radius != g_radius || retains != g_retains || linked != g_linked || jobCascades != g_jobCascades || resend != g_resend || moverRadius != g_moverRadius))) {
 			if (!on) {
 				logger::info("trace feed: off");
 			} else if (retains) {
 				logger::info("trace feed: on, the tracer keeps what it is handed (v2): an object CBRO leaves out is handed once (its first turn: one frame in {}), again when it moves (every frame within {:.0f} units, one frame in {} farther) or {} | within {:.0f} units | {}",
 					mask + 1, moverRadius, kMoverFarMask + 1, resend ? std::format("once in {} frames", resend) : std::string("never otherwise"), radius,
-					linked ? "handovers through the direct link (batched records with their entries, GONE when an entry handed leaves its slot)" : "handovers through the refused callback");
+					linked ? jobCascades ? "handovers through the direct link (batched records with their entries, GONE when an entry handed leaves its slot); the batched cascades' job-thread registrations taken by the tracer itself" :
+					                       "handovers through the direct link (batched records with their entries, GONE when an entry handed leaves its slot); the batched cascades' job-thread registrations forwarded through it" :
+					         "handovers through the refused callback");
 			} else {
 				logger::info("trace feed: on (refused registrations handed over; what CBRO leaves out filed once every {} frames, and when it moves, within {:.0f} units)", mask + 1, radius);
 			}
@@ -152,6 +195,7 @@ namespace CBRO::Core::TraceFeed
 		g_on = on;
 		g_retains = retains;
 		g_linked = linked;
+		g_jobCascades = jobCascades;
 		g_mask = mask;
 		g_resend = resend;
 		g_radius = radius;
@@ -173,6 +217,11 @@ namespace CBRO::Core::TraceFeed
 	bool Linked() noexcept
 	{
 		return g_linked;
+	}
+
+	bool ForwardsCascades() noexcept
+	{
+		return g_linked && !g_jobCascades;
 	}
 
 	bool Turn(const void* a_object, std::uint32_t a_clock) noexcept
@@ -248,11 +297,57 @@ namespace CBRO::Core::TraceFeed
 		if (!a_geometry) {
 			return;
 		}
-		if (g_linked && GetCurrentThreadId() == g_mainThread) {
-			Append({ reinterpret_cast<std::uintptr_t>(a_geometry), reinterpret_cast<std::uintptr_t>(a_anchor), a_kind, a_flags });
-			return;
+		if (g_linked) {
+			const CBRO_TraceRecord record{ reinterpret_cast<std::uintptr_t>(a_geometry), reinterpret_cast<std::uintptr_t>(a_anchor), a_kind, a_flags };
+			if (GetCurrentThreadId() == g_mainThread) {
+				Append(record);
+				return;
+			}
+			if (Stage(record)) {
+				return;  // (a job thread of the batched path: merged after its jobs)
+			}
 		}
 		Hooks::CullGroups::HandToTracer(a_geometry);
+	}
+
+	void StageCascade(RE::NiAVObject* a_geometry) noexcept
+	{
+		if (g_linked && a_geometry) {
+			(void)Stage({ reinterpret_cast<std::uintptr_t>(a_geometry), 0, CBRO_TRACE_TAKE, 0 });
+		}
+	}
+
+	void MergeStaged() noexcept
+	{
+		if (!g_stage) {
+			return;
+		}
+		const auto top = std::min(g_stageTop.load(std::memory_order_acquire), kStageRecords);
+		if (top == 0) {
+			return;
+		}
+		for (std::uint32_t i = 0; i < top; ++i) {
+			auto& record = g_stage[i];
+			if (!record.object) {
+				continue;  // (the unfilled rest of a thread's chunk)
+			}
+			if (g_linked) {
+				Append(record);
+				++(record.anchor ? g_stageCounts.handovers : g_stageCounts.cascades);
+			}
+			record = {};
+		}
+		++g_stageCounts.merges;
+		g_stageTop.store(0, std::memory_order_relaxed);
+		g_stageGeneration.fetch_add(1, std::memory_order_release);
+	}
+
+	StageCounts TakeStageCounts() noexcept
+	{
+		auto out = g_stageCounts;
+		g_stageCounts = {};
+		out.lost = g_stageLost.exchange(0, std::memory_order_relaxed);
+		return out;
 	}
 
 	void Gone(const void* a_anchor) noexcept

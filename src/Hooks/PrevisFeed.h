@@ -80,6 +80,7 @@ namespace CBRO::Hooks::PrevisFeed
 		std::uint32_t preCull{ 0 };    // cull windows opened by the pre-cull wrapper
 		std::uint32_t cullBegin{ 0 };  // ... opened at the cull begin instead (switch frames, or no pre-cull wrapper)
 		std::uint32_t cascade{ 0 };    // cascade windows
+		std::uint32_t batchedCascade{ 0 };  // ... on the batched path (v2.1: open from 339369+0x185 to the shadow stage's begin)
 		std::uint32_t lamp{ 0 };       // lamp windows (spot-light group-0 culls)
 		std::uint32_t rain{ 0 };       // rain windows (the rain map in a frame whose query was skipped)
 		std::uint32_t querySkips{ 0 }; // frames whose previs query was skipped (launch and collect)
@@ -110,7 +111,19 @@ namespace CBRO::Hooks::PrevisFeed
 	// Run inside the cascade window of a CBRO frame, previs suspended, before the cascade cull (main thread; v1.99.3: the
 	// group-0 entries held back from the main view are filed there). Null = none.
 	void SetCascadeOpenCallback(void (*a_callback)()) noexcept;
-	[[nodiscard]] bool CascadeWindowReady() noexcept;  // the cascade site is wrapped
+	[[nodiscard]] bool CascadeWindowReady(bool a_batched) noexcept;  // the cascade site of that path is wrapped
+
+	// The batched path's cascade window (v2.1; FO4OG 3, 6.1): 339369 (Render_PreUI+0x175, every frame) calls 432406 at
+	// +0x185, which with bCullingBatch and directional shadows runs the light's update and tail-jumps to the cascade cull;
+	// that cull submits the cascades as BSJobs jobs and returns, and the jobs read previs's state when they run, until the
+	// cascade render waits for them (slot 10, 1108521+0xEB4). So in a CBRO frame the window opens at that call (previs
+	// suspended, the cascade-open callback run) and stays open: Runtime waits for the jobs at the shadow stage's begin
+	// (CullGroups::WaitForBatch), then closes it (EndBatchedCascades). Main thread.
+	[[nodiscard]] bool BatchedCascadesPending() noexcept;  // the window opened this frame and the jobs aren't waited for yet
+	void EndBatchedCascades() noexcept;                    // after the wait: previs's byte as the engine had it
+	[[nodiscard]] std::uintptr_t BatchedCascadeThunkAddress() noexcept;
+	[[nodiscard]] std::uintptr_t BatchedCascadePrevious() noexcept;
+	[[nodiscard]] std::uint64_t  BatchedCascadeCalls() noexcept;  // the wrapper's calls so far (every frame: CullGroups' path proof)
 
 	// A culling group's six frustum planes (NiPlane {n, d}, 16 bytes each, at group+0). False if unreadable.
 	[[nodiscard]] bool GroupPlanes(const void* a_group, float a_planes[6][4]) noexcept;

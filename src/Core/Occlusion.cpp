@@ -2877,19 +2877,19 @@ namespace CBRO::Core::Occlusion
 			std::uint8_t          flags{ 0 };
 			float                 bound[4]{};
 		};
-		// This frame's top decisions by object, per thread (direct-mapped): the engine files a node's children only when it
-		// finishes the block the node sits in, hundreds of entries after the node's own decision (FO4-ENGINE-NOTES 5.2), so
-		// the last decision alone never matched (v1.98 measured none).
-		constexpr std::size_t kTopTableSize = 4096;
-		thread_local std::array<TopRecord, kTopTableSize>* t_topTable{ nullptr };
+		// This frame's top decisions by object (direct-mapped): the engine files a node's children only when it finishes the
+		// block the node sits in, hundreds of entries after the node's own decision (FO4-ENGINE-NOTES 5.2), so the last
+		// decision alone never matched (v1.98 measured none). One table for all threads (v2.1; per thread up to v2.0): the
+		// top-level decisions are made on the main thread, in the walk and Group::Add, all before DrawWorld's cull hands its
+		// groups to jobs on the batched path (FO4OG 3), where children on job threads read them. Written on the main thread only.
+		constexpr std::size_t                     kTopTableSize = 4096;
+		std::array<TopRecord, kTopTableSize>      g_topTable{};
+		std::atomic<bool>                         g_batchedFrame{ false };  // (SetBatched)
 
 		TopRecord& TopSlot(const RE::NiAVObject* a_object) noexcept
 		{
-			if (!t_topTable) [[unlikely]] {
-				t_topTable = new std::array<TopRecord, kTopTableSize>();
-			}
 			const auto address = reinterpret_cast<std::uintptr_t>(a_object);
-			return (*t_topTable)[((address >> 5) ^ (address >> 17)) & (kTopTableSize - 1)];
+			return g_topTable[((address >> 5) ^ (address >> 17)) & (kTopTableSize - 1)];
 		}
 
 		const TopRecord* TopOf(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
@@ -2953,9 +2953,11 @@ namespace CBRO::Core::Occlusion
 			return static_cast<std::size_t>(((reinterpret_cast<std::uintptr_t>(a_node) >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - 15));
 		}
 
+		// (not on the batched path, v2.1: the jobs finish the groups' blocks in no fixed order, each into its own SubGroup, and
+		// on other threads; the nodes go into the top table, which the jobs read)
 		bool StableIndexOn() noexcept
 		{
-			return g_tunables.stableIndex && GetCurrentThreadId() == g_mainThreadId;
+			return g_tunables.stableIndex && GetCurrentThreadId() == g_mainThreadId && !g_batchedFrame.load(std::memory_order_relaxed);
 		}
 
 		void ClearParentSequences() noexcept
@@ -4296,7 +4298,9 @@ namespace CBRO::Core::Occlusion
 		// number, id 734919), radius under 600, whose distance fade is at or below fFadeInThreshold: an object behind a
 		// pillar for a third of a second faded in again from nothing when the pillar uncovered it ("popping up"). Previs
 		// never let that happen: its entries get OnVisible every frame, even behind the camera. So the counter is kept
-		// current, as OnVisible would; the fade value itself is left as it was. Main thread (the walk).
+		// current, as OnVisible would; the fade value itself is left as it was. Main thread (the walk), and for children on
+		// the batched path (v2.1) the jobs' threads: there the engine's own finish runs OnVisible and its fade update (928617)
+		// on those threads as well (558046 from BatchProcessNodeCuller, FO4OG 3), a node in one job.
 		constexpr std::uint64_t kFrameNumberID = 734919;
 		constexpr std::size_t   kFadeFrameCounterOffset = 0x1B0;
 		constexpr std::size_t   kFadeCurrentOffset = 0x1A0;       // BSFadeNode::currentFade
@@ -4772,12 +4776,13 @@ namespace CBRO::Core::Occlusion
 			return true;
 		}
 
-		// A piece (Block::Add) filed for the trace alone, handed through the link instead (v2.0): a geometry, on the main
-		// thread. True when handed: the caller rejects it (hidden) or lets the frustum test leave it out (out of view), with
-		// no force mark and no main-view drop. Its anchor is the fade node filing it, else its parent.
+		// A piece (Block::Add) filed for the trace alone, handed through the link instead (v2.0): a geometry. True when
+		// handed: the caller rejects it (hidden) or lets the frustum test leave it out (out of view), with no force mark and
+		// no main-view drop. Its anchor is the fade node filing it, else its parent. On a job thread of the batched path
+		// (v2.1) the record is staged and joins the link's batch after the cull (TraceFeed::MergeStaged).
 		bool HandChild(const Hooks::CullGroups::BlockAdd& a_add, std::uint32_t a_flags) noexcept
 		{
-			if (!TraceFeed::Linked() || !Hooks::CullGroups::TracerWanted() || GetCurrentThreadId() != g_mainThreadId || !a_add.object->IsGeometry()) {
+			if (!TraceFeed::Linked() || !Hooks::CullGroups::TracerWanted() || !a_add.object->IsGeometry()) {
 				return false;
 			}
 			const auto filing = Hooks::CullGroups::FadeNodeFiling();
@@ -4815,11 +4820,14 @@ namespace CBRO::Core::Occlusion
 		// A group-0 entry the main view leaves out and the sun's cascades need (a confirmed-hidden caster): held back from the
 		// main view, filed in the cascade cull's window; OnVisible now, as the main view's finish would have run it, and its
 		// pieces to the tracer, as the refusals of their registrations handed them (SunOnlyHandDue). Only with the sun up
-		// (the cascade cull opens the window every frame then) and for a geometry or a fade node.
+		// (the cascade cull opens the window every frame then) and for a geometry or a fade node. Never in a batched frame
+		// (v2.1.1): the cascades' batch reuses the SubGroups DrawWorld's batch reserved for group 0, one per non-empty node
+		// block, unchecked (FO4OG 3), so a node filed into group 0 between the two batches overran them (the 21:59 crash in
+		// BatchProcessNodeCuller); such a drop takes the drop set's path instead.
 		bool DeferSunOnly(const FrameContext& a_context, RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
 		{
 			if (!g_tunables.deferSunOnly || !t_decisionGroup || a_context.sun.state != FrameContext::Sun::State::kOn ||
-				!Hooks::PrevisFeed::CascadeWindowReady() || GetCurrentThreadId() != g_mainThreadId) {
+				g_batchedFrame.load(std::memory_order_relaxed) || !Hooks::PrevisFeed::CascadeWindowReady(false) || GetCurrentThreadId() != g_mainThreadId) {
 				return false;
 			}
 			const bool hand = Hooks::CullGroups::TracerWanted() && SunOnlyHandDue(a_context, a_object, a_bound);
@@ -5778,6 +5786,8 @@ namespace CBRO::Core::Occlusion
 				}
 			}
 			if (recorded) {
+			} else if (GetCurrentThreadId() != g_mainThreadId) {
+				// (the top table is written on the main thread only: other threads read it, v2.1)
 			} else if (!skip && judged && !force) {
 				auto& top = TopSlot(a_object);
 				top.object = a_object;
@@ -7328,6 +7338,11 @@ namespace CBRO::Core::Occlusion
 	void SetActive(bool a_active)
 	{
 		g_active.store(a_active);
+	}
+
+	void SetBatched(bool a_batched) noexcept
+	{
+		g_batchedFrame.store(a_batched, std::memory_order_relaxed);
 	}
 
 	void JudgeAsync(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add, const Record* a_old, bool a_wantSun, Record& a_out)

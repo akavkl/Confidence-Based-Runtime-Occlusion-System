@@ -215,6 +215,43 @@ namespace CBRO::Hooks::CullGroups
 	};
 	[[nodiscard]] EngineFlags ReadEngineFlags() noexcept;
 
+	// ---- the batched culling path (v2.1, iCullingBatch; FO4OG 3) ------------------------------------------------------
+	// bCullingBatch:General's byte (938585, .data; only CullingJob::QBatchEnabled reads it) picks the path DrawWorld's cull
+	// (718911), the sun's cascade cull (432406 -> 1390075), the shadow stage (1108521) and the cascade render (slot 10,
+	// 871921) take. CBRO writes it at the cull stage's begin, before any of them reads it that frame. On the batched path
+	// DrawWorld's cull submits its groups as BSJobs jobs and waits for them before it returns (718911+0x753), so the main
+	// view's filing and registrations, with CBRO's filters, run on job threads inside the cull stage; the cascades' jobs are
+	// submitted at Render_PreUI+0x175 and waited for by the cascade render, or earlier by WaitForBatch.
+	// The value Fallout4.ini gave the byte (read at Install), and whether the engine's batch object exists.
+	[[nodiscard]] bool IniCullingBatch() noexcept;
+	[[nodiscard]] bool BatchAvailable() noexcept;
+	// The byte for this frame (main thread, at the cull stage's begin; any batch still running is waited for before a
+	// change). Returns what the byte holds now (false when the batch object is missing).
+	bool SetCullingBatch(bool a_batched) noexcept;
+	// The engine's wait for the batch's submitted jobs (1502924: returns at once when none are pending). QPC ticks waited.
+	// Main thread.
+	std::int64_t WaitForBatch() noexcept;
+	// A batched frame's sun cascade registrations made off the frame thread go to a_forward as well (refused ones too,
+	// instead of the refused observer): Core/TraceFeed hands them to a linked tracer, which takes shadow-map
+	// registrations only from the frame thread. Armed at the cull begin with the batched light's cascade accumulators
+	// (ShadowSceneNode 1327069 +0x208, as 432406 takes it; the light's update creates an accumulator only when missing),
+	// disarmed once the cascades' jobs are done. Main thread.
+	using CascadeForward = void (*)(RE::NiAVObject* a_object);
+	bool ArmCascadeForward(CascadeForward a_forward) noexcept;
+	void DisarmCascadeForward() noexcept;
+	// Job-thread activity since the last call (main thread).
+	struct BatchCounts
+	{
+		std::uint64_t mainWaits{ 0 };         // DrawWorld's cull waiting for its jobs (718911+0x753)
+		std::int64_t  mainWaitTicks{ 0 };     // ... QPC ticks
+		std::uint64_t jobBlockAdds{ 0 };      // main-pass Block::Adds CBRO's filter saw off the frame thread while DrawWorld culled
+		std::uint64_t jobRegistrations{ 0 };  // registrations the hook saw off the frame thread while DrawWorld culled or the forward was armed
+		std::uint64_t jobPrevisActive{ 0 };   // ... of those, made while previs was active (its job gates then skip blocks: must be 0)
+		std::uint64_t jobUnknownGroup{ 0 };   // ... Block::Adds whose group CBRO could not tell (must be 0)
+		std::uint64_t forwarded{ 0 };         // cascade registrations given to the forward
+	};
+	[[nodiscard]] BatchCounts TakeBatchCounts() noexcept;
+
 	// Owner value shared by DrawWorld's culling groups (0 before DrawWorld initialized).
 	[[nodiscard]] std::uintptr_t MainOwner() noexcept;
 

@@ -41,6 +41,15 @@ namespace CBRO::Hooks::CullGroups
 		constexpr std::size_t   kDirLightUpdateSlot = 14;
 		constexpr std::uint64_t kGroupsEnabledID = 938585;   // byte: the value of the INI setting bCullingBatch:General
 		constexpr std::uint64_t kDirShadowsID = 241042;      // byte
+		// The batched path (v2.1; FO4OG 3, Ghidra 2026-10-27): CullingJob::BatchCull (504506 stores itself in 1574716; 327246
+		// and 645297 create it when the global is null) holds a manual-reset event at +0x38 that its JobList (+0x40) sets
+		// when the list's last segment of jobs is done (JobListLocal::RunJobsInternal). 1502924 = 1412530(batch): with
+		// records added (count +0x18 != 0) WaitForSingleObjectEx on that event, the records' accumulators released, count
+		// 0; with none it returns at once. DrawWorld's cull calls it at +0x753, before it cleans its groups up.
+		constexpr std::uint64_t kBatchObjectID = 1574716;
+		constexpr std::uint64_t kBatchWaitID = 1502924;
+		constexpr std::size_t   kBatchWaitCallOffset = 0x753;
+		constexpr std::size_t   kCascadeTailJumpOffset = 0x5C;  // 432406: jmp 1390075 (light, group 0), after its own bCullingBatch and directional-shadows tests
 		constexpr std::uint64_t kShadowSceneNodeID = 1327069;     // ShadowSceneNode* the batched path takes its light from
 		constexpr std::uint64_t kUnbatchedSceneNodeID = 879298;   // ShadowSceneNode* the unbatched path takes its light from
 		constexpr std::uint64_t kDirLightVtableID = 97945;     // BSShadowDirectionalLight
@@ -287,6 +296,12 @@ namespace CBRO::Hooks::CullGroups
 			std::atomic<std::uint64_t> refused{ 0 };  // refused registrations handed to the refused observer
 			std::atomic<std::uint64_t> considered{ 0 };  // main-only Group::Adds offered to the group filter (one shared locked add up to v1.92.2)
 			std::atomic<std::uint64_t> refusedTicks{ 0 };  // QPC ticks inside the observer's callback, 1 call in 16 (v1.93; TakeRefusedTicks scales it)
+			// The batched path (v2.1): what the hooks saw off the frame thread (BatchCounts).
+			std::atomic<std::uint64_t> jobBlockAdds{ 0 };
+			std::atomic<std::uint64_t> jobRegistrations{ 0 };
+			std::atomic<std::uint64_t> jobPrevisActive{ 0 };
+			std::atomic<std::uint64_t> jobUnknownGroup{ 0 };
+			std::atomic<std::uint64_t> forwarded{ 0 };
 		};
 		constexpr std::size_t              kCountSlots = 64;
 		std::array<CallCounts, kCountSlots> g_callCounts{};
@@ -305,6 +320,60 @@ namespace CBRO::Hooks::CullGroups
 		void Count(std::atomic<std::uint64_t>& a_counter) noexcept
 		{
 			a_counter.store(a_counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		}
+
+		// The batched path (v2.1). The thread DrawWorld's cull runs on (SetMainCullActive): a call from any other thread is a
+		// job's. The cascade forward: this frame's cascade accumulators (null-terminated) and where their job-thread
+		// registrations go.
+		std::atomic<DWORD>                                g_frameThread{ 0 };
+		std::array<std::atomic<const void*>, kMaxCascades> g_forwardAccumulators{};
+		std::atomic<CascadeForward>                       g_cascadeForward{ nullptr };
+		std::uintptr_t                                    g_batchObject{ 0 };
+		std::uintptr_t                                    g_batchWait{ 0 };
+		std::uintptr_t                                    g_mainWaitSite{ 0 };      // 718911+0x753, wrapped for its time (MainBatchWaitThunk)
+		std::uintptr_t                                    g_mainWaitPrevious{ 0 };
+		std::uint64_t                                     g_mainWaits{ 0 };         // (main thread)
+		std::int64_t                                      g_mainWaitTicks{ 0 };
+		std::uint8_t                                      g_iniCullingBatch{ 0 };   // the byte as the game set it from Fallout4.ini (captured before CBRO first writes it)
+		bool                                              g_iniCaptured{ false };
+		bool                                              g_batchMissingWarned{ false };
+		BatchCounts                                       g_batchReported{};        // running totals at the last TakeBatchCounts
+
+		// DrawWorld's cull waiting for its jobs (718911+0x753 -> 1502924, no arguments): timed for the log.
+		void MainBatchWaitThunk()
+		{
+			LARGE_INTEGER before{}, after{};
+			QueryPerformanceCounter(&before);
+			reinterpret_cast<void (*)()>(g_mainWaitPrevious)();
+			QueryPerformanceCounter(&after);
+			g_mainWaitTicks += after.QuadPart - before.QuadPart;
+			++g_mainWaits;
+		}
+
+		bool OffFrameThread() noexcept
+		{
+			return GetCurrentThreadId() != g_frameThread.load(std::memory_order_relaxed);
+		}
+
+		// A registration into one of this frame's cascade accumulators, made off the frame thread while the forward is armed:
+		// given to the forward (true).
+		bool ForwardCascade(const void* a_accumulator, RE::NiAVObject* a_object) noexcept
+		{
+			const auto forward = g_cascadeForward.load(std::memory_order_acquire);
+			if (!forward || !a_accumulator || !a_object || !OffFrameThread()) {
+				return false;
+			}
+			for (const auto& accumulator : g_forwardAccumulators) {
+				const auto value = accumulator.load(std::memory_order_relaxed);
+				if (!value) {
+					return false;
+				}
+				if (value == a_accumulator) {
+					forward(a_object);
+					return true;
+				}
+			}
+			return false;
 		}
 
 		// The group whose Group::Add or ChildPush is running on this thread (Block::Add's only callers).
@@ -452,6 +521,17 @@ namespace CBRO::Hooks::CullGroups
 			};
 			// CBRO only acts on DrawWorld's own cull (a later pass re-processing a group is left alone).
 			const bool culling = add.mainPass && active;
+			if (culling && OffFrameThread()) {
+				// (the batched path, v2.1: a job of DrawWorld's cull; its block tests run only with previs inactive, FO4OG 3)
+				auto& counts = LocalCounts();
+				Count(counts.jobBlockAdds);
+				if (kind == GroupKind::kUnknown) {
+					Count(counts.jobUnknownGroup);
+				}
+				if (PrevisFeed::ActiveNow()) {
+					Count(counts.jobPrevisActive);
+				}
+			}
 
 			// Continuation calls (startIndex >= 0) only add more instance entries of a merged mesh.
 			const RE::NiBound* replacement = nullptr;
@@ -603,9 +683,13 @@ namespace CBRO::Hooks::CullGroups
 		}
 
 		// A registration the filters below refuse (all four register loops ignore the result, FO4-ENGINE-NOTES 5.2 item 6):
-		// the refused observer gets the call first, as the engine's own entry (1447420) would have got it.
-		bool Refuse(void* a_accumulator, RE::NiAVObject* a_object, CallCounts& a_counts) noexcept
+		// the refused observer gets the call first, as the engine's own entry (1447420) would have got it. a_forwarded: the
+		// cascade forward has it already (v2.1).
+		bool Refuse(void* a_accumulator, RE::NiAVObject* a_object, CallCounts& a_counts, bool a_forwarded = false) noexcept
 		{
+			if (a_forwarded) {
+				return true;
+			}
 			if (const auto observer = g_refusedObserver.load(std::memory_order_relaxed)) {
 				Count(a_counts.refused);
 				if ((a_counts.refused.load(std::memory_order_relaxed) & 15) == 0) {  // (sampled 1 in 16 per thread: the callback's own time)
@@ -631,18 +715,30 @@ namespace CBRO::Hooks::CullGroups
 			if (a_accumulator && a_accumulator == g_countedAccumulator.load(std::memory_order_relaxed)) {
 				g_countedRegistrations.fetch_add(1, std::memory_order_relaxed);  // (offered: dropped ones too)
 			}
+			// The batched path (v2.1): a cascade's registration on a job thread goes to the tracer through the link, refused or
+			// not, as the tracer takes a cascade's registrations on the frame thread itself (Core/TraceFeed).
+			const bool forwarded = ForwardCascade(a_accumulator, a_object);
+			if (forwarded) {
+				Count(counts.forwarded);
+			}
+			if ((forwarded || g_mainCullActive.load(std::memory_order_relaxed)) && OffFrameThread()) {
+				Count(counts.jobRegistrations);
+				if (PrevisFeed::ActiveNow()) {
+					Count(counts.jobPrevisActive);
+				}
+			}
 			if (a_accumulator && a_accumulator == g_droppedAccumulator.load(std::memory_order_relaxed)) {
 				Count(counts.dropped);
-				return Refuse(a_accumulator, a_object, counts);  // an emptied lamp shadow map (callers ignore the result)
+				return Refuse(a_accumulator, a_object, counts, forwarded);  // an emptied lamp shadow map (callers ignore the result)
 			}
 			if (a_accumulator && a_accumulator == g_filteredAccumulator.load(std::memory_order_relaxed)) {
 				if (const auto filter = g_casterFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
-					return Refuse(a_accumulator, a_object, counts);  // a caster that can't shadow a visible pixel (callers ignore the result)
+					return Refuse(a_accumulator, a_object, counts, forwarded);  // a caster that can't shadow a visible pixel (callers ignore the result)
 				}
 			}
 			if (a_accumulator && a_accumulator == g_farAccumulator.load(std::memory_order_relaxed)) {
 				if (const auto filter = g_farFilter.load(std::memory_order_relaxed); filter && filter(a_object)) {
-					return Refuse(a_accumulator, a_object, counts);  // a caster whose shadow lands on nothing visible in the sun's last cascade
+					return Refuse(a_accumulator, a_object, counts, forwarded);  // a caster whose shadow lands on nothing visible in the sun's last cascade
 				}
 			}
 			if (const auto filter = g_sunFilter.load(std::memory_order_relaxed); filter && a_accumulator) {
@@ -653,7 +749,7 @@ namespace CBRO::Hooks::CullGroups
 					}
 					if (value == a_accumulator) {
 						if (filter(a_object)) {
-							return Refuse(a_accumulator, a_object, counts);  // a caster kept in group 0 for a spot lamp alone: the sun doesn't need its shadow
+							return Refuse(a_accumulator, a_object, counts, forwarded);  // a caster kept in group 0 for a spot lamp alone: the sun doesn't need its shadow
 						}
 						break;
 					}
@@ -1243,14 +1339,14 @@ namespace CBRO::Hooks::CullGroups
 			if (thunk != 0 && landing == thunk && RenderStages::OriginalOf(Stage::kSunCascades) == a_target) {
 				return true;
 			}
-			// Likewise CBRO's cascade-window wrapper on 1108521+0xE49 (Hooks/PrevisFeed), chained to the engine's cull.
+			// Likewise CBRO's cascade-window wrapper on 1108521+0xE49 (Hooks/PrevisFeed), chained to the engine's cull, and its
+			// batched one on 339369+0x185 (v2.1), chained to 432406.
 			const auto window = PrevisFeed::CascadeCullThunkAddress();
-			return window != 0 && landing == window && PrevisFeed::CascadeCullPrevious() == a_target;
-		}
-
-		bool Intact(const std::array<CallSite, 2>& a_path) noexcept
-		{
-			return CallsTo(a_path[0].site, a_path[0].target) && CallsTo(a_path[1].site, a_path[1].target);
+			if (window != 0 && landing == window && PrevisFeed::CascadeCullPrevious() == a_target) {
+				return true;
+			}
+			const auto batched = PrevisFeed::BatchedCascadeThunkAddress();
+			return batched != 0 && landing == batched && PrevisFeed::BatchedCascadePrevious() == a_target;
 		}
 
 		// A plugin that wraps a site after CBRO did fails CallsTo, though the engine's function still runs beneath it:
@@ -1260,7 +1356,7 @@ namespace CBRO::Hooks::CullGroups
 		// engine's when CBRO's hook there ran since the previous check (the last frame's cascades: they run after the
 		// cull) and chains to the engine's function. CBRO's cascade wrapper sits inside the engine's stage function, so
 		// its call proves that function ran too, in either load order. Without directional shadows the stage never
-		// reaches the cascade cull's call. The batched path has no CBRO hook to give such proof.
+		// reaches the cascade cull's call. (The batched path: BatchedIntact, below.)
 		std::uint64_t g_stageEntriesSeen{ 0 };
 		std::uint64_t g_cascadeCallsSeen{ 0 };
 
@@ -1275,6 +1371,24 @@ namespace CBRO::Hooks::CullGroups
 			g_cascadeCallsSeen = calls;
 			return (stageRan || cullRan || CallsTo(g_unbatchedPath[0].site, g_unbatchedPath[0].target)) &&
 			       (!a_dirShadows || cullRan || CallsTo(g_unbatchedPath[1].site, g_unbatchedPath[1].target));
+		}
+
+		// The batched path (v2.1) has that proof too: 339369 runs every frame and calls 432406 at +0x185 unconditionally
+		// (432406 makes its own bCullingBatch and directional-shadows tests; Ghidra 2026-10-27), so CBRO's window wrapper there
+		// (Hooks/PrevisFeed) runs every frame, under whatever wraps Render_PreUI+0x175 (Renderer Replacer's stage stub),
+		// and its call since the last check proves both calls. 432406's tail jump to the cascade cull (+0x5C) is read too.
+		std::uint64_t g_batchedCallsSeen{ 0 };
+		std::uintptr_t g_cascadeTailJump{ 0 };
+
+		bool BatchedIntact() noexcept
+		{
+			const auto calls = PrevisFeed::BatchedCascadeCalls();
+			const bool ran = calls != g_batchedCallsSeen && PrevisFeed::BatchedCascadePrevious() == g_batchedPath[1].target;
+			g_batchedCallsSeen = calls;
+			const auto* jump = reinterpret_cast<const std::uint8_t*>(g_cascadeTailJump);
+			const bool  tail = jump && jump[0] == 0xE9 &&
+			                  g_cascadeTailJump + 5 + *reinterpret_cast<const std::int32_t*>(jump + 1) == CBRO::Engine::OG(kCascadeCullID).address();
+			return tail && (ran || (CallsTo(g_batchedPath[0].site, g_batchedPath[0].target) && CallsTo(g_batchedPath[1].site, g_batchedPath[1].target)));
 		}
 
 		// Once per session, when the path stays unverified for a while (a single frame can lack the proof, e.g. the
@@ -1308,6 +1422,7 @@ namespace CBRO::Hooks::CullGroups
 			g_unbatchedPath = { CallSite{ preUI + kUnbatchedCallOffset, unbatchedCaller }, CallSite{ unbatchedCaller + kUnbatchedCullCallOffset, CBRO::Engine::OG(kCascadeCullID).address() } };
 			g_dirLightUpdateSlot = g_dirLightVtable + sizeof(std::uintptr_t) * kDirLightUpdateSlot;
 			g_dirLightUpdate = CBRO::Engine::OG(kDirLightUpdateID).address();
+			g_cascadeTailJump = CBRO::Engine::OG(kBatchedSetupID).address() + kCascadeTailJumpOffset;
 			g_unbatchedSceneNode = CBRO::Engine::OG(kUnbatchedSceneNodeID).address();
 			const auto describe = [](const std::array<CallSite, 2>& a_path) {
 				return std::format(
@@ -1544,6 +1659,21 @@ namespace CBRO::Hooks::CullGroups
 		g_shadowRange = CBRO::Engine::OG(kShadowRangeID).address();
 		g_godrayCascades = CBRO::Engine::OG(kGodrayCascadesID).address();
 		ResolveSunPath();
+		g_batchObject = CBRO::Engine::OG(kBatchObjectID).address();
+		g_batchWait = CBRO::Engine::OG(kBatchWaitID).address();
+		if (Settings::Get().cullingBatch != 0) {
+			// (DrawWorld's cull waiting for its jobs, timed for the log: the main thread's share of the batched path)
+			g_mainWaitSite = CBRO::Engine::OG(kDrawWorldCullID).address() + kBatchWaitCallOffset;
+			if (Util::ReadCall5Target(g_mainWaitSite) == g_batchWait) {
+				g_mainWaitPrevious = Util::WriteCall5(g_mainWaitSite, Util::FnAddr(&MainBatchWaitThunk), "cullgroups:DrawWorld cull's batch wait");
+			} else {
+				logger::warn("cullgroups: {} is not the engine's call of 1502924 (another plugin patched it): DrawWorld's wait for its jobs is not timed", Util::DescribeCodeAddress(g_mainWaitSite));
+			}
+		}
+		logger::info(
+			"cullgroups: culling path in CBRO frames: iCullingBatch {} ({}); previs frames keep Fallout4.ini's bCullingBatch (read at the first frame)",
+			Settings::Get().cullingBatch,
+			Settings::Get().cullingBatch < 0 ? "as Fallout4.ini has it" : Settings::Get().cullingBatch > 0 ? "batched: the groups processed as BSJobs jobs" : "unbatched, the engine's default");
 		g_blockAddOriginal = Util::DetourSwitchable(g_blockAddHook, CBRO::Engine::OG(kBlockAddID).address(), Util::FnAddr(&BlockAddThunk), kBlockAddPrologue, "cullgroups:Block::Add");
 		g_groupAddOriginal = Util::DetourSwitchable(g_groupAddHook, CBRO::Engine::OG(kGroupAddID).address(), Util::FnAddr(&GroupAddThunk), kGroupAddPrologue, "cullgroups:Group::Add");
 		g_childPushOriginal = Util::DetourSwitchable(g_childPushHook, CBRO::Engine::OG(kChildPushID).address(), Util::FnAddr(&ChildPushThunk), kChildPushPrologue, "cullgroups:ChildPush");
@@ -1606,6 +1736,7 @@ namespace CBRO::Hooks::CullGroups
 
 	void SetMainCullActive(bool a_active) noexcept
 	{
+		g_frameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);  // (DrawWorld's thread: called at its cull stage's begin and end)
 		g_mainCullActive.store(a_active, std::memory_order_release);
 	}
 
@@ -1642,6 +1773,120 @@ namespace CBRO::Hooks::CullGroups
 			return {};
 		}
 		return { *reinterpret_cast<const std::uint8_t*>(g_groupsEnabled) != 0, *reinterpret_cast<const std::uint8_t*>(g_dirShadows) != 0 };
+	}
+
+	bool IniCullingBatch() noexcept
+	{
+		if (!g_iniCaptured && g_groupsEnabled) {
+			g_iniCaptured = true;
+			g_iniCullingBatch = *reinterpret_cast<const std::uint8_t*>(g_groupsEnabled);
+			logger::info("cullgroups: bCullingBatch as Fallout4.ini set it: {}", g_iniCullingBatch);
+		}
+		return g_iniCullingBatch != 0;
+	}
+
+	bool BatchAvailable() noexcept
+	{
+		return g_groupsEnabled && g_batchWait && g_batchObject && *reinterpret_cast<const std::uintptr_t*>(g_batchObject) != 0;
+	}
+
+	bool SetCullingBatch(bool a_batched) noexcept
+	{
+		if (!g_groupsEnabled) {
+			return false;
+		}
+		(void)IniCullingBatch();  // (captured before the first write)
+		const bool available = BatchAvailable();
+		if (a_batched && !available && !g_batchMissingWarned) {
+			g_batchMissingWarned = true;
+			logger::warn("cullgroups: the batched culling path was asked for, but the engine's batch object (1574716) doesn't exist: unbatched");
+		}
+		const std::uint8_t want = a_batched && available ? 1 : 0;
+		auto&              byte = *reinterpret_cast<volatile std::uint8_t*>(g_groupsEnabled);
+		if (byte != want) {
+			// (idle at the cull begin: DrawWorld's cull waits for its jobs, the cascade render or the shadow stage's begin for
+			// the cascades', the third user 593615 for its own; a wait with none pending returns at once)
+			(void)WaitForBatch();
+			byte = want;
+		}
+		return want != 0;
+	}
+
+	std::int64_t WaitForBatch() noexcept
+	{
+		if (!BatchAvailable()) {
+			return 0;
+		}
+		LARGE_INTEGER before{}, after{};
+		QueryPerformanceCounter(&before);
+		reinterpret_cast<void (*)()>(g_batchWait)();
+		QueryPerformanceCounter(&after);
+		return after.QuadPart - before.QuadPart;
+	}
+
+	bool ArmCascadeForward(CascadeForward a_forward) noexcept
+	{
+		DisarmCascadeForward();
+		if (!a_forward || !g_shadowSceneNode || !g_dirLightVtable) {
+			return false;
+		}
+		std::array<const void*, kMaxCascades> accumulators{};
+		std::uint32_t                         count = 0;
+		__try {
+			const auto node = *reinterpret_cast<const std::byte* const*>(g_shadowSceneNode);
+			const auto light = node ? *reinterpret_cast<const std::byte* const*>(node + kSunLightOffset) : nullptr;
+			if (!light || *reinterpret_cast<const std::uintptr_t*>(light) != g_dirLightVtable) {
+				return false;
+			}
+			const auto cascades = *reinterpret_cast<const std::uint32_t*>(light + kCascadeCountOffset);
+			const auto records = *reinterpret_cast<const std::byte* const*>(light + kCascadesOffset);
+			for (std::uint32_t i = 0; records && i < cascades && i < kMaxCascades; ++i) {
+				if (const auto accumulator = *reinterpret_cast<const void* const*>(records + kCascadeStride * i + kCascadeAccumulatorOffset)) {
+					accumulators[count++] = accumulator;
+				}
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+		if (!count) {
+			return false;
+		}
+		for (std::uint32_t i = 0; i < count; ++i) {
+			g_forwardAccumulators[i].store(accumulators[i], std::memory_order_relaxed);
+		}
+		g_frameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+		g_cascadeForward.store(a_forward, std::memory_order_release);
+		return true;
+	}
+
+	void DisarmCascadeForward() noexcept
+	{
+		g_cascadeForward.store(nullptr, std::memory_order_release);
+		for (auto& accumulator : g_forwardAccumulators) {
+			accumulator.store(nullptr, std::memory_order_relaxed);
+		}
+	}
+
+	BatchCounts TakeBatchCounts() noexcept
+	{
+		BatchCounts total{};
+		for (const auto& slot : g_callCounts) {
+			total.jobBlockAdds += slot.jobBlockAdds.load(std::memory_order_relaxed);
+			total.jobRegistrations += slot.jobRegistrations.load(std::memory_order_relaxed);
+			total.jobPrevisActive += slot.jobPrevisActive.load(std::memory_order_relaxed);
+			total.jobUnknownGroup += slot.jobUnknownGroup.load(std::memory_order_relaxed);
+			total.forwarded += slot.forwarded.load(std::memory_order_relaxed);
+		}
+		total.mainWaits = g_mainWaits;
+		total.mainWaitTicks = g_mainWaitTicks;
+		const BatchCounts since{
+			total.mainWaits - g_batchReported.mainWaits, total.mainWaitTicks - g_batchReported.mainWaitTicks,
+			total.jobBlockAdds - g_batchReported.jobBlockAdds, total.jobRegistrations - g_batchReported.jobRegistrations,
+			total.jobPrevisActive - g_batchReported.jobPrevisActive, total.jobUnknownGroup - g_batchReported.jobUnknownGroup,
+			total.forwarded - g_batchReported.forwarded
+		};
+		g_batchReported = total;
+		return since;
 	}
 
 	HookCalls ReadHookCalls() noexcept
@@ -1848,7 +2093,7 @@ namespace CBRO::Hooks::CullGroups
 			// light's update (which sets the direction the cascades use) is the engine's own.
 			a_out.groupsEnabled = *reinterpret_cast<const std::uint8_t*>(g_groupsEnabled) != 0;
 			a_out.dirShadows = *reinterpret_cast<const std::uint8_t*>(g_dirShadows) != 0;
-			a_out.pathIntact = (a_out.groupsEnabled ? Intact(g_batchedPath) : UnbatchedIntact(a_out.dirShadows)) &&
+			a_out.pathIntact = (a_out.groupsEnabled ? BatchedIntact() : UnbatchedIntact(a_out.dirShadows)) &&
 			                   *reinterpret_cast<const std::uintptr_t*>(g_dirLightUpdateSlot) == g_dirLightUpdate;
 			g_pathFailures = a_out.pathIntact ? 0 : g_pathFailures + 1;
 			if (g_pathFailures == kPathWarnFrames && !g_pathWarned) {

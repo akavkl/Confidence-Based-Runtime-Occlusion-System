@@ -41,6 +41,9 @@
 // The link's constants (v2): CBRO_TraceFeed::flags, CBRO_TraceRecord::kind and ::flags.
 inline constexpr std::uint32_t CBRO_TRACE_FEED_RETAINS = 1;
 inline constexpr std::uint32_t CBRO_TRACE_FEED_LINK = 2;
+// v2.1.3: the tracer takes the sun cascades' registrations made in the batched cascade cull's jobs itself; without it a
+// linked tracer gets them through the link (its own observer takes only the frame thread's)
+inline constexpr std::uint32_t CBRO_TRACE_FEED_JOB_CASCADES = 4;
 inline constexpr std::uint32_t CBRO_TRACE_TAKE = 0;      // `object`, a geometry: take it in as if registered this frame (first contact, resend)
 inline constexpr std::uint32_t CBRO_TRACE_MOVED = 1;     // ... the same, its entry moved
 inline constexpr std::uint32_t CBRO_TRACE_GONE = 2;      // `anchor` left the world as CBRO walks it: drop what came with it
@@ -59,7 +62,7 @@ extern "C"
 		float         radius;         // world units: an object wholly farther from the camera is never filed for it
 		void (*refused)(std::uintptr_t a_accumulator, std::uintptr_t a_object);  // each refused registration, on the registering thread
 		// v2 (CBRO 2.0)
-		std::uint32_t flags;          // CBRO_TRACE_FEED_RETAINS, CBRO_TRACE_FEED_LINK
+		std::uint32_t flags;          // CBRO_TRACE_FEED_RETAINS, CBRO_TRACE_FEED_LINK, CBRO_TRACE_FEED_JOB_CASCADES
 		std::uint32_t resendFrames;   // with RETAINS: an object handed already is handed again once in this many frames (rounded down to a power of two, refreshFrames..65536; 0: never)
 		float         moverRadius;    // with RETAINS: an object that moved is handed every frame within this distance of the camera, one frame in 8 farther (0: every frame)
 		std::uint32_t reserved;
@@ -108,6 +111,7 @@ namespace CBRO::Core::TraceFeed
 	[[nodiscard]] bool On() noexcept;       // this frame
 	[[nodiscard]] bool Retains() noexcept;  // this frame: the tracer keeps what it was handed (v2)
 	[[nodiscard]] bool Linked() noexcept;   // this frame: handovers go into the link's batch (v2)
+	[[nodiscard]] bool ForwardsCascades() noexcept;  // this frame: the batched cascades' job-thread registrations go into the link (v2.1)
 
 	// An object's turn this frame (one frame in refreshFrames, spread by address).
 	[[nodiscard]] bool Turn(const void* a_object, std::uint32_t a_clock) noexcept;
@@ -131,11 +135,30 @@ namespace CBRO::Core::TraceFeed
 	// The object Handed() saw last on this thread (the entry walk marks its slot after a decision).
 	[[nodiscard]] const void* LastHanded() noexcept;
 
-	// A geometry handed over for an entry (a_anchor): into the link's batch on the main thread, else through `refused`
-	// as a registration of the main accumulator. a_kind CBRO_TRACE_TAKE or _MOVED.
+	// A geometry handed over for an entry (a_anchor): into the link's batch on the main thread, staged on another thread
+	// (v2.1, below), else through `refused` as a registration of the main accumulator. a_kind CBRO_TRACE_TAKE or _MOVED.
 	void Take(RE::NiAVObject* a_geometry, const RE::NiAVObject* a_anchor, std::uint32_t a_kind, std::uint32_t a_flags) noexcept;
 	// An entry the walk had handed left its slot (main thread): a GONE record, and it is no longer known.
 	void Gone(const void* a_anchor) noexcept;
+
+	// v2.1, the batched culling path (iCullingBatch; FO4OG 3): the main view's children are filed and the sun's cascades
+	// registered by BSJobs jobs. A hand-over made on such a thread is staged and joins the link's batch on the main thread
+	// (MergeStaged) once those jobs are done: DrawWorld's cull waits for its jobs before it returns, and CBRO waits for the
+	// cascades' jobs at the shadow stage's begin. Both merges come before the tracer reads the batch (its composite).
+	// A sun cascade's registration made on a job thread (Hooks::CullGroups' cascade forward, a linked tracer only), staged
+	// as the engine's own filing (anchor 0): on the unbatched path the tracer takes the cascades' registrations from the
+	// frame thread itself, which a job's are not. Any thread.
+	void StageCascade(RE::NiAVObject* a_geometry) noexcept;
+	// The staged records into the link's batch, in staging order (main thread, no job staging meanwhile).
+	void MergeStaged() noexcept;
+	struct StageCounts
+	{
+		std::uint64_t handovers{ 0 };  // staged hand-overs merged (an anchor: the entry walk's or a filed node's)
+		std::uint64_t cascades{ 0 };   // staged cascade registrations merged (anchor 0)
+		std::uint64_t lost{ 0 };       // not staged (the stage full): a hand-over went through `refused` instead, a cascade's was dropped
+		std::uint64_t merges{ 0 };     // merges that found records
+	};
+	[[nodiscard]] StageCounts TakeStageCounts() noexcept;  // since the last call (main thread)
 
 	struct Counts
 	{

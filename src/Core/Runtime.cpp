@@ -1653,6 +1653,8 @@ namespace CBRO::Core::Runtime
 			int                 mode{ -1 };  // 0 previs, 1 CBRO
 			std::uint32_t       sinceSwitch{ 0 };
 			std::vector<float>  segment;       // settled frame times of the current segment
+			std::uint32_t       segmentBatched{ 0 };  // ... of them on the batched culling path
+			std::uint32_t       segmentStill{ 0 };    // ... with the camera still
 			std::int64_t        segmentStart{ 0 };
 			std::array<ModeTime, kModes> session{};  // settled frames at the current location
 			std::array<ModeTime, kModes> still{};    // ... of which the camera was exactly where it was the frame before
@@ -1709,6 +1711,95 @@ namespace CBRO::Core::Runtime
 			JobView                 judged{};    // the last submitted job's (what the map this frame reads was judged with)
 		};
 		AsyncFrame g_asyncFrame;
+
+		// ---- the batched culling path (v2.1, iCullingBatch; FO4OG 3) -----------------------------------------------
+		// DrawWorld's cull then hands its groups to BSJobs jobs and waits for them before it returns (the cull stage holds
+		// them); the sun's cascade cull at Render_PreUI+0x175 submits its jobs and returns, and they run beside the g-buffer
+		// pre-pass until the cascade render waits for them. CBRO waits for them at the shadow stage's begin instead, which
+		// closes their previs window (the jobs read previs's state when they run) and lets what they handed the tracer join
+		// the link's batch.
+		struct BatchStats
+		{
+			std::uint32_t culledFrames{ 0 };   // CBRO frames
+			std::uint32_t batched{ 0 };        // ... on the batched path
+			std::uint32_t walkJudged{ 0 };     // ... asked for, left unbatched: verdicts judged inside the walk (interiors without bAsyncInteriors)
+			std::uint32_t cascadeWaits{ 0 };   // the cascades' jobs waited for at the shadow stage's begin
+			std::int64_t  cascadeWaitTicks{ 0 };
+			std::uint32_t forwardArmed{ 0 };   // frames the cascade forward was armed (a linked tracer)
+		};
+		BatchStats g_batch;
+		bool       g_frameBatched{ false };  // this frame's cull on the batched path (either mode; ChooseCullingPath)
+
+		// Whether this frame takes the batched path: a CBRO frame as iCullingBatch says (-1: as Fallout4.ini), only when its
+		// verdicts come from the worker (a_asyncFrame; the walk's own streams follow one thread's filing order); a previs
+		// frame as Fallout4.ini has it.
+		bool WantBatched(bool a_cbro, bool a_asyncFrame) noexcept
+		{
+			const bool ini = Hooks::CullGroups::IniCullingBatch();
+			if (!a_cbro) {
+				return ini;
+			}
+			const auto setting = Settings::Get().cullingBatch;
+			const bool want = setting < 0 ? ini : setting > 0;
+			if (!want) {
+				return false;
+			}
+			// (the cascades' window opens at 339369+0x185 and closes at the shadow stage's begin: both must be CBRO's)
+			if (!Hooks::PrevisFeed::CascadeWindowReady(true) || !Hooks::RenderStages::ThunkOf(Stage::kSunCascades)) {
+				return false;
+			}
+			if (!a_asyncFrame) {
+				++g_batch.walkJudged;
+				return false;
+			}
+			return true;
+		}
+
+		// The cascades' jobs of this frame waited for, their previs window closed, their hand-overs merged (main thread).
+		void EndBatchedCascades() noexcept
+		{
+			if (Hooks::PrevisFeed::BatchedCascadesPending()) {
+				g_batch.cascadeWaitTicks += Hooks::CullGroups::WaitForBatch();
+				++g_batch.cascadeWaits;
+				Hooks::PrevisFeed::EndBatchedCascades();
+			}
+			Hooks::CullGroups::DisarmCascadeForward();
+			TraceFeed::MergeStaged();
+		}
+
+		// The culling path for this frame, at the cull begin once the frame's mode, hooks and trace request are settled, and
+		// before the sun's path is read (ReadSunState): CullingJob::QBatchEnabled's byte is read by DrawWorld's cull and later
+		// in the frame (432406, 1108521, the cascade render), not before.
+		void ChooseCullingPath() noexcept
+		{
+			EndBatchedCascades();  // (a window still open from a frame whose shadow stage never began: none expected)
+			const bool cbro = CurrentMode() != 0 && g_state.hooksIn;
+			const bool asyncFrame = Async::Enabled() && (!g_state.interiorScene || Settings::Get().asyncInteriors);  // (as the context's asyncFrame)
+			const bool batched = Hooks::CullGroups::SetCullingBatch(WantBatched(cbro, asyncFrame));
+			g_frameBatched = batched;
+			Occlusion::SetBatched(batched && cbro);
+			if (cbro) {
+				++g_batch.culledFrames;
+				g_batch.batched += batched ? 1u : 0u;
+				if (batched && TraceFeed::ForwardsCascades() && Hooks::CullGroups::ArmCascadeForward(&TraceFeed::StageCascade)) {
+					++g_batch.forwardArmed;
+				}
+			}
+		}
+
+		void LogBatch()
+		{
+			const auto   counts = Hooks::CullGroups::TakeBatchCounts();
+			const auto   stage = TraceFeed::TakeStageCounts();
+			const double batched = std::max(1u, g_batch.batched);
+			logger::info(
+				"batched culling (iCullingBatch {}): CBRO frames {}, batched {}, asked for but judged inside the walk {} | per batched frame: DrawWorld's cull waiting for its jobs {:.3f} ms ({} waits), the cascades' jobs waited for at the shadow stage {:.3f} ms ({} waits; near 0: done beside the pre-pass) | CBRO's hooks on job threads per batched frame: Block::Adds {:.0f}, registrations {:.0f}; with previs active {} (must be 0), group unknown {} (must be 0) | the tracer through the link: cascade registrations forwarded {:.0f} per batched frame (armed {} frames{}), staged records merged {:.1f} hand-overs + {:.0f} cascade registrations per batched frame, not staged (stage full) {}",
+				Settings::Get().cullingBatch, g_batch.culledFrames, g_batch.batched, g_batch.walkJudged,
+				QpcMs(counts.mainWaitTicks) / batched, counts.mainWaits, QpcMs(g_batch.cascadeWaitTicks) / batched, g_batch.cascadeWaits,
+				static_cast<double>(counts.jobBlockAdds) / batched, static_cast<double>(counts.jobRegistrations) / batched, counts.jobPrevisActive, counts.jobUnknownGroup,
+				static_cast<double>(counts.forwarded) / batched, g_batch.forwardArmed, TraceFeed::Linked() && !TraceFeed::ForwardsCascades() ? "; the tracer takes them itself" : "", static_cast<double>(stage.handovers) / batched, static_cast<double>(stage.cascades) / batched, stage.lost);
+			g_batch = {};
+		}
 
 		float PoseDistance(const Async::Pose& a_a, const Async::Pose& a_b) noexcept
 		{
@@ -1955,11 +2046,15 @@ namespace CBRO::Core::Runtime
 				const auto middle = samples.begin() + static_cast<std::ptrdiff_t>(samples.size() / 2);
 				std::nth_element(samples.begin(), middle, samples.end());
 				const double avg = sum / static_cast<double>(samples.size());
+				const double n = static_cast<double>(samples.size());
 				logger::info(
-					"A/B segment: {} for {:.1f} s | {} settled frames | avg {:.2f} ms ({:.0f} fps) | median {:.2f} ms",
-					kModeNames[g_frames.mode], QpcMs(a_now - g_frames.segmentStart) / 1000.0, samples.size(), avg, 1000.0 / avg, *middle);
+					"A/B segment: {} for {:.1f} s | {} settled frames | avg {:.2f} ms ({:.0f} fps) | median {:.2f} ms | location {} from ({:.0f}, {:.0f}, {:.0f}), camera still {:.0f}%, batched culling {:.0f}%",
+					kModeNames[g_frames.mode], QpcMs(a_now - g_frames.segmentStart) / 1000.0, samples.size(), avg, 1000.0 / avg, *middle,
+					g_frames.location, g_frames.anchor.x, g_frames.anchor.y, g_frames.anchor.z, 100.0 * g_frames.segmentStill / n, 100.0 * g_frames.segmentBatched / n);
 			}
 			samples.clear();
+			g_frames.segmentBatched = 0;
+			g_frames.segmentStill = 0;
 		}
 
 		// Previs against each CBRO mode that has enough frames at this location.
@@ -2065,6 +2160,8 @@ namespace CBRO::Core::Runtime
 				const bool warm = ++g_frames.sinceLoad > kLoadSettleFrames;
 				if (++g_frames.sinceSwitch > kSettleFrames && warm && ms < kHitchMs && !menu) {
 					g_frames.segment.push_back(static_cast<float>(ms));
+					g_frames.segmentBatched += g_frameBatched ? 1u : 0u;
+					g_frames.segmentStill += cameraStill ? 1u : 0u;
 					g_frames.session[mode].sum += ms;
 					++g_frames.session[mode].count;
 					if (cameraStill) {
@@ -2513,6 +2610,7 @@ namespace CBRO::Core::Runtime
 			}
 			const auto snapshot = active ? HiZ::Latest() : nullptr;
 			TraceFeed::BeginFrame();  // (before ReadSunState: the cascades' filter follows it)
+			ChooseCullingPath();      // (v2.1; after the trace request, before ReadSunState: the sun's path follows the byte)
 
 			Occlusion::FrameContext context{};
 			context.clock = ++g_state.clock;
@@ -2639,6 +2737,7 @@ namespace CBRO::Core::Runtime
 					g_state.wantActive ? "occlusion" : "previs", ConventionName(g_state.convention), HiZ::Describe());
 				Occlusion::LogStats(g_state.framesSinceLog);
 				LogSun();
+				LogBatch();
 				ShadowLights::LogStats(g_state.framesSinceLog);
 				Feed::LogStats(g_state.framesSinceLog);
 				if (const auto rain = Hooks::Precipitation::Take(); rain.runs > 0) {
@@ -2743,6 +2842,7 @@ namespace CBRO::Core::Runtime
 					break;
 				}
 				case Stage::kSunCascades: {
+					EndBatchedCascades();  // (v2.1: the batched cascades' jobs, before the stage's own wait in the cascade render)
 					const auto before = Qpc();
 					// The deferred-lights stage follows. In a CBRO frame the walk ran with previs inactive, so a light previs
 					// had marked occluded stays marked and dark (FO4-ENGINE-NOTES 6.7); clear the mark, as previs-off vanilla.
@@ -2781,6 +2881,7 @@ namespace CBRO::Core::Runtime
 				case Stage::kCull:
 					Hooks::CullGroups::SetMainCullActive(false);
 					Hooks::CullGroups::SetRoomWalk(false);
+					TraceFeed::MergeStaged();  // (v2.1: the batched main view's job-thread hand-overs; DrawWorld's cull waited for its jobs)
 					Occlusion::EndFrameSample(Hooks::CullGroups::ReadHookCalls().registrations, Hooks::CullGroups::ReadDroppedRegistrations());
 					if (g_state.cullingThisFrame) {
 						NoteMotion(g_stillness.lastTurn, g_asyncFrame.frameMove, g_asyncFrame.context.asyncValid);

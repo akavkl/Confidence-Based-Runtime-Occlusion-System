@@ -163,6 +163,9 @@ namespace CBRO::Core::Occlusion
 
 	void SetActive(bool a_active);
 	void SetObserveOnly(bool a_observeOnly);  // runtime override of [Occlusion] bObserveOnly (diagnostics)
+	// This frame's culling runs on the engine's batched path (v2.1, iCullingBatch; FO4OG 3): the main view's children are
+	// filed on BSJobs threads, in jobs' order. Main thread, at the cull begin, before DrawWorld's cull.
+	void SetBatched(bool a_batched) noexcept;
 	[[nodiscard]] bool Active() noexcept;
 
 	// Diagnostic (Core/SetDiff, bSetDiff; v1.92.5): why the main view keeps an object this frame. While on, the Block::Add

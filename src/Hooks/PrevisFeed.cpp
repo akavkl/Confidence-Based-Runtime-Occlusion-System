@@ -41,6 +41,14 @@ namespace CBRO::Hooks::PrevisFeed
 		constexpr std::uint64_t kPreCullHelperID = 102390;    // void(): what Render_PreUI+0x165 calls when previs is inactive
 		constexpr std::uint64_t kUnbatchedStageID = 1108521;
 		constexpr std::size_t   kCascadeCullSiteOffset = 0xE49;  // 1108521: call 1390075 (kCascadeCullID)
+		// The batched path (v2.1, Ghidra 2026-10-27): 339369 (Render_PreUI+0x175) runs every frame and calls 432406 at +0x185
+		// with no test; 432406 runs the light's update (slot 14) and tail-jumps to 1390075 with group 0 only when the
+		// bCullingBatch byte and the directional-shadows byte are both set (its own tests at +0x4/+0xD and +0x31/+0x3A).
+		constexpr std::uint64_t kBatchedStageID = 339369;
+		constexpr std::size_t   kBatchedCascadeSiteOffset = 0x185;
+		constexpr std::uint64_t kBatchedCascadeID = 432406;
+		constexpr std::uint64_t kCullingBatchByteID = 938585;  // bCullingBatch:General (read by CullingJob::QBatchEnabled alone)
+		constexpr std::uint64_t kDirShadowsByteID = 241042;
 
 		// ---- the previs query (FO4-ENGINE-NOTES 5.5e) ---------------------------------------------------------------
 		// Main::StartOfFrameUpdate (826184) +0x28A: `call 1276848` (MultiCellVisibilityData::LaunchQuery(camera): the
@@ -105,6 +113,12 @@ namespace CBRO::Hooks::PrevisFeed
 		FeedSite g_cascadeSite;   // 1108521+0xE49: the cascade window is that call
 		std::uint64_t g_cascadeCalls{ 0 };  // calls of CascadeCullThunk (main thread)
 		std::atomic<void (*)()> g_cascadeOpen{ nullptr };  // run as the window opens, before the cascade cull (v1.99.3)
+		FeedSite       g_batchedCascadeSite;      // 339369+0x185: the batched path's cascade window opens at that call (v2.1)
+		std::uint64_t  g_batchedCascadeCalls{ 0 };
+		bool           g_batchedPending{ false };   // opened this frame, the cascades' jobs not waited for yet
+		bool           g_batchedSuspended{ false }; // ... previs suspended by it (the engine's byte was clear)
+		std::uintptr_t g_cullingBatchByte{ 0 };
+		std::uintptr_t g_dirShadowsByte{ 0 };
 		bool     g_windowsAvailable{ false };
 
 		// The windows (main thread only: Render_PreUI's thread). `g_window` is the policy's word for the frame ("a CBRO
@@ -212,6 +226,12 @@ namespace CBRO::Hooks::PrevisFeed
 				return;
 			}
 			g_savedByte = ReadSuspendedByte();
+			if (g_batchedSuspended) {
+				// (a batched cascade window still open, its jobs not waited for: its suspension carries over into this one,
+				// over the engine's own clear byte; EndBatchedCascades then writes nothing)
+				g_batchedSuspended = false;
+				g_savedByte = 0;
+			}
 			if (!g_savedByte) {
 				WriteSuspended(true);
 			}
@@ -251,6 +271,27 @@ namespace CBRO::Hooks::PrevisFeed
 				WriteSuspended(false);
 			}
 			return result;
+		}
+
+		// 339369+0x185 (v2.1): the batched cascade cull, previs suspended from here until its jobs are waited for
+		// (EndBatchedCascades). Only when 432406 culls (both bytes set: its own tests), and in the frames CascadeCullThunk
+		// suspends for. The window-open callback is not run here (v2.1.1): nothing may be filed into group 0 between
+		// DrawWorld's batch and this one (its node jobs reuse the first batch's SubGroups unchecked, FO4OG 3).
+		std::uintptr_t BatchedCascadeThunk(std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4)
+		{
+			++g_batchedCascadeCalls;
+			const bool culls = *reinterpret_cast<const std::uint8_t*>(g_cullingBatchByte) != 0 && *reinterpret_cast<const std::uint8_t*>(g_dirShadowsByte) != 0;
+			if (!culls || g_batchedPending || (!g_window.load(std::memory_order_relaxed) && !g_querySkipped)) {
+				return reinterpret_cast<PassFn>(g_batchedCascadeSite.previous)(a1, a2, a3, a4);
+			}
+			const auto saved = ReadSuspendedByte();
+			if (!saved) {
+				WriteSuspended(true);
+			}
+			g_batchedSuspended = !saved;
+			g_batchedPending = true;
+			++g_windowCounts.batchedCascade;
+			return reinterpret_cast<PassFn>(g_batchedCascadeSite.previous)(a1, a2, a3, a4);
 		}
 
 		// StartOfFrameUpdate+0x28A: in a CBRO frame the background query isn't launched.
@@ -533,10 +574,14 @@ namespace CBRO::Hooks::PrevisFeed
 		g_preCullHelper = CBRO::Engine::OG(kPreCullHelperID).address();
 		const bool preCull = InstallSite(g_preCullSite, kRenderPreUIID, kPreCullSiteOffset, kPreCullTargetID, Util::FnAddr(&PreCullThunk), "previsfeed:pre-cull window");
 		const bool cascade = InstallSite(g_cascadeSite, kUnbatchedStageID, kCascadeCullSiteOffset, kCascadeCullID, Util::FnAddr(&CascadeCullThunk), "previsfeed:cascade window");
+		g_cullingBatchByte = CBRO::Engine::OG(kCullingBatchByteID).address();
+		g_dirShadowsByte = CBRO::Engine::OG(kDirShadowsByteID).address();
+		const bool batched = InstallSite(g_batchedCascadeSite, kBatchedStageID, kBatchedCascadeSiteOffset, kBatchedCascadeID, Util::FnAddr(&BatchedCascadeThunk), "previsfeed:batched cascade window");
 		g_windowsAvailable = preCull && cascade;
 		logger::info(
-			"previs feed: suspension windows {} (pre-cull {}, cascade cull {}); previs is suspended only inside them in CBRO frames",
-			g_windowsAvailable ? "installed" : "INCOMPLETE", preCull ? "wrapped" : "NOT wrapped: cull-begin hold instead", cascade ? "wrapped" : "NOT wrapped: no sun-shadow culling");
+			"previs feed: suspension windows {} (pre-cull {}, cascade cull {}, batched cascade cull {}); previs is suspended only inside them in CBRO frames",
+			g_windowsAvailable ? "installed" : "INCOMPLETE", preCull ? "wrapped" : "NOT wrapped: cull-begin hold instead", cascade ? "wrapped" : "NOT wrapped: no sun-shadow culling",
+			batched ? "wrapped" : "NOT wrapped: no sun-shadow culling on the batched path");
 		return g_available;
 	}
 
@@ -682,9 +727,41 @@ namespace CBRO::Hooks::PrevisFeed
 		g_cascadeOpen.store(a_callback, std::memory_order_relaxed);
 	}
 
-	bool CascadeWindowReady() noexcept
+	bool CascadeWindowReady(bool a_batched) noexcept
 	{
-		return g_cascadeSite.ok;
+		return a_batched ? g_batchedCascadeSite.ok : g_cascadeSite.ok;
+	}
+
+	bool BatchedCascadesPending() noexcept
+	{
+		return g_batchedPending;
+	}
+
+	void EndBatchedCascades() noexcept
+	{
+		if (!g_batchedPending) {
+			return;
+		}
+		g_batchedPending = false;
+		if (g_batchedSuspended) {
+			g_batchedSuspended = false;
+			WriteSuspended(false);
+		}
+	}
+
+	std::uintptr_t BatchedCascadeThunkAddress() noexcept
+	{
+		return g_batchedCascadeSite.ok ? Util::FnAddr(&BatchedCascadeThunk) : 0;
+	}
+
+	std::uintptr_t BatchedCascadePrevious() noexcept
+	{
+		return g_batchedCascadeSite.ok ? g_batchedCascadeSite.previous : 0;
+	}
+
+	std::uint64_t BatchedCascadeCalls() noexcept
+	{
+		return g_batchedCascadeCalls;
 	}
 
 	bool Available() noexcept
