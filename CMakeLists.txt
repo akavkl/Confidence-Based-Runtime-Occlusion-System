@@ -13,7 +13,7 @@ endif()
 set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "")
 
-project(CBRO VERSION 1.91.0 LANGUAGES CXX)
+project(CBRO VERSION 2.0.0 LANGUAGES CXX)
 
 if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
 	message(FATAL_ERROR "in-source builds are not allowed")
@@ -69,7 +69,8 @@ if(MSVC)
 		CBRO
 		PRIVATE
 			# "$<$<CONFIG:Release>:/INCREMENTAL:NO;/OPT:REF;/OPT:ICF;/DEBUG:FULL>"
-			"$<$<CONFIG:Release>:/INCREMENTAL:NO;/LTCG;/OPT:REF;/OPT:ICF;/DEBUG:FULL>"
+			# /MAP: the linker map (CBRO.map next to the DLL) names the sampler's CBRO offsets (Core/Sampler)
+			"$<$<CONFIG:Release>:/INCREMENTAL:NO;/LTCG;/OPT:REF;/OPT:ICF;/DEBUG:FULL;/MAP>"
 			"$<$<CONFIG:Debug>:/DEBUG:FULL>"
 	)
 endif()

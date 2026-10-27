@@ -104,6 +104,7 @@ namespace CBRO::Hooks::PrevisFeed
 		FeedSite g_preCullSite;   // Render_PreUI+0x157: the cull window opens after its call
 		FeedSite g_cascadeSite;   // 1108521+0xE49: the cascade window is that call
 		std::uint64_t g_cascadeCalls{ 0 };  // calls of CascadeCullThunk (main thread)
+		std::atomic<void (*)()> g_cascadeOpen{ nullptr };  // run as the window opens, before the cascade cull (v1.99.3)
 		bool     g_windowsAvailable{ false };
 
 		// The windows (main thread only: Render_PreUI's thread). `g_window` is the policy's word for the frame ("a CBRO
@@ -242,6 +243,9 @@ namespace CBRO::Hooks::PrevisFeed
 				WriteSuspended(true);
 			}
 			++g_windowCounts.cascade;
+			if (const auto open = g_cascadeOpen.load(std::memory_order_relaxed)) {
+				open();
+			}
 			const auto result = reinterpret_cast<PassFn>(g_cascadeSite.previous)(a1, a2, a3, a4);
 			if (!saved) {
 				WriteSuspended(false);
@@ -673,6 +677,16 @@ namespace CBRO::Hooks::PrevisFeed
 		return g_cascadeCalls;
 	}
 
+	void SetCascadeOpenCallback(void (*a_callback)()) noexcept
+	{
+		g_cascadeOpen.store(a_callback, std::memory_order_relaxed);
+	}
+
+	bool CascadeWindowReady() noexcept
+	{
+		return g_cascadeSite.ok;
+	}
+
 	bool Available() noexcept
 	{
 		return g_available;
@@ -734,6 +748,16 @@ namespace CBRO::Hooks::PrevisFeed
 			}
 		}
 		return false;
+	}
+
+	std::uintptr_t SiteAddress(Site a_site) noexcept
+	{
+		for (const auto& [address, site] : g_siteAddresses) {
+			if (site == a_site) {
+				return address;
+			}
+		}
+		return 0;
 	}
 
 	std::string_view SiteName(Site a_site) noexcept

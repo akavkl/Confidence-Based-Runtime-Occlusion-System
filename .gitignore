@@ -9,3 +9,4 @@ vsxmake*/
 *.png
 *.md
 
+__pycache__/

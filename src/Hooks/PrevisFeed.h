@@ -107,6 +107,10 @@ namespace CBRO::Hooks::PrevisFeed
 	// Calls of that wrapper so far (window or not): proof the engine's cascade cull ran when another plugin wraps the
 	// site over CBRO's wrapper (CullGroups reads the change between two frames).
 	[[nodiscard]] std::uint64_t CascadeCullCalls() noexcept;
+	// Run inside the cascade window of a CBRO frame, previs suspended, before the cascade cull (main thread; v1.99.3: the
+	// group-0 entries held back from the main view are filed there). Null = none.
+	void SetCascadeOpenCallback(void (*a_callback)()) noexcept;
+	[[nodiscard]] bool CascadeWindowReady() noexcept;  // the cascade site is wrapped
 
 	// A culling group's six frustum planes (NiPlane {n, d}, 16 bytes each, at group+0). False if unreadable.
 	[[nodiscard]] bool GroupPlanes(const void* a_group, float a_planes[6][4]) noexcept;
@@ -141,6 +145,8 @@ namespace CBRO::Hooks::PrevisFeed
 
 	// The replicated site a main-pass Group::Add return address belongs to, if any (for the audit).
 	[[nodiscard]] bool SiteOf(std::uintptr_t a_returnAddress, Site& a_out) noexcept;
+	// The return address of the first Group::Add site of that kind (0 = none): the entry walk reports its adds under it.
+	[[nodiscard]] std::uintptr_t SiteAddress(Site a_site) noexcept;
 	[[nodiscard]] std::string_view SiteName(Site a_site) noexcept;
 	[[nodiscard]] std::string_view RouteName(Route a_route) noexcept;
 }

@@ -1,5 +1,9 @@
 #include "Core/SetDiff.h"
 
+#include "Core/Recorder.h"
+
+#include "Core/Occlusion.h"
+#include "Settings.h"
 #include "Hooks/CullGroups.h"
 #include "Util/Gamebryo.h"
 
@@ -97,7 +101,31 @@ namespace CBRO::Core::SetDiff
 			std::uint64_t flags{ 0 };
 			char          type[48]{};
 			char          name[64]{};
+			Occlusion::KeptReason reason{};  // (CBRO frames: why its main view kept it; v1.92.5)
 		};
+
+		const char* ReasonName(const Occlusion::KeptReason& a_reason) noexcept
+		{
+			if (!a_reason.valid) {
+				return "no verdict";
+			}
+			if (a_reason.confirming) {
+				return "confirming";
+			}
+			if (a_reason.exempt) {
+				return "exempt";
+			}
+			switch (a_reason.verdict) {
+			case 5:
+				return "near";
+			case 2:
+				return "edge";
+			case 6:
+				return "bad bound";
+			default:
+				return a_reason.shaped ? "shape" : a_reason.shapeNone ? "sphere, no shape" : "sphere";
+			}
+		}
 
 		bool DescribeImpl(const RE::NiAVObject* a_object, const RE::NiPoint3& a_eye, Info& a_out) noexcept
 		{
@@ -107,6 +135,7 @@ namespace CBRO::Core::SetDiff
 				const float dx = bound.center.x - a_eye.x, dy = bound.center.y - a_eye.y, dz = bound.center.z - a_eye.z;
 				a_out.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
 				a_out.flags = a_object->GetFlags();
+				a_out.reason = Occlusion::LastKeptReason(a_object);
 				Util::TryGetRTTIName(a_object, a_out.type, sizeof(a_out.type));
 				Util::TryGetObjectName(a_object, a_out.name, sizeof(a_out.name));
 				return std::isfinite(a_out.radius) && std::isfinite(a_out.distance);
@@ -130,6 +159,17 @@ namespace CBRO::Core::SetDiff
 			std::uint32_t typeOther{ 0 };
 			char          samples[kSamples][160]{};
 			std::uint32_t sampleCount{ 0 };
+			// Why CBRO's main view kept them (Occlusion::LastKeptReason; meaningful for the CBRO side only, v1.92.5)
+			std::uint32_t reasonSphere{ 0 };         // visible by its sphere, no shape wanted (small, or not a shape type)
+			std::uint32_t reasonSphereNoShape{ 0 };  // visible by its sphere; a shape was wanted and none was used
+			std::uint32_t reasonShape{ 0 };          // visible by its mesh shape
+			std::uint32_t reasonNear{ 0 };
+			std::uint32_t reasonEdge{ 0 };
+			std::uint32_t reasonBadBound{ 0 };
+			std::uint32_t reasonConfirming{ 0 };
+			std::uint32_t reasonExempt{ 0 };
+			std::uint32_t reasonNone{ 0 };           // no kept verdict that frame: filed force-visible, dropped with its parent, or never judged
+			std::uint32_t reasonParallax{ 0 };       // of the sphere, shape and edge ones: kept only by the parallax margin
 
 			void Add(const Info& a_info, bool a_readable)
 			{
@@ -147,6 +187,29 @@ namespace CBRO::Core::SetDiff
 				const float ratio = a_info.distance > 1.0f ? a_info.radius / a_info.distance : 1.0f;
 				++size[ratio < 0.002f ? 0 : ratio < 0.01f ? 1 : ratio < 0.05f ? 2 : 3];
 				++distance[a_info.distance < 500.0f ? 0 : a_info.distance < 2000.0f ? 1 : a_info.distance < 8000.0f ? 2 : 3];
+				const auto& reason = a_info.reason;
+				if (!reason.valid) {
+					++reasonNone;
+				} else if (reason.confirming) {
+					++reasonConfirming;
+				} else if (reason.exempt) {
+					++reasonExempt;
+				} else if (reason.verdict == 5) {
+					++reasonNear;
+				} else if (reason.verdict == 2) {
+					++reasonEdge;
+				} else if (reason.verdict == 6) {
+					++reasonBadBound;
+				} else if (reason.shaped) {
+					++reasonShape;
+				} else if (reason.shapeNone) {
+					++reasonSphereNoShape;
+				} else {
+					++reasonSphere;
+				}
+				if (reason.valid && reason.parallaxKept) {
+					++reasonParallax;
+				}
 				bool typed = false;
 				for (std::size_t i = 0; i < kTypeSlots; ++i) {
 					if (typeNames[i][0] == 0) {
@@ -166,14 +229,15 @@ namespace CBRO::Core::SetDiff
 				}
 				if (sampleCount < kSamples) {
 					std::snprintf(
-						samples[sampleCount], sizeof(samples[sampleCount]), "%s \"%s\" r=%.0f d=%.0f%s%s",
+						samples[sampleCount], sizeof(samples[sampleCount]), "%s \"%s\" r=%.0f d=%.0f%s%s [%s%s]",
 						a_info.type[0] ? a_info.type : "?", a_info.name[0] ? a_info.name : "", a_info.radius, a_info.distance,
-						((a_info.flags >> 11) & 1) ? " always-draw" : "", ((a_info.flags >> 26) & 1) ? (((a_info.flags >> 39) & 1) ? " previs:hidden" : " previs:shown") : "");
+						((a_info.flags >> 11) & 1) ? " always-draw" : "", ((a_info.flags >> 26) & 1) ? (((a_info.flags >> 39) & 1) ? " previs:hidden" : " previs:shown") : "",
+						ReasonName(a_info.reason), a_info.reason.valid && a_info.reason.parallaxKept ? ", by the parallax margin" : "");
 					++sampleCount;
 				}
 			}
 
-			std::string Describe() const
+			std::string Describe(bool a_reasons) const
 			{
 				std::string text = std::format(
 					"{} (unreadable {}, always-draw {}, previs-marked hidden {} / shown {}) | by size (radius/distance): <0.002 {}, <0.01 {}, <0.05 {}, larger {} | by distance: <500 {}, <2000 {}, <8000 {}, farther {} | by type:",
@@ -198,6 +262,11 @@ namespace CBRO::Core::SetDiff
 				}
 				if (typeOther) {
 					text += std::format(", other {}", typeOther);
+				}
+				if (a_reasons) {
+					text += std::format(
+						" | why CBRO kept them: sphere {} (a shape wanted, none used {}), shape {}, near {}, edge {}, bad bound {}, confirming {}, exempt {}, no verdict (forced, inherited) {} | of the sphere, shape and edge ones, kept only by the parallax margin {}",
+						reasonSphere, reasonSphereNoShape, reasonShape, reasonNear, reasonEdge, reasonBadBound, reasonConfirming, reasonExempt, reasonNone, reasonParallax);
 				}
 				return text;
 			}
@@ -224,27 +293,37 @@ namespace CBRO::Core::SetDiff
 		std::uint32_t g_unsettled{ 0 };
 		std::uint32_t g_overflow{ 0 };
 
-		// Previs-only objects whose bound comes within kNearGap of the eye, with their place in the scene graph (2026-10-09:
-		// a wall's lower part drawn by previs, not by CBRO, with Runtime Combiner's chunks in the scene).
-		constexpr float       kNearGap = 2000.0f;
+		// Previs-only objects with their place in the scene graph (2026-10-09: a wall's lower part drawn by previs, not by
+		// CBRO, with Runtime Combiner's chunks in the scene), the largest on screen first (v1.92.7: up to v1.92.6 only those
+		// within 2000 of the eye, nearest first; the 2026-10-26 spot's missing object was farther).
 		constexpr std::size_t kNearMax = 400;
+		constexpr std::size_t kNearPrinted = 80;
 		struct Near
 		{
 			float       gap{ 0.0f };
+			float       size{ 0.0f };  // radius over distance: how big on screen
+			float       ray{ -1.0f };  // v1.92.9: how far along the ray window's rays (fRayWindow*, the last dumped depth frame's camera); negative outside it
 			std::string text;
 		};
 		std::vector<Near> g_previsNear;
+		// v1.92.9: every previs-only object whose bound crosses the ray window, whatever its size (the 2026-10-26 spot's
+		// missing object, a wall piece 3.3k away and 60 pixels wide, was below the 80 largest and beyond the 400 stored).
+		constexpr std::size_t kWindowMax = 300;
+		std::vector<Near>     g_previsWindow;
 
 		bool DescribeNear(const RE::NiAVObject* a_object, const RE::NiPoint3& a_eye, Near& a_out) noexcept
 		{
 			__try {
 				const auto& bound = a_object->worldBound;
 				const float dx = bound.center.x - a_eye.x, dy = bound.center.y - a_eye.y, dz = bound.center.z - a_eye.z;
-				const float gap = std::sqrt(dx * dx + dy * dy + dz * dz) - bound.fRadius;
-				if (!(gap <= kNearGap)) {
+				const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+				const float gap = distance - bound.fRadius;
+				if (!std::isfinite(gap)) {
 					return false;
 				}
 				a_out.gap = gap;
+				a_out.size = distance > 1.0f ? bound.fRadius / distance : 1.0f;
+				a_out.ray = Occlusion::RayWindowHitOnDepthFrame(bound.center.x, bound.center.y, bound.center.z, bound.fRadius);
 				char type[48]{}, name[64]{};
 				Util::TryGetRTTIName(a_object, type, sizeof(type));
 				Util::TryGetObjectName(a_object, name, sizeof(name));
@@ -262,8 +341,8 @@ namespace CBRO::Core::SetDiff
 					used = std::min(sizeof(path) - 1, used + static_cast<std::size_t>(n));
 				}
 				char line[900]{};
-				std::snprintf(line, sizeof(line), "  %s '%s' %llX | bound (%.0f,%.0f,%.0f) r=%.0f gap %.0f | flags 0x%llX%s | in %s", type, name,
-					static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(a_object)), bound.center.x, bound.center.y, bound.center.z, bound.fRadius, gap,
+				std::snprintf(line, sizeof(line), "  %s '%s' %llX | bound (%.0f,%.0f,%.0f) r=%.0f gap %.0f size %.3f | flags 0x%llX%s | in %s", type, name,
+					static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(a_object)), bound.center.x, bound.center.y, bound.center.z, bound.fRadius, gap, a_out.size,
 					static_cast<unsigned long long>(a_object->GetFlags()), (a_object->GetFlags() & 1) ? " (AppCulled)" : "", path);
 				a_out.text = line;
 				return true;
@@ -276,12 +355,19 @@ namespace CBRO::Core::SetDiff
 	void Install(bool a_enabled)
 	{
 		g_enabled = a_enabled;
-		Hooks::CullGroups::SetMainRegistrationObserver(a_enabled ? &Observe : nullptr);
+		Hooks::CullGroups::SetMainRegistrationObserver(a_enabled || Recorder::Enabled() ? &Observe : nullptr);  // (the recorder reads the same registrations)
+		Occlusion::SetKeptReasons(a_enabled);
 		logger::info("set diff: {}", a_enabled ? "on (bSetDiff=1): main-view registrations compared between the modes at each A/B location" : "off");
 	}
 
 	void Observe(RE::NiAVObject* a_object) noexcept
 	{
+		if (Recorder::On()) {
+			Recorder::NoteRegistration(a_object, false);
+		}
+		if (!g_enabled) {
+			return;
+		}
 		const auto index = g_count.fetch_add(1, std::memory_order_relaxed);
 		if (index < kRing) {
 			g_ring[index] = a_object;
@@ -317,10 +403,15 @@ namespace CBRO::Core::SetDiff
 				Info       info{};
 				const bool readable = DescribeImpl(object, a_eye, info);
 				mine.onlyHere.Add(info, readable);
-				if (a_mode == 0 && g_previsNear.size() < kNearMax) {
+				if (a_mode == 0 && (g_previsNear.size() < kNearMax || g_previsWindow.size() < kWindowMax)) {
 					Near item;
 					if (DescribeNear(object, a_eye, item)) {
-						g_previsNear.push_back(std::move(item));
+						if (item.ray >= 0.0f && g_previsWindow.size() < kWindowMax) {
+							g_previsWindow.push_back(item);
+						}
+						if (g_previsNear.size() < kNearMax) {
+							g_previsNear.push_back(std::move(item));
+						}
 					}
 				}
 			}
@@ -356,25 +447,35 @@ namespace CBRO::Core::SetDiff
 			previs.set.count, previs.frames, previs.frames ? static_cast<double>(previs.registrations) / previs.frames : 0.0,
 			cbro.set.count, cbro.frames, cbro.frames ? static_cast<double>(cbro.registrations) / cbro.frames : 0.0, g_unsettled, g_overflow);
 		if (cbro.onlyHere.total || previs.frames >= kMinOtherFrames) {
-			logger::info("set diff: drawn by CBRO, never by previs here: {}", cbro.onlyHere.Describe());
+			logger::info("set diff: drawn by CBRO, never by previs here: {}", cbro.onlyHere.Describe(true));
 			if (cbro.onlyHere.sampleCount) {
 				logger::info("set diff: CBRO-only samples: {}", cbro.onlyHere.Samples());
 			}
 		}
 		if (previs.onlyHere.total || cbro.frames >= kMinOtherFrames) {
-			logger::info("set diff: drawn by previs, never by CBRO here: {}", previs.onlyHere.Describe());
+			logger::info("set diff: drawn by previs, never by CBRO here: {}", previs.onlyHere.Describe(false));
 			if (previs.onlyHere.sampleCount) {
 				logger::info("set diff: previs-only samples: {}", previs.onlyHere.Samples());
 			}
 		}
 		if (!g_previsNear.empty()) {
-			std::ranges::sort(g_previsNear, [](const Near& a_left, const Near& a_right) { return a_left.gap < a_right.gap; });
-			logger::info("set diff: drawn by previs, never by CBRO here, bound within {:.0f} of the eye: {}{} (nearest first)", kNearGap, g_previsNear.size(),
-				g_previsNear.size() >= kNearMax ? "+" : "");
-			for (const auto& item : g_previsNear) {
-				logger::info("{}", item.text);
+			std::ranges::sort(g_previsNear, [](const Near& a_left, const Near& a_right) { return a_left.size > a_right.size; });
+			logger::info("set diff: drawn by previs, never by CBRO here: {}{} (the {} largest on screen first; size = radius / distance at registration)", g_previsNear.size(),
+				g_previsNear.size() >= kNearMax ? "+" : "", std::min(g_previsNear.size(), kNearPrinted));
+			for (std::size_t i = 0; i < g_previsNear.size() && i < kNearPrinted; ++i) {
+				logger::info("{}", g_previsNear[i].text);
 			}
 			g_previsNear.clear();  // (logged once per summary)
+		}
+		if (!g_previsWindow.empty()) {
+			std::ranges::sort(g_previsWindow, [](const Near& a_left, const Near& a_right) { return a_left.ray < a_right.ray; });
+			const auto& window = Settings::Get().rayWindow;
+			logger::info("set diff: previs-only objects whose bound crosses the ray window (NDC x {:.2f}..{:.2f}, y {:.2f}..{:.2f}, up to {:.0f} along, on the last dumped depth frame's camera): {}{} (nearest along the rays first)",
+				window[0], window[1], window[2], window[3], Settings::Get().rayLength, g_previsWindow.size(), g_previsWindow.size() >= kWindowMax ? "+" : "");
+			for (const auto& item : g_previsWindow) {
+				logger::info("  {:.0f} along |{}", item.ray, item.text);
+			}
+			g_previsWindow.clear();
 		}
 	}
 }

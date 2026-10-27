@@ -3,6 +3,7 @@
 #include "Hooks/PrevisFeed.h"
 #include "Hooks/RenderStages.h"
 #include "Settings.h"
+#include "Util/Gamebryo.h"
 #include "Util/Hooking.h"
 
 #include <intrin.h>
@@ -14,6 +15,7 @@ namespace CBRO::Hooks::CullGroups
 		constexpr std::uint64_t kBlockAddID = 1143206;
 		constexpr std::uint64_t kGroupAddID = 1175493;
 		constexpr std::uint64_t kChildPushID = 357475;
+		constexpr std::uint64_t kFadeNodeAddID = 166850;  // BSCullingGroup::AddP1FadeNode (FO4-ENGINE-NOTES 5.3)
 		constexpr std::uint64_t kMainGroupID = 1117782;         // DrawWorld group 0 (the struct itself): shadow casters
 		constexpr std::uint64_t kGroup1ID = 133326;             // DrawWorld group 1: non-casters (main view only)
 		constexpr std::uint64_t kGroup2ID = 1328670;            // DrawWorld group 2: the previs list (main view only)
@@ -184,6 +186,7 @@ namespace CBRO::Hooks::CullGroups
 		constexpr std::array<std::uint8_t, 5> kBlockAddPrologue{ 0x48, 0x89, 0x5C, 0x24, 0x08 };
 		constexpr std::array<std::uint8_t, 5> kGroupAddPrologue{ 0x48, 0x89, 0x5C, 0x24, 0x20 };
 		constexpr std::array<std::uint8_t, 5> kChildPushPrologue{ 0x48, 0x89, 0x5C, 0x24, 0x08 };
+		constexpr std::array<std::uint8_t, 5> kFadeNodeAddPrologue{ 0x48, 0x89, 0x5C, 0x24, 0x08 };  // mov [rsp+8], rbx
 
 		constexpr std::size_t kBlockOwnerOffset = 0x3A60;
 		constexpr std::size_t kBlockCountOffset = 0x3A68;
@@ -233,7 +236,6 @@ namespace CBRO::Hooks::CullGroups
 		std::atomic<std::uint64_t> g_skyForced{ 0 };   // sky entries given previs's force-visible mark (CBRO frames)
 		std::atomic<std::uint64_t> g_skyKept{ 0 };     // ... and reject bounds CBRO's filter would have given them
 		std::atomic<std::uint64_t> g_forcedVisible{ 0 };  // entries the filter had filed force-visible (ForceVisible)
-		std::atomic<std::uint64_t> g_groupAddsConsidered{ 0 };
 
 		std::uintptr_t g_mainGroup{ 0 };
 		std::uintptr_t g_triShapeVtable{ 0 };
@@ -261,6 +263,7 @@ namespace CBRO::Hooks::CullGroups
 		std::uintptr_t g_blockAddOriginal{ 0 };
 		std::uintptr_t g_groupAddOriginal{ 0 };
 		std::uintptr_t g_childPushOriginal{ 0 };
+		std::uintptr_t g_fadeNodeAddOriginal{ 0 };
 		std::uintptr_t g_registerOriginal{ 0 };
 		bool           g_installed{ false };
 		bool           g_ready{ false };
@@ -269,6 +272,7 @@ namespace CBRO::Hooks::CullGroups
 		Util::SwitchableHook g_blockAddHook;
 		Util::SwitchableHook g_groupAddHook;
 		Util::SwitchableHook g_childPushHook;
+		Util::SwitchableHook g_fadeNodeAddHook;
 		Util::SwitchableHook g_registerHook;
 		std::array<Util::SwitchableHook, 5> g_cellNodeHooks{};  // one per prune site
 
@@ -281,6 +285,8 @@ namespace CBRO::Hooks::CullGroups
 			std::atomic<std::uint64_t> registrations{ 0 };
 			std::atomic<std::uint64_t> dropped{ 0 };  // registrations into the dropped accumulator
 			std::atomic<std::uint64_t> refused{ 0 };  // refused registrations handed to the refused observer
+			std::atomic<std::uint64_t> considered{ 0 };  // main-only Group::Adds offered to the group filter (one shared locked add up to v1.92.2)
+			std::atomic<std::uint64_t> refusedTicks{ 0 };  // QPC ticks inside the observer's callback, 1 call in 16 (v1.93; TakeRefusedTicks scales it)
 		};
 		constexpr std::size_t              kCountSlots = 64;
 		std::array<CallCounts, kCountSlots> g_callCounts{};
@@ -303,12 +309,16 @@ namespace CBRO::Hooks::CullGroups
 
 		// The group whose Group::Add or ChildPush is running on this thread (Block::Add's only callers).
 		thread_local const void* t_group{ nullptr };
+		thread_local const void* t_addingGroup{ nullptr };  // the group a hooked Group::Add asks its filter about (v1.99.2)
 
 		using BlockAddFn = std::int32_t (*)(void*, RE::NiAVObject*, const RE::NiBound*, std::int32_t);
 		using GroupAddFn = void (*)(void*, RE::NiAVObject*, const RE::NiBound*, std::uint32_t);
 		// The flag bytes travel in r9 and 8-byte stack slots; all seven arguments are passed on untouched,
 		// and RAX comes back unchanged (callers ignore it).
 		using ChildPushFn = std::uint64_t (*)(void*, RE::NiAVObject*, const RE::NiBound*, std::uint64_t, std::uint64_t, std::uint64_t, void*);
+		// AddP1FadeNode(group, node, context): three arguments (r9 passed on untouched, RAX back unchanged).
+		using FadeNodeAddFn = std::uint64_t (*)(void*, RE::NiAVObject*, void*, std::uint64_t);
+		thread_local const RE::NiAVObject* t_fadeNodeFiling{ nullptr };
 		using RegisterFn = bool (*)(void*, RE::NiAVObject*);
 
 		template <class T>
@@ -388,6 +398,24 @@ namespace CBRO::Hooks::CullGroups
 		thread_local const RE::NiBound* t_widened{ nullptr };  // (WidenBound, for the add in progress)
 		thread_local bool               t_forceVisible{ false };  // (ForceVisible, for the add in progress)
 
+		// The camera's position this frame (SetFrameEye), for the sky check of an entry dropped from another group.
+		float           g_frameEye[3]{};
+		bool            g_frameEyeValid{ false };
+		constexpr float kSkyEyeSlack = 4096.0f;
+
+		// Sky meshes sit at the camera (FO4OG 5.5b: world bounds at the camera, radius 16-600), so an entry of another group
+		// the filter drops is checked for one only when its bound reaches near the eye (v1.99.1): the check's read of the
+		// shader property's vtable was a miss on each of the ~1,200 entries a frame rejected in every view.
+		bool NearFrameEye(const RE::NiBound& a_bound) noexcept
+		{
+			if (!g_frameEyeValid) {
+				return true;
+			}
+			const float dx = a_bound.center.x - g_frameEye[0], dy = a_bound.center.y - g_frameEye[1], dz = a_bound.center.z - g_frameEye[2];
+			const float reach = std::max(a_bound.fRadius, 0.0f) + kSkyEyeSlack;
+			return !(dx * dx + dy * dy + dz * dz > reach * reach);  // (a NaN anywhere: checked)
+		}
+
 		bool IsSkyMesh(const RE::NiAVObject* a_object) noexcept
 		{
 			if (!a_object || !g_skyShaderVtable || ReadAt<std::uintptr_t>(a_object, 0) != g_triShapeVtable) {
@@ -404,18 +432,22 @@ namespace CBRO::Hooks::CullGroups
 			// the sky's force-visible mark.
 			const bool active = g_mainCullActive.load(std::memory_order_relaxed);
 			const auto observer = g_blockObserver.load(std::memory_order_relaxed);
-			const bool sky = a_startIndex < 0 && IsSkyMesh(a_object);
+			const auto owner = ReadAt<std::uintptr_t>(a_block, kBlockOwnerOffset);
+			const bool mainPass = owner != 0 && owner == MainOwner();
+			const auto kind = mainPass ? ClassifyGroup(t_group) : GroupKind::kUnknown;
+			// Sky meshes are filed into the main-only groups (all 18 in the v1.62 run), so only those entries are checked
+			// up front; an entry of another group is checked only where the filter would drop it (below). The check reads
+			// the shader property's vtable, a cache miss on nearly every object: 0.3 ms a frame on the main thread when it
+			// ran on every entry, ~92% of them group 0 (2026-10-26 profile, v1.92.2).
+			bool sky = a_startIndex < 0 && kind == GroupKind::kMainOnly && IsSkyMesh(a_object);
 			if (!active && !observer && !sky) {
 				return reinterpret_cast<BlockAddFn>(g_blockAddOriginal)(a_block, a_object, a_bound, a_startIndex);
 			}
 			const auto filter = g_filter.load(std::memory_order_relaxed);
 			const auto instanceFilter = g_instanceFilter.load(std::memory_order_relaxed);
 
-			const auto owner = ReadAt<std::uintptr_t>(a_block, kBlockOwnerOffset);
-			const bool mainPass = owner != 0 && owner == MainOwner();
 			const BlockAdd add{
-				a_block, a_object, a_bound, a_startIndex, owner, mainPass,
-				mainPass ? ClassifyGroup(t_group) : GroupKind::kUnknown,
+				a_block, a_object, a_bound, a_startIndex, owner, mainPass, kind,
 				reinterpret_cast<std::uintptr_t>(_ReturnAddress())
 			};
 			// CBRO only acts on DrawWorld's own cull (a later pass re-processing a group is left alone).
@@ -430,6 +462,9 @@ namespace CBRO::Hooks::CullGroups
 				if (add.kind == GroupKind::kUnknown) {
 					replacement = nullptr;  // (other readers possible: dropped from the main view only; the filter recorded it)
 				}
+			}
+			if (replacement && !sky && kind != GroupKind::kMainOnly && NearFrameEye(*a_bound)) {
+				sky = IsSkyMesh(a_object);
 			}
 			if (sky && replacement) {
 				g_skyKept.fetch_add(1, std::memory_order_relaxed);
@@ -497,7 +532,8 @@ namespace CBRO::Hooks::CullGroups
 
 		void GroupAdd(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags, std::uintptr_t a_returnAddress)
 		{
-			Count(LocalCounts().groupAdds);
+			auto& counts = LocalCounts();
+			Count(counts.groupAdds);
 			const bool active = g_mainCullActive.load(std::memory_order_relaxed);
 			const auto observer = g_groupObserver.load(std::memory_order_relaxed);
 			if (!active && !observer && !g_blockObserver.load(std::memory_order_relaxed)) {
@@ -519,11 +555,14 @@ namespace CBRO::Hooks::CullGroups
 				if (kind != GroupKind::kUnknown) {
 					const auto block = ReadAt<const std::uint8_t*>(a_group, a_object->IsGeometry() ? kGroupGeometryBlockOffset : kGroupNodeBlockOffset);
 					if (block && !block[kBlockMarkerBegin] && !block[kBlockMarkerEnd] && !block[kBlockMarkerExtra]) {
-						const auto considered = g_groupAddsConsidered.fetch_add(1, std::memory_order_relaxed);
-						if ((considered & 63) == 0) {  // sampled 1 in 64 (the log scales it back)
+						Count(counts.considered);
+						if ((counts.considered.load(std::memory_order_relaxed) & 63) == 0) {  // sampled 1 in 64 per thread (the log scales it back)
 							RecordGroupAddSite(a_returnAddress);
 						}
-						if (filter(a_object, a_bound, kind)) {
+						t_addingGroup = a_group;
+						const bool left = filter(a_object, a_bound, kind);
+						t_addingGroup = nullptr;
+						if (left) {
 							return;
 						}
 					}
@@ -552,13 +591,32 @@ namespace CBRO::Hooks::CullGroups
 			return reinterpret_cast<ChildPushFn>(g_childPushOriginal)(a_group, a_object, a_bound, a_flag, a_arg5, a_arg6, a_context);
 		}
 
+		// The fade node's flattened geometry goes through AddP1 and Block::Add one entry after another inside this call
+		// (FO4-ENGINE-NOTES 5.3): the node is kept for them, their parent pointers being its sub-nodes (v1.98.1).
+		std::uint64_t FadeNodeAddThunk(void* a_group, RE::NiAVObject* a_node, void* a_context, std::uint64_t a_arg4)
+		{
+			const auto outer = t_fadeNodeFiling;
+			t_fadeNodeFiling = a_node;
+			const auto result = reinterpret_cast<FadeNodeAddFn>(g_fadeNodeAddOriginal)(a_group, a_node, a_context, a_arg4);
+			t_fadeNodeFiling = outer;
+			return result;
+		}
+
 		// A registration the filters below refuse (all four register loops ignore the result, FO4-ENGINE-NOTES 5.2 item 6):
 		// the refused observer gets the call first, as the engine's own entry (1447420) would have got it.
 		bool Refuse(void* a_accumulator, RE::NiAVObject* a_object, CallCounts& a_counts) noexcept
 		{
 			if (const auto observer = g_refusedObserver.load(std::memory_order_relaxed)) {
 				Count(a_counts.refused);
-				observer(a_accumulator, a_object);
+				if ((a_counts.refused.load(std::memory_order_relaxed) & 15) == 0) {  // (sampled 1 in 16 per thread: the callback's own time)
+					LARGE_INTEGER before{}, after{};
+					QueryPerformanceCounter(&before);
+					observer(a_accumulator, a_object);
+					QueryPerformanceCounter(&after);
+					a_counts.refusedTicks.store(a_counts.refusedTicks.load(std::memory_order_relaxed) + static_cast<std::uint64_t>(after.QuadPart - before.QuadPart), std::memory_order_relaxed);
+				} else {
+					observer(a_accumulator, a_object);
+				}
 			}
 			return true;
 		}
@@ -622,16 +680,20 @@ namespace CBRO::Hooks::CullGroups
 		// by id and tests only the chunk's own bit 0 (FO4-ENGINE-NOTES 5.5b, 7.12). So when the walk starts a cell's
 		// node 3, an AppCulled node 9 of the same cell has its children filed into group 0 as the walk files a node 9's
 		// (each child with bit 0 clear, whole, flags 0). Every CBRO frame (the hooks are in only then), culling or not.
+		// The loops run to the engine's bound (Util::UsedSlots), not CommonLib's size(): a Runtime Combiner chunk
+		// container appended behind emptied slots was never reached (v1.92.11; a river wall rail 3.4k away, drawn by
+		// previs, missing in CBRO frames).
 		bool                       g_cellArtNode9{ false };
 		bool                       g_cellNodePruning{ false };
 		constexpr std::uint32_t    kCellArtNode = 9;
 		std::atomic<std::uint64_t> g_culledArtNodes{ 0 };   // AppCulled node 9s found
 		std::atomic<std::uint64_t> g_culledArtFiled{ 0 };   // their children filed
+		std::atomic<std::uint64_t> g_culledArtWalked{ 0 };  // ... or the node walked by the entry walk (v1.94.1)
 
 		void FileCulledCellArt(RE::NiAVObject* a_node3) noexcept
 		{
 			const auto cell = a_node3->parent;
-			if (!cell || cell->children.size() <= kCellArtNode || cell->children[3].get() != a_node3) {
+			if (!cell || Util::UsedSlots(cell->children) <= kCellArtNode || cell->children[3].get() != a_node3) {
 				return;
 			}
 			const auto art = cell->children[kCellArtNode].get();
@@ -643,9 +705,29 @@ namespace CBRO::Hooks::CullGroups
 				return;
 			}
 			g_culledArtNodes.fetch_add(1, std::memory_order_relaxed);
+			// The entry walk (bEntryWalk) takes the node as it takes a node 9 the scene walk offers: each child gets the cheap
+			// tests before anything is filed (v1.94.1; before, every child went in whole and its own children were judged one by
+			// one: ~1,700 containers and their meshes a frame in the 2026-10-27 run). The filter says false (the walk off, no
+			// culled frame): the children are filed whole as before.
+			if (g_cellNodePruning && g_mainCullActive.load(std::memory_order_relaxed)) {
+				if (const auto filter = g_cellNodeFilter.load(std::memory_order_relaxed); filter && filter(art, kCellArtNode)) {
+					g_culledArtWalked.fetch_add(1, std::memory_order_relaxed);
+					return;
+				}
+			}
 			std::uint64_t filed = 0;
-			for (auto& child : node->children) {
-				const auto object = child.get();
+			const auto&   children = node->children;
+			const auto    count = Util::UsedSlots(children);
+			for (std::uint16_t i = 0; i < count; ++i) {
+				// (each child's flags and world bound lines are a first touch, ~1,600 a frame: the child a few slots ahead
+				// is fetched first; v1.92.3)
+				if (static_cast<std::size_t>(i) + 4 < count) {
+					if (const auto ahead = reinterpret_cast<const char*>(children[static_cast<decltype(count)>(i + 4)].get())) {
+						_mm_prefetch(ahead + 0x100, _MM_HINT_T0);
+						_mm_prefetch(ahead + 0x80, _MM_HINT_T0);
+					}
+				}
+				const auto object = children[i].get();
 				if (object && !(object->GetFlags() & 1)) {
 					AddDirect(reinterpret_cast<void*>(g_mainGroup), object, &object->worldBound, 0);
 					++filed;
@@ -750,7 +832,7 @@ namespace CBRO::Hooks::CullGroups
 			if (!block || block[kBlockMarkerBegin] || block[kBlockMarkerEnd] || block[kBlockMarkerExtra]) {
 				return false;
 			}
-			g_groupAddsConsidered.fetch_add(1, std::memory_order_relaxed);
+			Count(LocalCounts().considered);
 			return filter(a_object, &a_object->worldBound, a_kind);
 		}
 
@@ -801,7 +883,7 @@ namespace CBRO::Hooks::CullGroups
 			const auto listedCount = listed ? ReadAt<std::uint32_t>(reinterpret_cast<const void*>(state), kStateRoomCountOffset) : 0u;
 			const auto isListed = [&](const void* a_room) { return std::find(listed, listed + listedCount, a_room) != listed + listedCount; };
 			std::uint64_t rooms = 0, filed = 0, objects = 0, leftOut = 0;
-			const auto node = a_cell->children.size() > 7 && a_cell->children[7] ? a_cell->children[7]->IsNode() : nullptr;
+			const auto node = Util::UsedSlots(a_cell->children) > 7 && a_cell->children[7] ? a_cell->children[7]->IsNode() : nullptr;
 			if (node && !(node->GetFlags() & 1)) {
 				for (auto& entry : node->children) {
 					const auto object = entry.get();
@@ -891,7 +973,7 @@ namespace CBRO::Hooks::CullGroups
 			if (g_interiorOutsideRooms) {
 				const auto group = reinterpret_cast<void*>(g_mainGroup);
 				const auto child = [&](std::uint16_t a_index) -> RE::NiNode* {
-					const auto object = cell->children.size() > a_index ? cell->children[a_index].get() : nullptr;
+					const auto object = Util::UsedSlots(cell->children) > a_index ? cell->children[a_index].get() : nullptr;
 					return object ? object->IsNode() : nullptr;
 				};
 				std::uint64_t leftOut = 0;
@@ -1267,6 +1349,22 @@ namespace CBRO::Hooks::CullGroups
 		g_mainRegistrationObserver.store(a_observer);
 	}
 
+	bool TracerWanted() noexcept
+	{
+		return g_refusedObserver.load(std::memory_order_relaxed) != nullptr && g_mainAccumulator != 0;
+	}
+
+	void HandToTracer(RE::NiAVObject* a_object) noexcept
+	{
+		const auto observer = g_refusedObserver.load(std::memory_order_relaxed);
+		if (!observer || !g_mainAccumulator || !a_object) {
+			return;
+		}
+		if (const auto accumulator = *reinterpret_cast<void* const*>(g_mainAccumulator)) {
+			observer(accumulator, a_object);
+		}
+	}
+
 	void SetRefusedObserver(RefusedObserver a_observer) noexcept
 	{
 		g_refusedObserver.store(a_observer, std::memory_order_release);
@@ -1282,6 +1380,18 @@ namespace CBRO::Hooks::CullGroups
 		const auto since = total - reported;
 		reported = total;
 		return since;
+	}
+
+	std::int64_t TakeRefusedTicks() noexcept
+	{
+		static std::uint64_t reported = 0;
+		std::uint64_t        total = 0;
+		for (const auto& slot : g_callCounts) {
+			total += slot.refusedTicks.load(std::memory_order_relaxed);
+		}
+		const auto since = total - reported;
+		reported = total;
+		return static_cast<std::int64_t>(since * 16);  // (1 call in 16 is timed)
 	}
 
 	void SetDroppedAccumulator(const void* a_accumulator) noexcept
@@ -1346,7 +1456,14 @@ namespace CBRO::Hooks::CullGroups
 
 	std::uint64_t TakeGroupAddsConsidered() noexcept
 	{
-		return g_groupAddsConsidered.exchange(0);
+		static std::uint64_t reported = 0;  // (main thread, at the log)
+		std::uint64_t        total = 0;
+		for (const auto& slot : g_callCounts) {
+			total += slot.considered.load(std::memory_order_relaxed);
+		}
+		const auto since = total - reported;
+		reported = total;
+		return since;
 	}
 
 	void SetRegistrationMode(bool a_cbro) noexcept
@@ -1430,6 +1547,10 @@ namespace CBRO::Hooks::CullGroups
 		g_blockAddOriginal = Util::DetourSwitchable(g_blockAddHook, CBRO::Engine::OG(kBlockAddID).address(), Util::FnAddr(&BlockAddThunk), kBlockAddPrologue, "cullgroups:Block::Add");
 		g_groupAddOriginal = Util::DetourSwitchable(g_groupAddHook, CBRO::Engine::OG(kGroupAddID).address(), Util::FnAddr(&GroupAddThunk), kGroupAddPrologue, "cullgroups:Group::Add");
 		g_childPushOriginal = Util::DetourSwitchable(g_childPushHook, CBRO::Engine::OG(kChildPushID).address(), Util::FnAddr(&ChildPushThunk), kChildPushPrologue, "cullgroups:ChildPush");
+		g_fadeNodeAddOriginal = Util::DetourSwitchable(g_fadeNodeAddHook, CBRO::Engine::OG(kFadeNodeAddID).address(), Util::FnAddr(&FadeNodeAddThunk), kFadeNodeAddPrologue, "cullgroups:AddP1FadeNode");
+		if (!g_fadeNodeAddOriginal) {
+			logger::warn("cullgroups: AddP1FadeNode not hooked: a fade node's geometry can take the node's decision only through its parent pointer (bChildInherit)");
+		}
 		g_registerOriginal = Util::WriteVFuncSwitchable(g_registerHook, CBRO::Engine::OG(kAccumulatorVtableID).address(), kRegisterObjectSlot, Util::FnAddr(&RegisterObjectThunk), "cullgroups:BSShaderAccumulator::RegisterObject");
 		// The walk's node loops carry two things: cell-node pruning and the AppCulled node-9 art (FileCulledCellArt).
 		// (and, room bounds off, the unrestricted interior branch's rooms: FileRooms from its child-3 loop)
@@ -1493,8 +1614,8 @@ namespace CBRO::Hooks::CullGroups
 		// The accumulator hook (RegisterObject) stays in either way: it filters only while DrawWorld culls in CBRO
 		// mode and otherwise just counts, so the two modes' registrations (what each view draws) can be compared.
 		bool ok = true;
-		const std::array<Util::SwitchableHook*, 8> hooks{
-			&g_blockAddHook, &g_groupAddHook, &g_childPushHook,
+		const std::array<Util::SwitchableHook*, 9> hooks{
+			&g_blockAddHook, &g_groupAddHook, &g_childPushHook, &g_fadeNodeAddHook,
 			&g_cellNodeHooks[0], &g_cellNodeHooks[1], &g_cellNodeHooks[2], &g_cellNodeHooks[3], &g_cellNodeHooks[4]
 		};
 		for (auto* hook : hooks) {
@@ -1565,7 +1686,7 @@ namespace CBRO::Hooks::CullGroups
 
 	CellArtCounts TakeCellArtCounts() noexcept
 	{
-		return { g_culledArtNodes.exchange(0), g_culledArtFiled.exchange(0) };
+		return { g_culledArtNodes.exchange(0), g_culledArtFiled.exchange(0), g_culledArtWalked.exchange(0) };
 	}
 
 	OutsideRoomsCounts TakeOutsideRoomsCounts() noexcept
@@ -1629,6 +1750,11 @@ namespace CBRO::Hooks::CullGroups
 		t_widened = a_bound;
 	}
 
+	bool ForceVisiblePending() noexcept
+	{
+		return t_forceVisible;
+	}
+
 	void ForceVisible() noexcept
 	{
 		t_forceVisible = true;
@@ -1642,6 +1768,69 @@ namespace CBRO::Hooks::CullGroups
 		GroupScope scope(a_group);  // (so the Block::Add that follows knows the group, as after a hooked Group::Add)
 		reinterpret_cast<GroupAddFn>(g_groupAddOriginal)(a_group, a_object, a_bound, a_flags);
 		return true;
+	}
+
+	bool GroupAddHooked() noexcept
+	{
+		return g_groupAddOriginal != 0 && g_mainGroup != 0 && g_group1 != 0;
+	}
+
+	void* WalkGroup(bool a_group1) noexcept
+	{
+		return reinterpret_cast<void*>(a_group1 ? g_group1 : g_mainGroup);
+	}
+
+	bool MarkerPending(const void* a_group, RE::NiAVObject* a_object) noexcept
+	{
+		// (as GroupAdd reads it: no block, or a marker byte set, means the add can't be left out)
+		const auto block = ReadAt<const std::uint8_t*>(a_group, a_object->IsGeometry() ? kGroupGeometryBlockOffset : kGroupNodeBlockOffset);
+		return !block || block[kBlockMarkerBegin] || block[kBlockMarkerEnd] || block[kBlockMarkerExtra];
+	}
+
+	// The same on either of the group's blocks (the geometry block, the node block): for a run of entries the walk leaves
+	// out whole without reading one, which must not leave a pending marker waiting for another entry (v1.98).
+	bool MarkerPendingAny(const void* a_group) noexcept
+	{
+		for (const auto offset : { kGroupGeometryBlockOffset, kGroupNodeBlockOffset }) {
+			const auto block = ReadAt<const std::uint8_t*>(a_group, offset);
+			if (!block || block[kBlockMarkerBegin] || block[kBlockMarkerEnd] || block[kBlockMarkerExtra]) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	const RE::NiAVObject* FadeNodeFiling() noexcept
+	{
+		return t_fadeNodeFiling;
+	}
+
+	const void* CurrentGroup() noexcept
+	{
+		return t_group;
+	}
+
+	const void* AddingGroup() noexcept
+	{
+		return t_addingGroup;
+	}
+
+	void SetFrameEye(const float* a_eye, bool a_valid) noexcept
+	{
+		std::copy_n(a_eye, 3, g_frameEye);
+		g_frameEyeValid = a_valid;
+	}
+
+	void NoteEntryOffered(void* a_group, RE::NiAVObject* a_object, std::uintptr_t a_returnAddress) noexcept
+	{
+		if (const auto observer = g_groupObserver.load(std::memory_order_relaxed)) {
+			observer(a_group, a_object, ReadAt<std::uintptr_t>(a_group, kGroupOwnerOffset), a_returnAddress);
+		}
+	}
+
+	const void* SceneNode() noexcept
+	{
+		return g_shadowSceneNode ? *reinterpret_cast<const void* const*>(g_shadowSceneNode) : nullptr;
 	}
 
 	std::uintptr_t MainOwner() noexcept

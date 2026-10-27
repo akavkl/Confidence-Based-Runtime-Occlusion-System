@@ -106,6 +106,7 @@ namespace CBRO::Hooks::CullGroups
 	// main-pass entries, so no frustum test leaves it out of a pass that processes its group (v1.89.1, the player's 3D).
 	// Consumed by that add; ignored when the filter rejects the entry.
 	void ForceVisible() noexcept;
+	[[nodiscard]] bool ForceVisiblePending() noexcept;  // ... asked for by the add in progress (the recorder reads it)
 
 	// Called after a main-pass add into a main-only group that wrote instance entries [a_first, a_end) into
 	// a_add.block (merge-instanced meshes, fresh or continued). Instance k of the mesh is entry
@@ -149,7 +150,12 @@ namespace CBRO::Hooks::CullGroups
 	// RegisterObject (1447420) would have received (Core/TraceFeed). Null = none.
 	using RefusedObserver = void (*)(const void* a_accumulator, RE::NiAVObject* a_object);
 	void SetRefusedObserver(RefusedObserver a_observer) noexcept;
+	// Whether a refused observer is set (v1.99.3), and an object handed to it as if the main accumulator's registration
+	// of it had been refused (main thread: an entry CBRO hands the tracer instead of filing it).
+	[[nodiscard]] bool TracerWanted() noexcept;
+	void HandToTracer(RE::NiAVObject* a_object) noexcept;
 	[[nodiscard]] std::uint64_t TakeRefusedRegistrations() noexcept;  // handed to it since the last call (main thread)
+	[[nodiscard]] std::int64_t  TakeRefusedTicks() noexcept;          // QPC ticks inside its callback since the last call, scaled from a 1-in-16 sample (v1.93)
 	void SetCellNodeFilter(CellNodeFilter a_filter);
 	[[nodiscard]] std::uint64_t TakeGroupAddsConsidered() noexcept;  // main-only Group::Adds offered to the group filter
 	[[nodiscard]] std::string   TakeGroupAddSites(double a_frames);  // their callers (return addresses) since the last call, most frequent first
@@ -216,6 +222,36 @@ namespace CBRO::Hooks::CullGroups
 	// Block::Add that follows knows the group), bypassing the group filter: for a caller that has already decided
 	// (Core/Feed). Main thread, while DrawWorld culls. False if Group::Add isn't hooked.
 	bool AddDirect(void* a_group, RE::NiAVObject* a_object, const RE::NiBound* a_bound, std::uint32_t a_flags) noexcept;
+	[[nodiscard]] bool GroupAddHooked() noexcept;  // AddDirect can file (the Group::Add detour is installed)
+
+	// The entry walk (Core/Occlusion, v1.94, bEntryWalk): for a node a prune site offered, CBRO files the node's entries
+	// itself. WalkGroup: the group the engine would have filed an entry into (DrawWorld's group 0; group 1 for a root's
+	// child with flags bit 40). MarkerPending: one of Group::Add's group markers is pending on the entry's block there,
+	// so the entry can't be left out without moving the marker to another (the walk files it unjudged, as GroupAdd
+	// does). NoteEntryOffered: the group observer (Core/Feed's audit) gets the add the engine would have made, with
+	// the return address of the site it would have come from. Main thread, inside DrawWorld's cull.
+	[[nodiscard]] void* WalkGroup(bool a_group1) noexcept;
+	[[nodiscard]] bool  MarkerPending(const void* a_group, RE::NiAVObject* a_object) noexcept;
+	[[nodiscard]] bool  MarkerPendingAny(const void* a_group) noexcept;  // ... on either of the group's blocks (no object read; v1.98)
+
+	// The fade node whose flattened geometry the engine is filing right now on this thread (inside AddP1FadeNode,
+	// FO4-ENGINE-NOTES 5.3), or null. Such a geometry's parent pointer is a sub-node of the fade node, never an entry
+	// decided itself; the fade node was (v1.98.1, for bChildInherit).
+	[[nodiscard]] const RE::NiAVObject* FadeNodeFiling() noexcept;
+
+	// The group whose Group::Add (hooked, or AddDirect) or ChildPush is running on this thread: the group a Block::Add
+	// files into (null outside them).
+	[[nodiscard]] const void* CurrentGroup() noexcept;
+	// The group a hooked Group::Add asks the group filter about, during that call (null otherwise; v1.99.2).
+	[[nodiscard]] const void* AddingGroup() noexcept;
+	void NoteEntryOffered(void* a_group, RE::NiAVObject* a_object, std::uintptr_t a_returnAddress) noexcept;
+
+	// The camera's position this frame (main thread, at the frame's start; a_valid false: unknown, every dropped entry of
+	// a shared group is checked for a sky mesh).
+	void SetFrameEye(const float* a_eye, bool a_valid) noexcept;
+
+	// The scene root (the ShadowSceneNode the batched sun path takes its light from), as the engine's global holds it now.
+	[[nodiscard]] const void* SceneNode() noexcept;
 
 	// The sun's shadow cascades as the engine has them set up (main thread, once per culled frame: what ran is
 	// counted since the previous call). False if the engine's structures couldn't be read (then nothing about
@@ -270,6 +306,7 @@ namespace CBRO::Hooks::CullGroups
 	{
 		std::uint64_t nodes{ 0 };
 		std::uint64_t filed{ 0 };
+		std::uint64_t walked{ 0 };  // taken by the entry walk instead (bEntryWalk, v1.94.1)
 	};
 	[[nodiscard]] CellArtCounts TakeCellArtCounts() noexcept;
 

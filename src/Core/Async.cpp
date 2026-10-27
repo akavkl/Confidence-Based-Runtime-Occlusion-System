@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <condition_variable>
+#include <intrin.h>
 #include <thread>
 
 namespace CBRO::Core::Async
@@ -22,15 +23,17 @@ namespace CBRO::Core::Async
 		constexpr std::size_t kIndexSlots = std::size_t{ 1 } << kIndexBits;
 		constexpr std::size_t kIndexProbe = 64;
 
-		struct Candidate
+		struct alignas(32) Candidate  // (two to a cache line, none across two: v1.92.1)
 		{
 			RE::NiAVObject*             object{ nullptr };
 			RE::NiBound                 bound{};
 			Hooks::CullGroups::GroupKind kind{ Hooks::CullGroups::GroupKind::kUnknown };
 		};
 
-		// One thread's candidates of a frame and, once the worker ran, their records in the same order.
-		struct Lane
+		// One thread's candidates of a frame and, once the worker ran, their records in the same order. A cache line each
+		// (v1.92): two lanes shared one, so the main thread's count and a block job's were written into the same line
+		// for every entry.
+		struct alignas(64) Lane
 		{
 			Candidate*         items{ nullptr };
 			Occlusion::Record* records{ nullptr };
@@ -184,11 +187,33 @@ namespace CBRO::Core::Async
 			double        moveMarginSum{ 0.0 };
 			double        viewWidenSum{ 0.0 };
 		};
-		Stats                      g_stats;
-		std::atomic<std::uint64_t> g_lookups{ 0 };
-		std::atomic<std::uint64_t> g_hitsSequential{ 0 };
-		std::atomic<std::uint64_t> g_hitsAhead{ 0 };
-		std::atomic<std::uint64_t> g_hitsIndex{ 0 };
+		Stats g_stats;
+
+		// Lookup counts, one block per thread slot, each written only by its own thread (no atomic add). Up to v1.91 they
+		// were four shared atomics, two locked adds per lookup from the main thread and the block jobs at once: one
+		// contended cache line per entry, as the v1.36 run found in the shared candidate ring (above).
+		struct alignas(64) LookupCounts
+		{
+			std::atomic<std::uint64_t> lookups{ 0 };
+			std::atomic<std::uint64_t> sequential{ 0 };
+			std::atomic<std::uint64_t> ahead{ 0 };
+			std::atomic<std::uint64_t> indexed{ 0 };
+		};
+		std::array<LookupCounts, kThreads> g_lookupCounts{};
+
+		struct LookupTotals
+		{
+			std::uint64_t lookups{ 0 };
+			std::uint64_t sequential{ 0 };
+			std::uint64_t ahead{ 0 };
+			std::uint64_t indexed{ 0 };
+		};
+		LookupTotals g_lookupsReported;  // (main thread, LogStats)
+
+		void Count(std::atomic<std::uint64_t>& a_value) noexcept
+		{
+			a_value.store(a_value.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		}
 
 		double Now() noexcept
 		{
@@ -370,6 +395,30 @@ namespace CBRO::Core::Async
 		return valid;
 	}
 
+	// The walk files the same objects in the same order every frame (98% of lookups land on the cursor), so the objects a
+	// few records ahead are what the engine and the hooks touch next. Their header (vtable, parent +0x28), world bound
+	// (+0xB0) and flags (+0x108) lines, and the worker's record itself (written on another core), are fetched now, while
+	// this entry is processed: the 2026-10-26 profile had ~0.7 ms a frame of the main thread's CBRO time on those first
+	// touches (Filter, FilterDecide, GroupAddThunk, PlayerPart, the record copy). A stale pointer (an object freed since
+	// last frame) only wastes the prefetch (v1.92.3).
+	namespace
+	{
+		constexpr std::uint32_t kPrefetchAhead = 2;
+
+		void PrefetchAhead(const Lane& a_lane, std::uint32_t a_index) noexcept
+		{
+			if (a_index < a_lane.judged) {
+				const auto& record = a_lane.records[a_index];
+				_mm_prefetch(reinterpret_cast<const char*>(&record), _MM_HINT_T0);
+				if (const auto object = static_cast<const char*>(record.object)) {
+					_mm_prefetch(object, _MM_HINT_T0);
+					_mm_prefetch(object + 0x80, _MM_HINT_T0);
+					_mm_prefetch(object + 0x100, _MM_HINT_T0);
+				}
+			}
+		}
+	}
+
 	const Occlusion::Record* Find(const void* a_object) noexcept
 	{
 		if (!g_readFilled.load(std::memory_order_acquire)) {
@@ -379,7 +428,8 @@ namespace CBRO::Core::Async
 		if (slot >= static_cast<int>(kThreads)) {
 			return nullptr;
 		}
-		g_lookups.fetch_add(1, std::memory_order_relaxed);
+		auto& counts = g_lookupCounts[static_cast<std::size_t>(slot)];
+		Count(counts.lookups);
 		const auto parity = g_parity.load(std::memory_order_acquire);
 		const auto& lane = g_frames[parity ^ 1u].lanes[static_cast<std::size_t>(slot)];
 		// A new frame: the cursor starts over.
@@ -392,20 +442,30 @@ namespace CBRO::Core::Async
 			const auto judged = lane.judged;
 			auto&      cursor = t_state.cursor;
 			if (cursor < judged && lane.records[cursor].object == a_object) {
-				g_hitsSequential.fetch_add(1, std::memory_order_relaxed);
-				return &lane.records[cursor++];
+				Count(counts.sequential);
+				const auto* found = &lane.records[cursor++];
+				PrefetchAhead(lane, cursor + kPrefetchAhead - 1);
+				return found;
 			}
 			for (std::uint32_t k = 1; k < kLookAhead && cursor + k < judged; ++k) {
 				if (lane.records[cursor + k].object == a_object) {
-					g_hitsAhead.fetch_add(1, std::memory_order_relaxed);
+					Count(counts.ahead);
 					const auto* found = &lane.records[cursor + k];
 					cursor += k + 1;
+					PrefetchAhead(lane, cursor + kPrefetchAhead - 1);
 					return found;
 				}
 			}
 		}
 		if (const auto record = g_indices[parity ^ 1u].Find(a_object)) {
-			g_hitsIndex.fetch_add(1, std::memory_order_relaxed);
+			Count(counts.indexed);
+			// The sequence goes on after the record when it is this lane's (v1.92.2). Up to v1.92.1 the cursor stayed
+			// where the walk left the look-ahead's reach (a stretch walked last frame and pruned now, or the reverse), so
+			// every later object of the lane came here too: 1,700 index probes a frame, each a cache miss.
+			if (lane.records && record >= lane.records && record < lane.records + lane.judged) {
+				t_state.cursor = static_cast<std::uint32_t>(record - lane.records) + 1;
+				PrefetchAhead(lane, t_state.cursor + kPrefetchAhead - 1);
+			}
 			return record;
 		}
 		return nullptr;
@@ -499,10 +559,18 @@ namespace CBRO::Core::Async
 			return;
 		}
 		const double frames = std::max(1u, a_frames);
-		const auto   lookups = g_lookups.exchange(0);
-		const auto   sequential = g_hitsSequential.exchange(0);
-		const auto   ahead = g_hitsAhead.exchange(0);
-		const auto   indexed = g_hitsIndex.exchange(0);
+		LookupTotals totals;
+		for (const auto& slot : g_lookupCounts) {
+			totals.lookups += slot.lookups.load(std::memory_order_relaxed);
+			totals.sequential += slot.sequential.load(std::memory_order_relaxed);
+			totals.ahead += slot.ahead.load(std::memory_order_relaxed);
+			totals.indexed += slot.indexed.load(std::memory_order_relaxed);
+		}
+		const auto lookups = totals.lookups - g_lookupsReported.lookups;
+		const auto sequential = totals.sequential - g_lookupsReported.sequential;
+		const auto ahead = totals.ahead - g_lookupsReported.ahead;
+		const auto indexed = totals.indexed - g_lookupsReported.indexed;
+		g_lookupsReported = totals;
 		const auto&  s = g_stats;
 		const double jobs = std::max(1u, s.submitted);
 		logger::info(

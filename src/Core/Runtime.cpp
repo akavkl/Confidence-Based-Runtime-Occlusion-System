@@ -3,6 +3,8 @@
 #include "Core/Async.h"
 #include "Core/Feed.h"
 #include "Core/HangWatch.h"
+#include "Core/Recorder.h"
+#include "Core/Sampler.h"
 #include "Core/SetDiff.h"
 #include "Core/HiZ.h"
 #include "Core/Occlusion.h"
@@ -79,6 +81,7 @@ namespace CBRO::Core::Runtime
 			bool          interiorStandby{ false };   // the scene is an interior/override root and bInteriors=0: previs mode regardless of wantActive
 			bool          interiorScene{ false };     // the scene is an interior/override root (the gates), whatever bInteriors says
 			bool          toggleKeyDown{ false };
+			std::uint32_t toggleAfterDump{ 0 };     // frames left until the hotkey's switch to previs, after the dump it asked for (v1.92.8)
 			bool          failureHandled{ false };
 			std::atomic<int> previsRequest{ -1 };  // previs to switch at the next cull begin: 0 off, 1 back to the original (-1: none)
 			bool          loadSwitch{ false };       // previs was switched off at a loading screen (v1.44); the first cull after decides what follows
@@ -91,6 +94,7 @@ namespace CBRO::Core::Runtime
 			int           notifiedEffective{ -1 };
 			bool          statusKeyDown{ false };
 			bool          diagnosticKeyDown{ false };
+			bool          recorderKeyDown{ false };
 			int           diagnostic{ 0 };  // 0 normal, 1 decide-only, 2 decide-only + no depth capture
 			std::uint32_t selfCheckAttempts{ 0 };
 			bool          originalPrevisKnown{ false };
@@ -1179,16 +1183,22 @@ namespace CBRO::Core::Runtime
 			kBucketHiZ,  // CBRO's depth capture and hi-z build, right after the pre-pass (marks 3-4; previs mode: nothing)
 			kBucketSun,
 			kBucketForward,
-			kBucketBetween,
+			// (v1.93) the gaps between the stages, each its own (the 15:17 log of 2026-10-26 had CBRO classic 4.07 ms
+			// "between" against previs's 1.50, more than the cull's own gap, with no way to tell which gap)
+			kBucketGapCull,     // cull end to pre-pass begin
+			kBucketGapPrePass,  // pre-pass (or hi-z) end to shadow maps begin
+			kBucketGapSun,      // shadow maps end to forward begin
+			kBucketBetween,     // any other gap (a mark missing)
 			kBucketRest,
 			kBucketCount
 		};
 		// (the "shadow maps" stage, Render_PreUI+0x1BF, renders the lamps' shadow maps as well as the sun's cascades: the
 		// v1.31 interior run had 10 ms of lamp shadow maps in it with no sun at all)
-		constexpr std::array   kBucketNames{ "cull"sv, "pre-pass"sv, "hi-z"sv, "shadow maps"sv, "forward"sv, "between"sv, "rest"sv };
+		constexpr std::array   kBucketNames{ "cull"sv, "pre-pass"sv, "hi-z"sv, "shadow maps"sv, "forward"sv, "after cull"sv, "after pre-pass"sv, "after shadow maps"sv, "other gaps"sv, "rest"sv };
 		// Marks: 0 cull begin, 1 cull end, 2 pre-pass begin, 3 pre-pass end (the engine's), 4 hi-z capture end, 5 shadow
 		// maps begin, 6 shadow maps end, 7 forward begin, 8 forward end, 9 the next frame's cull begin.
 		constexpr std::size_t  kMarkCount = 10;
+		constexpr std::array   kMarkNames{ "cull begin"sv, "cull end"sv, "pre-pass begin"sv, "pre-pass end"sv, "hi-z end"sv, "shadows begin"sv, "shadows end"sv, "forward begin"sv, "forward end"sv, "next cull begin"sv };
 
 		struct ModeBuckets
 		{
@@ -1210,8 +1220,55 @@ namespace CBRO::Core::Runtime
 			}
 		};
 
-		// Adds the spans between consecutive present marks (0 = absent, in ms) to the buckets: a stage's own span when
-		// both its marks are present and adjacent, "rest" for a span ending at the next cull begin, else "between".
+		// The bucket of the span from mark a_last to mark a_j, the next present mark: a stage's own span when both its
+		// marks are present and adjacent, "rest" for a span ending at the next cull begin, else the gap it starts in.
+		Bucket BucketFor(std::size_t a_last, std::size_t a_j) noexcept
+		{
+			Bucket bucket = kBucketBetween;
+			if (a_j == a_last + 1) {
+				switch (a_last) {
+				case 0:
+					bucket = kBucketCull;
+					break;
+				case 2:
+					bucket = kBucketPrePass;
+					break;
+				case 3:
+					bucket = kBucketHiZ;
+					break;
+				case 5:
+					bucket = kBucketSun;
+					break;
+				case 7:
+					bucket = kBucketForward;
+					break;
+				default:
+					break;
+				}
+			}
+			if (a_j == kMarkCount - 1 && bucket == kBucketBetween) {
+				bucket = kBucketRest;
+			}
+			if (bucket == kBucketBetween) {
+				switch (a_last) {
+				case 1:
+					bucket = kBucketGapCull;
+					break;
+				case 3:
+				case 4:
+					bucket = kBucketGapPrePass;
+					break;
+				case 6:
+					bucket = kBucketGapSun;
+					break;
+				default:
+					break;
+				}
+			}
+			return bucket;
+		}
+
+		// Adds the spans between consecutive present marks (0 = absent, in ms) to the buckets.
 		void FoldMarks(const double a_marks[kMarkCount], ModeBuckets& a_out) noexcept
 		{
 			std::size_t last = 0;
@@ -1219,32 +1276,76 @@ namespace CBRO::Core::Runtime
 				if (!(a_marks[j] > 0.0)) {
 					continue;
 				}
-				Bucket bucket = kBucketBetween;
-				if (j == last + 1) {
-					switch (last) {
-					case 0:
-						bucket = kBucketCull;
-						break;
-					case 2:
-						bucket = kBucketPrePass;
-						break;
-					case 3:
-						bucket = kBucketHiZ;
-						break;
-					case 5:
-						bucket = kBucketSun;
-						break;
-					case 7:
-						bucket = kBucketForward;
-						break;
-					default:
-						break;
+				a_out.ms[BucketFor(last, j)] += std::max(0.0, a_marks[j] - a_marks[last]);
+				last = j;
+			}
+			++a_out.frames;
+		}
+
+		// (v1.93.1) The GPU's work per bucket from pipeline-statistics queries, one per span between marks: triangles
+		// handed to the input assembler and pixel-shader invocations. Unlike a timestamp span these hold no idle time, so
+		// a bucket whose work differs between the modes differs in what was drawn; one whose work is equal while its
+		// timestamp span isn't was waiting. (The 16:40 run of 2026-10-26: CBRO classic's "after shadow maps", the
+		// deferred composite with no scene draws and no CBRO code, took 2.5-3.8 ms of main-thread time against previs's
+		// 1.2-2.0, and its pre-pass and shadow-map timestamp spans ran 1-3 ms longer: work or waiting is the question.)
+		struct ModeWork
+		{
+			std::array<double, kBucketCount> triangles{};
+			std::array<double, kBucketCount> pixels{};
+			std::uint32_t                    frames{ 0 };
+
+			std::string Describe() const
+			{
+				if (!frames) {
+					return "-";
+				}
+				std::string text;
+				double      tri = 0.0, px = 0.0;
+				for (std::size_t i = 0; i < kBucketCount; ++i) {
+					text += std::format("{}{} {:.2f}/{:.1f}", i ? " | " : "", kBucketNames[i], triangles[i] / frames / 1e6, pixels[i] / frames / 1e6);
+					tri += triangles[i];
+					px += pixels[i];
+				}
+				return std::format("{} = {:.2f}/{:.1f} ({} frames)", text, tri / frames / 1e6, px / frames / 1e6, frames);
+			}
+		};
+
+		// Adds each span's statistics (indexed by the mark the span begins at; a_written = the marks present) to the
+		// bucket the span's marks select, as FoldMarks does with the times.
+		// (v1.93.2) How far the GPU runs behind the CPU at each mark: the time from the CPU issuing a mark's timestamp to the
+		// GPU executing it, per mode. The two clocks have an unknown offset, so an interval's smallest gap over all marks
+		// and modes stands for "the GPU was idle there" and every average is reported above it.
+		struct ModeLag
+		{
+			std::array<double, kMarkCount>        sum{};
+			std::array<std::uint32_t, kMarkCount> count{};
+
+			std::string Describe(double a_floor) const
+			{
+				if (!count[0]) {
+					return "-";
+				}
+				std::string text;
+				for (std::size_t i = 0; i < kMarkCount; ++i) {
+					if (!count[i]) {
+						continue;
 					}
+					text += std::format("{}{} {:.2f}", text.empty() ? "" : " | ", kMarkNames[i], sum[i] / count[i] - a_floor);
 				}
-				if (j == kMarkCount - 1 && bucket == kBucketBetween) {
-					bucket = kBucketRest;
+				return std::format("{} ({} frames)", text, count[0]);
+			}
+		};
+
+		void FoldStats(const std::uint64_t a_triangles[kMarkCount], const std::uint64_t a_pixels[kMarkCount], std::uint32_t a_written, ModeWork& a_out) noexcept
+		{
+			std::size_t last = 0;
+			for (std::size_t j = 1; j < kMarkCount; ++j) {
+				if (!(a_written & (1u << j))) {
+					continue;
 				}
-				a_out.ms[bucket] += std::max(0.0, a_marks[j] - a_marks[last]);
+				const auto bucket = BucketFor(last, j);
+				a_out.triangles[bucket] += static_cast<double>(a_triangles[last]);
+				a_out.pixels[bucket] += static_cast<double>(a_pixels[last]);
 				last = j;
 			}
 			++a_out.frames;
@@ -1268,6 +1369,11 @@ namespace CBRO::Core::Runtime
 			int                                  mode{ -1 };  // the frame's mode once its cull begin ran (see kModeNames)
 			std::int64_t                         setupTicks{ 0 };
 			std::int64_t                         captureTicks{ 0 };
+			// (v1.93) CBRO's own work inside the gaps: the frame boundary (every frame), the shadow-map stage's begin and
+			// end hooks (CBRO-mode frames)
+			std::int64_t                         boundaryTicks{ 0 };
+			std::int64_t                         lightsBeginTicks{ 0 };
+			std::int64_t                         cascadesEndTicks{ 0 };
 			std::uint32_t                        cullFrames{ 0 };
 			std::uint32_t                        prepassFrames{ 0 };
 			std::array<ModeBuckets, kModes>      cpu{};
@@ -1293,6 +1399,12 @@ namespace CBRO::Core::Runtime
 		// waiting once the GPU is done (4+ frames later). A span includes the GPU's idle time between its marks (the
 		// GPU waiting for the CPU), so a span that grows with a mode while its CPU bucket doesn't is GPU work, and a
 		// frame whose GPU total equals the CPU total in both modes is paced by whichever the buckets say.
+		struct LagReport
+		{
+			std::array<ModeLag, kModes> modes{};
+			double                      floor{ 0.0 };
+		};
+
 		class GpuTimeline
 		{
 		public:
@@ -1309,8 +1421,10 @@ namespace CBRO::Core::Runtime
 				Poll(context);
 				auto& previous = m_ring[m_current];
 				if (previous.open) {
+					previous.cpu[kMarkCount - 1] = Qpc();
 					context->End(previous.marks[kMarkCount - 1]);  // this cull begin closes the previous frame's "rest"
 					previous.written |= 1u << (kMarkCount - 1);
+					CloseSpan(context, previous);
 					context->End(previous.disjoint);
 					previous.open = false;
 					previous.pending = true;
@@ -1324,8 +1438,14 @@ namespace CBRO::Core::Runtime
 				frame.open = true;
 				frame.mode = a_mode;
 				frame.written = 0;
+				frame.statsWritten = 0;
+				frame.span = -1;
 				context->Begin(frame.disjoint);
 				Mark(0);
+				// (v1.93.2) The commands up to this mark go to the GPU now, so the cull-begin stamp measures the GPU's
+				// backlog at the frame boundary rather than the runtime's next flush. The engine presented before this
+				// point; what is pending here is small.
+				context->Flush();
 			}
 
 			void Mark(std::size_t a_index)
@@ -1335,8 +1455,13 @@ namespace CBRO::Core::Runtime
 					return;
 				}
 				if (const auto context = Util::GetContext()) {
+					frame.cpu[a_index] = Qpc();
 					context->End(frame.marks[a_index]);
 					frame.written |= 1u << a_index;
+					// (the statistics of the span this mark ends, then the span it begins: one query open at a time)
+					CloseSpan(context, frame);
+					context->Begin(frame.stats[a_index]);
+					frame.span = static_cast<int>(a_index);
 				}
 			}
 
@@ -1344,6 +1469,21 @@ namespace CBRO::Core::Runtime
 			{
 				auto out = m_gpu;
 				m_gpu = {};
+				return out;
+			}
+
+			std::array<ModeWork, kModes> TakeWork() noexcept
+			{
+				auto out = m_work;
+				m_work = {};
+				return out;
+			}
+
+			LagReport TakeLag() noexcept
+			{
+				LagReport out{ m_lag, m_lagMin < kNoLag ? m_lagMin : 0.0 };
+				m_lag = {};
+				m_lagMin = kNoLag;
 				return out;
 			}
 
@@ -1357,16 +1497,30 @@ namespace CBRO::Core::Runtime
 
 		private:
 			static constexpr std::uint32_t kRing = 8;
+			static constexpr double        kNoLag = 1.0e300;
 
 			struct Frame
 			{
 				ID3D11Query*  disjoint{ nullptr };
 				ID3D11Query*  marks[kMarkCount]{};
+				ID3D11Query*  stats[kMarkCount - 1]{};  // pipeline statistics of the span each mark begins (v1.93.1)
 				bool          open{ false };
 				bool          pending{ false };
 				int           mode{ 0 };
 				std::uint32_t written{ 0 };
+				std::uint32_t statsWritten{ 0 };
+				int           span{ -1 };  // the mark whose statistics query is open, or -1
+				std::int64_t  cpu[kMarkCount]{};  // QPC when the CPU issued each mark (v1.93.2)
 			};
+
+			static void CloseSpan(ID3D11DeviceContext* a_context, Frame& a_frame)
+			{
+				if (a_frame.span >= 0) {
+					a_context->End(a_frame.stats[a_frame.span]);
+					a_frame.statsWritten |= 1u << a_frame.span;
+					a_frame.span = -1;
+				}
+			}
 
 			bool Create(ID3D11Device* a_device)
 			{
@@ -1379,6 +1533,12 @@ namespace CBRO::Core::Runtime
 					desc.Query = D3D11_QUERY_TIMESTAMP;
 					for (auto& mark : frame.marks) {
 						if (FAILED(a_device->CreateQuery(&desc, &mark))) {
+							m_failed = true;
+						}
+					}
+					desc.Query = D3D11_QUERY_PIPELINE_STATISTICS;
+					for (auto& stats : frame.stats) {
+						if (FAILED(a_device->CreateQuery(&desc, &stats))) {
 							m_failed = true;
 						}
 					}
@@ -1423,7 +1583,32 @@ namespace CBRO::Core::Runtime
 						marks[i] = static_cast<double>(stamp) * 1000.0 / static_cast<double>(disjoint.Frequency);
 					}
 					if (ok && marks[0] > 0.0) {
-						FoldMarks(marks, m_gpu[static_cast<std::size_t>(std::clamp(frame.mode, 0, static_cast<int>(kModes) - 1))]);
+						// (every statistics query ended before the disjoint did, so each is done with it; one that isn't
+						// counts as 0 for its span)
+						std::uint64_t triangles[kMarkCount]{};
+						std::uint64_t pixels[kMarkCount]{};
+						for (std::size_t i = 0; i + 1 < kMarkCount; ++i) {
+							if (!(frame.statsWritten & (1u << i))) {
+								continue;
+							}
+							D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
+							if (a_context->GetData(frame.stats[i], &stats, sizeof(stats), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+								triangles[i] = stats.IAPrimitives;
+								pixels[i] = stats.PSInvocations;
+							}
+						}
+						const auto mode = static_cast<std::size_t>(std::clamp(frame.mode, 0, static_cast<int>(kModes) - 1));
+						FoldMarks(marks, m_gpu[mode]);
+						FoldStats(triangles, pixels, frame.written, m_work[mode]);
+						for (std::size_t i = 0; i < kMarkCount; ++i) {
+							if (!(frame.written & (1u << i)) || !frame.cpu[i]) {
+								continue;
+							}
+							const double gap = marks[i] - QpcMs(frame.cpu[i]);
+							m_lag[mode].sum[i] += gap;
+							++m_lag[mode].count[i];
+							m_lagMin = std::min(m_lagMin, gap);
+						}
 						++m_read;
 					} else {
 						++m_disjoint;
@@ -1436,6 +1621,9 @@ namespace CBRO::Core::Runtime
 			bool                       m_ready{ false };
 			bool                       m_failed{ false };
 			std::array<ModeBuckets, kModes> m_gpu{};
+			std::array<ModeWork, kModes>    m_work{};
+			std::array<ModeLag, kModes>     m_lag{};
+			double                          m_lagMin{ kNoLag };
 			std::uint64_t              m_read{ 0 };
 			std::uint64_t              m_dropped{ 0 };
 			std::uint64_t              m_disjoint{ 0 };
@@ -1927,6 +2115,14 @@ namespace CBRO::Core::Runtime
 			logger::info(
 				"GPU per frame by mode (ms, timestamp spans, idle between marks included): previs: {} || CBRO feed: {} || CBRO classic: {} || {}",
 				gpu[0].Describe(), gpu[1].Describe(), gpu[2].Describe(), g_gpu.Status());
+			const auto work = g_gpu.TakeWork();
+			logger::info(
+				"GPU work per frame by mode (pipeline statistics, no idle: millions of triangles in / pixel-shader invocations): previs: {} || CBRO feed: {} || CBRO classic: {}",
+				work[0].Describe(), work[1].Describe(), work[2].Describe());
+			const auto lag = g_gpu.TakeLag();
+			logger::info(
+				"GPU behind the CPU at each mark by mode (ms from the CPU issuing a mark to the GPU reaching it, above this interval's smallest such gap, so 0 = the GPU was idle there; a mark that ends a stage without draws carries the runtime's flush delay instead): previs: {} || CBRO feed: {} || CBRO classic: {}",
+				lag.modes[0].Describe(lag.floor), lag.modes[1].Describe(lag.floor), lag.modes[2].Describe(lag.floor));
 			const auto calls = Hooks::CullGroups::TakeHookCalls();
 			const auto flags = Hooks::CullGroups::ReadEngineFlags();
 			logger::info(
@@ -1954,6 +2150,18 @@ namespace CBRO::Core::Runtime
 				tests.evaluate / cbroFrames, tests.shape / cbroFrames, tests.sun / cbroFrames, std::max(0.0, tests.all - tests.evaluate - tests.sun) / cbroFrames,
 				tests.lookup / cbroFrames, tests.reuse / cbroFrames, tests.recheck / cbroFrames, tests.record / cbroFrames, tests.nodeScan / cbroFrames,
 				std::max(0.0, tests.all - tests.evaluate - tests.sun - tests.lookup - tests.reuse - tests.record - tests.nodeScan) / cbroFrames);
+			logger::info(
+				"CBRO's own work in the gaps (ms): frame boundary per frame {:.3f} | per CBRO-mode frame: before the shadow maps (lights unoccluded, lamp survey) {:.3f}, after them (cascade filters closed, lamp loop read) {:.3f}, refused registrations handed to the tracer {:.3f} (the tracer's callback; sampled 1 in 16, scaled)",
+				QpcMs(g_timing.boundaryTicks) / prepassFrames, QpcMs(g_timing.lightsBeginTicks) / cbroFrames, QpcMs(g_timing.cascadesEndTicks) / cbroFrames,
+				QpcMs(Hooks::CullGroups::TakeRefusedTicks()) / cbroFrames);
+			{
+				const double inPath = tests.mainEvaluate + tests.mainSun + tests.mainLookup + tests.mainReuse + tests.mainRecord;
+				logger::info(
+					"object tests on the main thread per CBRO-mode frame (ms): {:.3f} | the verdict path {:.3f} (record lookups {:.3f}, view evaluations {:.3f}, sun evaluations {:.3f}, reuse checks {:.3f}, record writes {:.3f}, the rest of it {:.3f}) | around it: cell-node scans {:.3f}, the hooks' decisions and counters {:.3f} | entry walk in all {:.3f} (its entries' decisions and filings count above too)",
+					tests.mainThread / cbroFrames, tests.mainJudge / cbroFrames, tests.mainLookup / cbroFrames, tests.mainEvaluate / cbroFrames, tests.mainSun / cbroFrames,
+					tests.mainReuse / cbroFrames, tests.mainRecord / cbroFrames, std::max(0.0, tests.mainJudge - inPath) / cbroFrames, tests.mainNodeScan / cbroFrames,
+					std::max(0.0, tests.mainThread - tests.mainJudge - tests.mainNodeScan) / cbroFrames, tests.mainEntryWalk / cbroFrames);
+			}
 			{
 				const double readbacks = std::max(1.0, static_cast<double>(g_timing.prepassFrames));
 				const auto   kinds = HiZ::TakeBlockChangeKinds();
@@ -2001,6 +2209,9 @@ namespace CBRO::Core::Runtime
 
 		void NotifyStatus()
 		{
+			if (Recorder::Enabled()) {
+				Notify(Recorder::Status());
+			}
 			if (!Occlusion::Active()) {
 				Notify(!g_state.wantActive ? "CBRO off - previs on" : g_state.interiorStandby ? "CBRO standing by (interior) - previs is handling visibility" : "CBRO unavailable - previs is handling visibility");
 				return;
@@ -2238,7 +2449,22 @@ namespace CBRO::Core::Runtime
 			const auto& settings = Settings::Get();
 
 			if (KeyPressed(settings.toggleHotkey, g_state.toggleKeyDown)) {
-				ApplyMode(!g_state.wantActive, "hotkey");
+				// v1.92.8 (bLeftOutDump): the dump at the A/B spot itself. The switch CBRO -> previs waits for the dump the press
+				// asks for: the left-out dump takes the next frame, the kept dump the one after, both logged at the cull begin
+				// after that; previs follows one frame later. (The 2026-10-26 runs' dumps ran 120 frames into a location, up to
+				// 700 units before the spot the A/B was done at, so the objects the set diff named were never in them.)
+				if (g_state.toggleAfterDump != 0) {
+					// (a press while that wait runs: ignored)
+				} else if (g_state.wantActive && settings.leftOutDump && g_footprint.lastValid && CurrentMode() != 0) {
+					g_state.toggleAfterDump = 5;
+					logger::info("dumps: requested at the hotkey press (location {}): the switch to previs follows the dump", g_frames.location);
+					Occlusion::RequestKeptDump();
+				} else {
+					ApplyMode(!g_state.wantActive, "hotkey");
+				}
+			}
+			if (g_state.toggleAfterDump != 0 && --g_state.toggleAfterDump == 0) {
+				ApplyMode(false, "hotkey, after the dump");
 			}
 			if (KeyPressed(settings.statusHotkey, g_state.statusKeyDown)) {
 				NotifyStatus();
@@ -2256,6 +2482,9 @@ namespace CBRO::Core::Runtime
 				};
 				logger::info("{}", kNames[g_state.diagnostic]);
 				Notify(std::string(kNames[g_state.diagnostic]));
+			}
+			if (KeyPressed(settings.recorderHotkey, g_state.recorderKeyDown)) {
+				Recorder::Toggle();  // (between two frames' decisions: nothing is being appended)
 			}
 			ApplyPrevisRequest();
 			// Previs switched outside CBRO (console `tpc`): follow it, so the two stay inverse. (Not with bPrevisFeed=1:
@@ -2392,11 +2621,15 @@ namespace CBRO::Core::Runtime
 			g_asyncFrame.context = context;
 			g_state.cullingThisFrame = context.cull;
 
-			// Once per location, after ~5 s standing still with CBRO culling: list what is still drawn.
+			// Once per location, with CBRO culling: list what is left out and what is still drawn. After ~5 s standing still,
+			// or (v1.92.6) once the mode has settled: the stillness rule (0.01 deg a frame) never held through first-person idle
+			// sway in the 2026-10-26 runs ("camera still: no still frames" at a standing A/B spot), so no dump ever ran.
 			Occlusion::FlushKeptDump();
 			constexpr std::uint32_t kDumpAfterStillFrames = 300;
-			if (context.cull && g_footprint.lastValid && g_stillness.frames >= kDumpAfterStillFrames && !g_frames.dumpedHere) {
+			if (context.cull && g_footprint.lastValid && !g_frames.dumpedHere &&
+				(g_stillness.frames >= kDumpAfterStillFrames || (g_frames.sinceSwitch >= kSettleFrames && g_frames.sinceLoad > kLoadSettleFrames))) {
 				g_frames.dumpedHere = true;
+				logger::info("dumps: requested at location {} ({} frames since the mode switch, {} still frames)", g_frames.location, g_frames.sinceSwitch, g_stillness.frames);
 				Occlusion::RequestKeptDump();
 			}
 
@@ -2423,6 +2656,7 @@ namespace CBRO::Core::Runtime
 				LogMotionTable(g_moveTable);
 				LogDepthAge();
 				LogTiming();
+				Sampler::LogStats(g_state.framesSinceLog);
 				g_state.framesSinceLog = 0;
 			}
 		}
@@ -2487,6 +2721,7 @@ namespace CBRO::Core::Runtime
 					g_timing.mode = CurrentMode();  // (OnCullBegin may have switched it)
 					Hooks::CullGroups::SetRegistrationMode(g_timing.mode != 0);
 					g_gpu.FrameBegin(g_timing.mode);
+					Sampler::SetPhase(g_timing.mode, kBucketCull);
 					// DrawWorld's cull registers the main view's objects (and waits for its jobs) inside this
 					// stage: only then may the main accumulator's registrations be filtered. On a frame CBRO
 					// doesn't cull (previs mode, stale depth, camera jump) every hook stays a pass-through.
@@ -2497,12 +2732,18 @@ namespace CBRO::Core::Runtime
 					}
 					break;
 				}
-				case Stage::kPrePass:
+				case Stage::kPrePass: {
+					const auto before = Qpc();
 					OnFrameBoundary();
-					g_timing.marks[2] = Qpc();
+					const auto after = Qpc();
+					g_timing.boundaryTicks += after - before;
+					g_timing.marks[2] = after;
 					g_gpu.Mark(2);
+					Sampler::SetPhase(g_timing.mode, kBucketPrePass);
 					break;
-				case Stage::kSunCascades:
+				}
+				case Stage::kSunCascades: {
+					const auto before = Qpc();
 					// The deferred-lights stage follows. In a CBRO frame the walk ran with previs inactive, so a light previs
 					// had marked occluded stays marked and dark (FO4-ENGINE-NOTES 6.7); clear the mark, as previs-off vanilla.
 					if (Settings::Get().unoccludeLights && Occlusion::Active() && g_state.hooksIn) {
@@ -2515,12 +2756,19 @@ namespace CBRO::Core::Runtime
 						ShadowLights::LampLoopBegin();
 					}
 					ShadowLights::SetLampStage(Occlusion::Active() && g_state.hooksIn);  // (spot-light shadow maps may be emptied)
-					g_timing.marks[5] = Qpc();
+					const auto after = Qpc();
+					if (g_timing.mode != 0) {
+						g_timing.lightsBeginTicks += after - before;
+					}
+					g_timing.marks[5] = after;
 					g_gpu.Mark(5);
+					Sampler::SetPhase(g_timing.mode, kBucketSun);
 					break;
+				}
 				case Stage::kForward:
 					g_timing.marks[7] = Qpc();
 					g_gpu.Mark(7);
+					Sampler::SetPhase(g_timing.mode, kBucketForward);
 					break;
 				default:
 					break;
@@ -2551,6 +2799,19 @@ namespace CBRO::Core::Runtime
 						const bool settled = g_frames.sinceSwitch > kSettleFrames && g_frames.sinceLoad > kLoadSettleFrames && !(ui && ui->menuMode != 0);
 						const auto root = RE::Main::WorldRootCamera();
 						SetDiff::EndCull(CurrentMode(), settled, root ? root->world.translate : RE::NiPoint3{});
+						if (Recorder::On()) {
+							// The recorder closes its frame here (both modes): the walk and its jobs are done, this frame's objects are alive.
+							Recorder::FrameInfo info{};
+							info.context = &g_asyncFrame.context;
+							info.pose = Async::Enabled() && g_asyncFrame.lastKnown ? &g_asyncFrame.pose : nullptr;
+							info.lamps = &ShadowLights::Lamps();
+							info.renderFrame = g_state.renderFrame;
+							info.location = g_frames.location;
+							info.mode = CurrentMode();
+							info.settled = settled;
+							info.observeOnly = g_state.diagnostic != 0 || Settings::Get().observeOnly;
+							Recorder::EndFrame(info);
+						}
 					}
 					// Asynchronous verdicts: this frame's candidates go to the worker with this frame's context, dilated for
 					// the next frame's camera (the walk is done: every candidate is recorded). The view is this frame's,
@@ -2591,12 +2852,14 @@ namespace CBRO::Core::Runtime
 					}
 					g_timing.marks[1] = Qpc();
 					g_gpu.Mark(1);
+					Sampler::SetPhase(g_timing.mode, kBucketGapCull);
 					break;
 				case Stage::kPrePass: {
 					const auto end = Qpc();
 					++g_timing.prepassFrames;
 					g_timing.marks[3] = end;  // the engine's pre-pass ends here; CBRO's depth capture follows (the "hi-z" bucket)
 					g_gpu.Mark(3);
+					Sampler::SetPhase(g_timing.mode, kBucketHiZ);
 					// (with first person held back the capture ran at the world block's end, inside the pre-pass bucket; a
 					// block still held runs now, after its capture)
 					Hooks::FirstPersonOrder::Flush();
@@ -2607,22 +2870,31 @@ namespace CBRO::Core::Runtime
 					g_timing.captureTicks += captured - end;
 					g_timing.marks[4] = captured;
 					g_gpu.Mark(4);
+					Sampler::SetPhase(g_timing.mode, kBucketGapPrePass);
 					break;
 				}
-				case Stage::kSunCascades:
+				case Stage::kSunCascades: {
+					const auto before = Qpc();
 					// (the last cascade's registration filter lives from this frame's cull begin to here: never across a
 					// menu, a loading screen or a frame CBRO doesn't cull, whose context it would read)
 					Occlusion::SetFarCascade(nullptr);
 					Occlusion::SetSunCascades(nullptr, 0);
 					ShadowLights::LampLoopEnd();  // (nothing unless LampLoopBegin ran this frame)
 					ShadowLights::SetLampStage(false);
-					g_timing.marks[6] = Qpc();
+					const auto after = Qpc();
+					if (g_timing.mode != 0) {
+						g_timing.cascadesEndTicks += after - before;
+					}
+					g_timing.marks[6] = after;
 					g_gpu.Mark(6);
+					Sampler::SetPhase(g_timing.mode, kBucketGapSun);
 					break;
+				}
 				case Stage::kForward:
 					Async::Wait();  // the worker's frame ends with the render: it never touches objects across the game's update
 					g_timing.marks[8] = Qpc();
 					g_gpu.Mark(8);
+					Sampler::SetPhase(g_timing.mode, kBucketRest);
 					break;
 				default:
 					break;
@@ -2676,7 +2948,9 @@ namespace CBRO::Core::Runtime
 		Hooks::PrevisFeed::Install();  // (pass-through wrappers on the engine's two previs feed sites, plus the accessors)
 		Hooks::Precipitation::Install();  // (diagnostic: the rain occlusion pass's runs and cost)
 		Feed::Install();
+		Recorder::Install(settings.recorder, settings.recorderFrames, settings.recorderHiZLevel, std::string(CBRO::Version::NAME));  // (before SetDiff: its observer serves both)
 		SetDiff::Install(settings.setDiff);
+		Sampler::Install(settings.sampler, kModeNames, kBucketNames);
 		Async::Install(settings.async);
 		HangWatch::Install();
 		Hooks::RenderStages::AddListener(&g_listener);

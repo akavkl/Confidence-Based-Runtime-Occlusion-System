@@ -66,6 +66,7 @@ namespace CBRO
 		cullActors = ReadBool(path, L"Occlusion", L"bCullActors", cullActors);
 		cullPlayer = ReadBool(path, L"Occlusion", L"bCullPlayer", cullPlayer);
 		traceFeed = ReadBool(path, L"Occlusion", L"bTraceFeed", traceFeed);
+		traceLink = ReadBool(path, L"Occlusion", L"bTraceLink", traceLink);
 		meshShapes = ReadBool(path, L"Occlusion", L"bMeshShapes", meshShapes);
 		sunShadowCulling = ReadBool(path, L"Occlusion", L"bSunShadowCulling", sunShadowCulling);
 		farCascadeTrim = ReadBool(path, L"Occlusion", L"bFarCascadeTrim", farCascadeTrim);
@@ -78,6 +79,15 @@ namespace CBRO
 		spotCullWindow = ReadBool(path, L"Occlusion", L"bSpotCullWindow", spotCullWindow);
 		spotCasterTrim = ReadBool(path, L"Occlusion", L"bSpotCasterTrim", spotCasterTrim);
 		cellNodePruning = ReadBool(path, L"Occlusion", L"bCellNodePruning", cellNodePruning);
+		entryWalk = ReadBool(path, L"Occlusion", L"bEntryWalk", entryWalk);
+		childCheapTests = ReadBool(path, L"Occlusion", L"bChildCheapTests", childCheapTests);
+		childInherit = ReadBool(path, L"Occlusion", L"bChildInherit", childInherit);
+		walkLeases = ReadBool(path, L"Occlusion", L"bWalkLeases", walkLeases);
+		walkLeaseFrames = std::clamp(ReadUInt(path, L"Occlusion", L"iWalkLeaseFrames", walkLeaseFrames), 1u, 16u);
+		walkLeaseMargin = std::clamp(ReadFloat(path, L"Occlusion", L"fWalkLeaseMargin", walkLeaseMargin), 0.0f, 4096.0f);
+		stableIndex = ReadBool(path, L"Occlusion", L"bStableIndex", stableIndex);
+		traceDirect = ReadBool(path, L"Occlusion", L"bTraceDirect", traceDirect);
+		deferSunOnly = ReadBool(path, L"Occlusion", L"bDeferSunOnly", deferSunOnly);
 		cellArtNode9 = ReadBool(path, L"Occlusion", L"bCellArtNode9", cellArtNode9);
 		interiorOutsideRooms = ReadBool(path, L"Occlusion", L"bInteriorOutsideRooms", interiorOutsideRooms);
 		disableRoomBounds = ReadBool(path, L"Occlusion", L"bDisableRoomBounds", disableRoomBounds);
@@ -91,11 +101,21 @@ namespace CBRO
 		interiorLegacyPrevis = ReadBool(path, L"Occlusion", L"bInteriorLegacyPrevis", interiorLegacyPrevis);
 		asyncInteriors = ReadBool(path, L"Occlusion", L"bAsyncInteriors", asyncInteriors);
 		setDiff = ReadBool(path, L"Occlusion", L"bSetDiff", setDiff);
+		sampler = ReadBool(path, L"Occlusion", L"bSampler", sampler);
+		recorder = ReadBool(path, L"Occlusion", L"bRecorder", recorder);
+		recorderFrames = std::clamp(ReadUInt(path, L"Occlusion", L"iRecorderFrames", recorderFrames), 1u, 36000u);
+		recorderHotkey = ReadUInt(path, L"Occlusion", L"iRecorderHotkey", recorderHotkey);
+		recorderHiZLevel = std::clamp(static_cast<std::int32_t>(ReadUInt(path, L"Occlusion", L"iRecorderHiZLevel", static_cast<std::uint32_t>(recorderHiZLevel))), -1, 15);
 		async = ReadBool(path, L"Occlusion", L"bAsync", async);
 		lampGroupTrim = ReadBool(path, L"Occlusion", L"bLampGroupTrim", lampGroupTrim);
 		unoccludeLights = ReadBool(path, L"Occlusion", L"bUnoccludeLights", unoccludeLights);
 		lampDiagnostic = ReadBool(path, L"Occlusion", L"bLampDiagnostic", lampDiagnostic);
 		leftOutDump = ReadBool(path, L"Occlusion", L"bLeftOutDump", leftOutDump);
+		rayWindow[0] = ReadFloat(path, L"Occlusion", L"fRayWindowX0", rayWindow[0]);
+		rayWindow[1] = ReadFloat(path, L"Occlusion", L"fRayWindowX1", rayWindow[1]);
+		rayWindow[2] = ReadFloat(path, L"Occlusion", L"fRayWindowY0", rayWindow[2]);
+		rayWindow[3] = ReadFloat(path, L"Occlusion", L"fRayWindowY1", rayWindow[3]);
+		rayLength = ReadFloat(path, L"Occlusion", L"fRayLength", rayLength);
 		feedAuditInterval = ReadUInt(path, L"Occlusion", L"iFeedAuditInterval", feedAuditInterval);
 		verdictCache = ReadBool(path, L"Occlusion", L"bVerdictCache", verdictCache);
 		cacheMove = std::clamp(ReadFloat(path, L"Occlusion", L"fCacheMove", cacheMove), 0.5f, 64.0f);
@@ -122,13 +142,14 @@ namespace CBRO
 
 		logger::info("settings: {} ({})", path.string(), exists ? "found" : "missing, using defaults");
 		logger::info(
-			"settings: occlusion={} disablePrevis={} previsFeed={} skipPrevisQuery={} interiors={} interiorLegacyPrevis={} asyncInteriors={} setDiff={} async={} lampGroupTrim={} unoccludeLights={} lampDiagnostic={} leftOutDump={} feedAuditInterval={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} cullPlayer={} traceFeed={} meshShapes={} sunShadowCulling={} farCascadeTrim={} lampShadowCulling={} spotShadowCulling={} spotCullWindow={} spotCasterTrim={} emptiedSpotTrim={} spotOnlyCascadeTrim={} scolRootBounds={} cellNodePruning={} cellArtNode9={} interiorOutsideRooms={} disableRoomBounds={} ignoreOccluders={} parallaxMargin={} keepFadeState={} firstPersonAfterWorld={} viewOverhang={} viewOverhangTurn={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
-			occlusion, disablePrevis, previsFeed, skipPrevisQuery, interiors, interiorLegacyPrevis, asyncInteriors, setDiff, async, lampGroupTrim, unoccludeLights, lampDiagnostic, leftOutDump, feedAuditInterval, startActive, observeOnly, toggleHotkey, statusHotkey, notify, hiZDownsample, hiZTemporalFrames, confirmFrames, maxSnapshotAge,
-			maxCameraMove, maxCameraAngle, nearDistance, cullActors, cullPlayer, traceFeed, meshShapes, sunShadowCulling, farCascadeTrim, lampShadowCulling, spotShadowCulling, spotCullWindow, spotCasterTrim, emptiedSpotTrim, spotOnlyCascadeTrim, scolRootBounds, cellNodePruning, cellArtNode9, interiorOutsideRooms, disableRoomBounds, ignoreOccluders, parallaxMargin, keepFadeState, firstPersonAfterWorld, viewOverhang, viewOverhangTurn, depthTolerance, depthSlack,
+			"settings: occlusion={} disablePrevis={} previsFeed={} skipPrevisQuery={} interiors={} interiorLegacyPrevis={} asyncInteriors={} setDiff={} sampler={} async={} lampGroupTrim={} unoccludeLights={} lampDiagnostic={} leftOutDump={} feedAuditInterval={} startActive={} observeOnly={} toggleHotkey=0x{:X} statusHotkey=0x{:X} notify={} hiZDownsample={} hiZTemporalFrames={} confirmFrames={} maxSnapshotAge={} maxCameraMove={} maxCameraAngle={} nearDistance={} cullActors={} cullPlayer={} traceFeed={} traceLink={} meshShapes={} sunShadowCulling={} farCascadeTrim={} lampShadowCulling={} spotShadowCulling={} spotCullWindow={} spotCasterTrim={} emptiedSpotTrim={} spotOnlyCascadeTrim={} scolRootBounds={} cellNodePruning={} entryWalk={} childInherit={} walkLeases={} walkLeaseFrames={} walkLeaseMargin={} stableIndex={} traceDirect={} deferSunOnly={} cellArtNode9={} interiorOutsideRooms={} disableRoomBounds={} ignoreOccluders={} parallaxMargin={} keepFadeState={} firstPersonAfterWorld={} viewOverhang={} viewOverhangTurn={} depthTolerance={} depthSlack={} worldDepth=[{},{}]",
+			occlusion, disablePrevis, previsFeed, skipPrevisQuery, interiors, interiorLegacyPrevis, asyncInteriors, setDiff, sampler, async, lampGroupTrim, unoccludeLights, lampDiagnostic, leftOutDump, feedAuditInterval, startActive, observeOnly, toggleHotkey, statusHotkey, notify, hiZDownsample, hiZTemporalFrames, confirmFrames, maxSnapshotAge,
+			maxCameraMove, maxCameraAngle, nearDistance, cullActors, cullPlayer, traceFeed, traceLink, meshShapes, sunShadowCulling, farCascadeTrim, lampShadowCulling, spotShadowCulling, spotCullWindow, spotCasterTrim, emptiedSpotTrim, spotOnlyCascadeTrim, scolRootBounds, cellNodePruning, entryWalk, childInherit, walkLeases, walkLeaseFrames, walkLeaseMargin, stableIndex, traceDirect, deferSunOnly, cellArtNode9, interiorOutsideRooms, disableRoomBounds, ignoreOccluders, parallaxMargin, keepFadeState, firstPersonAfterWorld, viewOverhang, viewOverhangTurn, depthTolerance, depthSlack,
 			worldDepthMin, worldDepthMax);
 		logger::info(
 			"settings: enabled={} probe={} renderStageHooks={} cullingHooks={} cullingGroupHooks={} drawCallCounter={} sceneSurvey={} summaryInterval={} traceFrames={} traceDelay={} traceHotkey=0x{:X} surveyHotkey=0x{:X}",
 			enabled, probe, renderStageHooks, cullingHooks, cullingGroupHooks, drawCallCounter, sceneSurvey,
 			summaryIntervalFrames, traceFrames, traceDelayFramesAfterLoad, traceHotkey, surveyHotkey);
+		logger::info("settings: recorder={} recorderFrames={} recorderHotkey=0x{:X} recorderHiZLevel={}", recorder, recorderFrames, recorderHotkey, recorderHiZLevel);
 	}
 }

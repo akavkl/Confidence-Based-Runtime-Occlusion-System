@@ -165,6 +165,24 @@ namespace CBRO::Core::Occlusion
 	void SetObserveOnly(bool a_observeOnly);  // runtime override of [Occlusion] bObserveOnly (diagnostics)
 	[[nodiscard]] bool Active() noexcept;
 
+	// Diagnostic (Core/SetDiff, bSetDiff; v1.92.5): why the main view keeps an object this frame. While on, the Block::Add
+	// filter records it for every geometry entry it lets through (one history-table store each), and the view evaluation
+	// runs its tests a second time without the parallax margin where that margin widened them (kRecordParallaxKept).
+	// Read at the cull's end (main thread). valid false: no kept verdict was recorded for the object this frame (filed
+	// force-visible, dropped with its parent, or never judged).
+	struct KeptReason
+	{
+		bool         valid{ false };
+		std::uint8_t verdict{ 0 };          // the Verdict behind the outcome: 0 visible, 1 hidden, 2 edge, 5 near, 6 bad bound
+		bool         confirming{ false };   // hidden by the depth, drawn while its streak is short
+		bool         exempt{ false };       // hidden by the depth, kept: a type never culled, a light's reach, an actor's part, the table full
+		bool         shaped{ false };       // the verdict came through a mesh-shape test
+		bool         shapeNone{ false };    // a shape was wanted and none was used: the sphere decided
+		bool         parallaxKept{ false }; // kept only by the parallax margin
+	};
+	void SetKeptReasons(bool a_on) noexcept;
+	[[nodiscard]] KeptReason LastKeptReason(const void* a_object) noexcept;
+
 	// Forget streaks and type decisions (load, mode switch). Applied at the next BeginFrame.
 	void ResetHistory();
 
@@ -236,6 +254,15 @@ namespace CBRO::Core::Occlusion
 		double recheck{ 0.0 };   // of `reuse`: hidden verdicts' evidence re-checked against the current depth
 		double record{ 0.0 };    // this frame's record written (the stream, the table's streak backup)
 		double nodeScan{ 0.0 };  // cell-node pruning's scans of a node's entries
+		// The same parts on the main thread alone (v1.92): what of `mainThread` is evaluation and what bookkeeping.
+		double mainEvaluate{ 0.0 };
+		double mainSun{ 0.0 };
+		double mainLookup{ 0.0 };
+		double mainReuse{ 0.0 };
+		double mainRecord{ 0.0 };
+		double mainNodeScan{ 0.0 };
+		double mainJudge{ 0.0 };  // the verdict path as a whole (holds lookup, evaluate, sun, reuse, record)
+		double mainEntryWalk{ 0.0 };  // the entry walk in all (v1.94): its loop and cheap tests, and the decisions and filings of the entries it offers (those count in mainThread too)
 	};
 	[[nodiscard]] TestTime TakeTestMilliseconds() noexcept;
 
@@ -244,6 +271,10 @@ namespace CBRO::Core::Occlusion
 	// at each cull begin.
 	void RequestKeptDump();
 	void FlushKeptDump();
+
+	// Diagnostic (bSetDiff, v1.92.9): how far along the ray window's rays (fRayWindow*, cast from the last dumped depth
+	// frame's camera) a bound's center lies; negative when no ray crosses it or no depth frame was dumped yet.
+	[[nodiscard]] float RayWindowHitOnDepthFrame(float a_x, float a_y, float a_z, float a_radius) noexcept;
 
 	// Per-frame averages from the last LogStats (for the on-screen status).
 	[[nodiscard]] float RejectedPerFrame() noexcept;

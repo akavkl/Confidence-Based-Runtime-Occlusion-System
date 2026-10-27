@@ -1,11 +1,14 @@
 #include "Core/Occlusion.h"
 
+#include "Core/Recorder.h"
+
 #include "Core/Async.h"
 #include "Core/DropSet.h"
 #include "Core/MeshProxy.h"
 #include "Core/ShadowLights.h"
 #include "Core/TraceFeed.h"
 #include "Hooks/CullGroups.h"
+#include "Hooks/PrevisFeed.h"
 #include "Settings.h"
 #include "Util/Gamebryo.h"
 
@@ -37,6 +40,15 @@ namespace CBRO::Core::Occlusion
 			bool          spotOnlyCascadeTrim{ true };  // sun up: entries kept for spot lamps alone stay out of the sun's cascades (v1.82)
 			bool          scolRootBounds{ true };  // static collection pieces judged and filed with the collection's bound (v1.83)
 			bool          keepFadeState{ true };   // fade nodes left out of the main view keep their fade, as previs's would (v1.88.2)
+			bool          entryWalk{ true };       // a node pruning can't leave out whole is walked by CBRO itself (v1.94, bEntryWalk)
+			bool          cheapChildren{ true };   // a static mesh child out of the view that no view needs is left out by the cheap tests alone (v1.96, bChildCheapTests)
+			bool          childInherit{ true };    // a child with its kept top entry's bound takes its decision, no judgement of its own (v1.98, bChildInherit)
+			bool          stableIndex{ true };     // decision parents' records in filing order, found by a cursor (v1.99.2, bStableIndex)
+			bool          traceDirect{ true };     // an entry filed for the trace alone is handed to the tracer, not filed (v1.99.3, bTraceDirect)
+			bool          deferSunOnly{ true };    // a sun-only drop is filed into group 0 after the main view (v1.99.3, bDeferSunOnly)
+			bool          walkLeases{ true };      // clusters of walked entries out of the view are left untouched between walks (v1.98, bWalkLeases)
+			std::uint32_t leaseFrames{ 4 };        // ... a cluster is walked again at most this many frames after its last walk (iWalkLeaseFrames)
+			float         leaseMargin{ 64.0f };    // ... units a cluster's sphere must clear the view by on top of the verdict's margins, for what moves meanwhile (fWalkLeaseMargin)
 			float         viewOverhang{ 0.03f };  // objects and sun shadows: how far (NDC) the view may overhang the depth frame and still be judged by its edge
 			float         viewOverhangTurn{ 0.0f };  // ... up to this much where a turned view reaches that far past it (FrameContext::overhang)
 		};
@@ -146,6 +158,9 @@ namespace CBRO::Core::Occlusion
 			kTraceForced,         // out-of-view entries no view files, filed force-visible for the trace on their turn (v1.91)
 			kTraceForcedChildren, // ... their children, given the mark with them
 			kScolWidened,         // static collection pieces judged and filed with their collection's bound (v1.83)
+			kScolRootHits,        // ... their collection root taken from the cache, its parent chain checked (v1.98)
+			kScolSlotHits,        // ... parents found in the cache with a root (the chain then checked; v1.98.1)
+			kScolChainFails,      // ... of those, the chain check failed: the root found again
 			kCellNodesSeen,       // cells' child node 3 (precombined chunks + static refs) offered by the scene walk
 			kCellNodesSkipped,    // ... left out whole: outside the view, sun shadow can't reach it
 			kCellNodesInView,     // ... walked: the node's bound meets the view
@@ -155,7 +170,50 @@ namespace CBRO::Core::Occlusion
 			kContainersSeen,      // exact-NiNode containers under a cell's node 3, offered by the walk's container loops
 			kCellNodesHeld,       // ... holding an always-draw entry or an actor (or too big to scan): walked
 			kCellNodeEntriesSkipped,  // entries never filed because their node was skipped whole
+			kCellNodesCached,         // ... of the skipped nodes, answered from their clusters' cached spheres, no entry touched (v1.98)
+			kCellNodeEntriesCached,   // ... their entries
+			kCellNodeClustersRescanned, // ... clusters of such nodes read again on the way (lease due, held, or the array changed; v1.98.1)
 			kCellNodesAlwaysDraw, // ... the node's own flags carry always-draw (counted only)
+			kWalkNodes,           // nodes walked by CBRO itself (bEntryWalk, v1.94): their entries filed by CBRO, the engine's loop skipped
+			kWalkEntries,         // ... their entries seen (null and AppCulled children apart)
+			kWalkSkipped,         // ... left out by the cheap tests alone (unmoved, out of view, shadow beyond reach, no lamp, not the trace's turn)
+			kWalkOffered,         // ... offered to the top-level decision (SkipTopLevel), as the engine's Group::Add would have
+			kWalkFiled,           // ... of them, filed with the engine
+			kWalkMarkerFiled,     // ... filed unjudged: a group marker was pending on the entry's block
+			kWalkClusters,        // clusters of walked nodes' slots seen (v1.98, bWalkLeases)
+			kWalkClustersDormant, // ... left out whole on their cached sphere: within their lease, nothing held, outside the view, shadow unneeded
+			kWalkLeased,          // ... their entries, untouched (counted in kWalkEntries too)
+			kWalkLeaseFadeVisits, // ... of those, visited after all for a fade mid-way (KeepFadeSeen)
+			kWalkLeaseTraceVisits, // ... or for the trace's turn within reach (walked as an entry)
+			kWalkLeaseMarkerHeld, // clusters walked after all: a group marker was pending (the next entry filed must take it)
+			kWalkClusterNotWalked,    // clusters walked, not leased, because (v1.98.1): the walk never finished them (the pruning scan did)
+			kWalkClusterHeldBad,      // ... a member's bound was unusable, or moved, at the last walk
+			kWalkClusterHeldKind,     // ... a member is always-draw, a light, a sky mesh, an actor root or the player's 3D
+			kWalkClusterHeldMarker,   // ... a member was filed unjudged for a pending marker
+			kWalkClusterDue,          // ... the lease ran out (the scheduled re-read)
+			kWalkClusterSlotsChanged, // ... the child array changed under the slots
+			kWalkClusterInView,       // ... the cached sphere meets the view (with the margins)
+			kWalkClusterShadow,       // ... the sun's shadow of the sphere may reach the view
+			kWalkClusterLamp,         // ... a spot lamp may need the sphere
+			kWalkCulled,              // AppCulled children the walk read the flags of (never entries; v1.98.1)
+			kWalkClusterNoMembers,    // clusters walked, not leased: no entry of their own (containers only; v1.99)
+			kStableRecorded,          // top-level node decisions recorded in filing order (v1.99.2, bStableIndex)
+			kStableParentHits,        // children's decision parents found by the cursor (once per parent)
+			kStableParentNotRecorded, // ... not recorded this frame (a nested node, a group filed otherwise; v1.99.3: no scan)
+			kStableParentOutOfOrder,  // ... recorded, not found within the look-ahead (the tables answered)
+			kTraceHanded,             // top-level entries handed to the tracer directly, not filed (v1.99.3, bTraceDirect)
+			kTraceHandedPieces,       // ... the geometry handed with them
+			kSunOnlyDeferred,         // sun-only drops held back from the main view, filed into group 0 later (v1.99.3, bDeferSunOnly)
+			kSunOnlyHandedPieces,     // ... their geometry handed to the tracer
+			kSunOnlyFiledLate,        // ... filed in the cascade cull's window
+			kSunOnlyDropped,          // ... never filed: no cascade window opened in their frame
+			kSunOnlyKnown,            // ... their pieces not handed again: the tracer keeps them (v2.0, the link)
+			kTraceKnownSkipped,       // objects left out on their turn: the tracer keeps them from an earlier handover (v2.0)
+			kTraceMoverHeld,          // movers past the tracer's mover radius, not their frame (v2.0)
+			kTraceChildHanded,        // pieces filed for the trace alone, handed through the link instead (v2.0)
+			kTraceGone,               // entries the walk had handed that left their slot: GONE records (v2.0)
+			kWalkFadeRoots,       // roots that are fade nodes: left to the engine, which files them whole into the group array
+			kWalkCachesRebuilt,   // slot caches rebuilt (a node's child count changed)
 			kLampVolumeOutside,   // lamp casters whose shadow volume lies outside the view (or beyond the lamp's reach)
 			kLampVolumeMisses,    // ... lies entirely behind, or entirely in front of, every visible surface (confirmed)
 			kLampVolumeConfirming,
@@ -175,7 +233,7 @@ namespace CBRO::Core::Occlusion
 			kOverhangHidden,      // objects hidden with part of them in a thin overhang of the view, judged by the depth frame's edge (fViewOverhang)
 			kSunOverhang,         // sun shadows found behind surfaces the same way
 			kParallaxWidened,     // tests whose screen box widened for a near occluder's parallax since the depth frame (v1.88)
-			kFadeKeptSeen,        // fade nodes left out (hidden or out of view) whose frame counter was kept current (v1.88.2)
+			kFadeKeptSeen,        // fade nodes left out (hidden or out of view) whose frame counter was stamped (v1.88.2; on their turn since v1.92)
 			kSunPiecewise,        // sun shadows found behind surfaces stretch by stretch where the whole sweep's box said needed (v1.79)
 			kSunFarTests,         // needed sun shadows tested again for the last cascade alone (v1.80)
 			kSunFarUnneeded,      // ... that find nothing visible in its slab
@@ -186,6 +244,42 @@ namespace CBRO::Core::Occlusion
 			kWalkSunEdge,         // ... and sun outcomes needed only for the map's no-depth strip, judged again in the walk (v1.73)
 			kFinalEdge,           // the walk's decisions (v1.74): kept as edge
 			kFinalConfirming,     // ... hidden, still confirming
+			kFadeTopOffered,      // survey (v1.92.4; 1 node in kFadeStampFrames, the log scales it): top-level fade nodes offered to the group filter
+			kFadeTopKept,         // ... let through (filed)
+			kFadeTopKeptEntries,  // ... their geometry records (+0x178): the ChildPush adds they bring
+			kFadeTopKeptOne,      // ... let through with exactly one record
+			kFadeTopFadingOut,    // ... past the far fade range by distance, currentFade still above 0 (fading out: drawn)
+			kFadeTopPastFarBit15, // ... past the far range with flag bit 15 set (filed and drawn whatever the fade)
+			kFadeTopFaded,        // ... past the far range at currentFade 0, bit 15 clear: the engine files no mesh of them
+			kFadeTopFadedKept,    // ... of those, let through by CBRO (a Group::Add, a verdict, a frustum test and OnVisible for nothing drawn)
+			kFadeTopFadedKeptEntries,  // ... their geometry records
+			kFadeTopLightingBit33,     // let-through fade nodes with flag bit 33 set: OnVisible re-queues their lighting (v1.94 survey)
+			kFadeTopMidFade,           // ... with 0 < currentFade < 1: the same
+			kFadeTopNoLighting,        // ... with flag bit 51 set: never re-queued
+			kFrameLightingByte,        // frames with the scene node's byte +0x228 set: every visible fade node's lighting re-queued
+			kFadeTopLightingBit33Forced,  // ... of the bit-33 ones, filed force-visible (for the trace, or the player's) (v1.94.1)
+			kFadeTopMidFadeForced,        // ... of the mid-fade ones, the same
+			kFadeTopMidFadeIn,            // ... of the mid-fade ones, fading in (flag bit 37 "complete" clear) (v1.96.1)
+			kFadeTopMidFadeInBig,         // ... of those, bound radius +0x1A8 at or above 600: the engine's unseen rule never snaps them to 1
+			kFadeAdvanced,                // fade updates run by CBRO on left-out fade nodes whose fade is not complete (v1.97.0)
+			kFadeStarted,                 // ... of those, fades that began (currentFade left 0)
+			kFadeCompleted,               // ... of those, fades that completed (bit 37 set by the update)
+			kFadeStartUnseen,             // let-through fade nodes at currentFade 0, bit 37 clear, frameCounter over 20 frames old: the unseen rule decides at this OnVisible (v1.96.2)
+			kFadeStartUnseenNear,         // ... of those, distance fade above fFadeInThreshold: snapped to 1, no fade-in
+			kFadeStartSeenLast,           // let-through fade nodes at currentFade 0, bit 37 clear, stamped last frame: OnVisible itself kept them at 0 (far) until now
+			kFadeStartSeenRecent,         // ... stamped 2-20 frames ago: a stamp while left out of the main view (CBRO's, or a culling process's OnVisible)
+			kFadeStartSeenNear,           // ... of the two above, distance fade above fFadeInThreshold: a fade-in from 0 runs on screen from this frame
+			kFadeTopMidFadeInContinuous,  // mid-fade fading-in nodes stamped last frame (the fade ran on screen last frame too)
+			kFadeTopMidFadeInResumed,     // ... stamped 2 or more frames ago: left out mid-fade, now back
+			kFadeTopMidFadeInActor,       // ... of the fading-in nodes, type 3 (actors: currentFade follows fadeAmount directly)
+			kChildOfFade,         // Block::Add entries not decided at the top level (the engine's child pushes, unjudged filings): under a fade node (v1.94.1)
+			kChildOfNode,         // ... under an exact NiNode (a chunk container, a cell's node 9)
+			kChildOther,          // ... under any other node, or none
+			kChildCheapRejected,  // static geometry children out of the view that no view needs, left out by the cheap tests alone, no verdict (v1.96)
+			kChildCheapOutside,   // ... the same in a main-only group: left to the engine's frustum test
+			kChildInherited,      // children with their kept top entry's bound, decided with it, no judgement (v1.98, bChildInherit)
+			kChildInheritedFade,  // ... of them, reached through the fade node filing them (their parent one of its sub-nodes; v1.98.1)
+			kChildFadeDecided,    // children dropped or forced with the fade node filing them, their parent one of its sub-nodes (v1.99)
 			kCycles,             // TSC cycles in the per-object tests (sampled frames, scaled)
 			kCyclesEvaluate,      // ... of which: full view evaluations (sphere tests, mesh shapes, lights)
 			kCyclesShape,         // ... of which: the mesh-shape tests inside those evaluations
@@ -195,6 +289,8 @@ namespace CBRO::Core::Occlusion
 			kCyclesRecheck,       // ... of kCyclesReuse: hidden verdicts' evidence re-checked against the current depth
 			kCyclesRecord,        // ... of which: this frame's record written (the stream, the table's streak backup)
 			kCyclesNodeScan,      // ... of which: cell-node pruning's scans of a node's entries
+			kCyclesJudge,         // ... of which: the verdict path as a whole (JudgeOrLookup: lookup, checks, evaluations, copy; v1.92)
+			kCyclesEntryWalk,     // the entry walk in all (not part of kCycles; its entries' decisions and filings count there too; v1.94)
 			kCounterCount
 		};
 
@@ -209,6 +305,7 @@ namespace CBRO::Core::Occlusion
 		std::uint64_t                          g_cyclesReported{ 0 };
 		ThreadStats*                           g_mainStats{ nullptr };  // the main thread's block (set at BeginFrame)
 		std::uint64_t                          g_mainCyclesReported{ 0 };
+		std::array<std::uint64_t, kCounterCount> g_mainReported{};  // the main thread's block at the last LogStats
 
 		ThreadStats& LocalStats() noexcept
 		{
@@ -278,6 +375,12 @@ namespace CBRO::Core::Occlusion
 		constexpr std::uint64_t kMergedReject = std::uint64_t{ 1 } << 46;
 		constexpr int           kEpochShift = 48;
 		constexpr int           kHintShift = 56;
+		// Entry::lamp bits [40,60) (v1.92.5, diagnostic, SetKeptReasons on only): bit 40 recorded, [41,44) the Verdict, [44,46) the
+		// Outcome, 46 kRecordShaped, 47 kRecordShapeNone, 48 kRecordParallaxKept, [50,60) the clock's low ten bits (read back
+		// only in the frame that wrote them). The lamp streak keeps the word's low 40 bits.
+		constexpr int           kReasonShift = 40;
+		constexpr std::uint64_t kReasonMask = ((std::uint64_t{ 1 } << 20) - 1) << kReasonShift;
+		std::atomic<bool>       g_keptReasons{ false };
 
 		struct alignas(32) Entry
 		{
@@ -310,6 +413,18 @@ namespace CBRO::Core::Occlusion
 				}
 			}
 			return nullptr;
+		}
+
+		// The line an object's entry starts on, fetched ahead (v1.98): the table is 8 MB, a miss on nearly every first probe
+		// (0.12 ms a frame listed by the sampler on the main thread, 2026-10-27), and the walk knows the object well before
+		// the verdict path's streak backups and classification look it up.
+		inline void PrefetchEntry(const void* a_object) noexcept
+		{
+			if (g_table) {
+				const auto key = reinterpret_cast<std::uintptr_t>(a_object);
+				const auto hash = static_cast<std::size_t>(((key >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - kTableBits));
+				_mm_prefetch(reinterpret_cast<const char*>(&g_table[hash]), _MM_HINT_T1);
+			}
 		}
 
 		// FindEntry without adding one (the sun streak's backup: only objects the view already judged hidden have it).
@@ -809,10 +924,12 @@ namespace CBRO::Core::Occlusion
 		// edge has just uncovered (strafing past a pillar) is no longer judged by the old depth behind that edge, which
 		// drew it a frame late. The object's own depth is unchanged. a_x0..a_y1: the box in NDC, before clipping.
 		constexpr float kParallaxMinDepth = 16.0f;  // nearer surfaces count as this far (the near plane, first person)
+		thread_local bool t_parallaxOff{ false };  // (diagnostic: EvaluateView's second run of the tests without the margin, SetKeptReasons)
+		thread_local bool t_parallaxHit{ false };  // a test since EvaluateView's start widened its box
 
 		float ParallaxTan(const FrameContext& a_context, float a_x0, float a_x1, float a_y0, float a_y1, float a_z) noexcept
 		{
-			if (!(a_context.parallaxMove > 0.0f) || !(a_z > kParallaxMinDepth)) {
+			if (t_parallaxOff || !(a_context.parallaxMove > 0.0f) || !(a_z > kParallaxMinDepth)) {
 				return 0.0f;
 			}
 			const auto& snapshot = *a_context.snapshot;
@@ -830,6 +947,7 @@ namespace CBRO::Core::Occlusion
 				return 0.0f;
 			}
 			Bump(kParallaxWidened);
+			t_parallaxHit = true;
 			return a_context.parallaxMove * (1.0f / nearest - 1.0f / a_z);
 		}
 
@@ -1055,40 +1173,69 @@ namespace CBRO::Core::Occlusion
 		// where its cross-section reaches that region; that part is then tested against the depth frame like an
 		// object: hidden only if every visible surface over its screen box is in front of its nearest point.
 		// a_far (v1.80): only the receivers of the sun's last cascade, the slab of view depth it covers (Sun::farPlanes).
+		// A caster's sweep as TestSun starts it (and the entry walk's cheap shadow test, v1.94): the bound in the depth
+		// frame's view space and its radius with the margins (the cache's move tolerance, the shadow maps' filtering, and
+		// the cache's turn tolerance over the whole receiver range: a reused verdict must hold for a camera turned by that
+		// much, which shifts a point at depth z by z x the slack). False: the bound or the camera is unusable (needed).
+		struct SunSweep
+		{
+			float center[3]{};
+			float radius{ 0.0f };
+		};
+
+		bool SunSweepStart(const FrameContext& a_context, const RE::NiBound& a_bound, SunSweep& a_out) noexcept
+		{
+			const auto& camera = a_context.snapshot->camera;
+			const auto& sun = a_context.sun;
+			const float radius = a_bound.fRadius;
+			if (!camera.viewSpace || !(camera.depthB < 0.0f) || !(radius > 0.0f) || !(radius < 1.0e6f) ||
+				!std::isfinite(a_bound.center.x) || !std::isfinite(a_bound.center.y) || !std::isfinite(a_bound.center.z)) {
+				return false;
+			}
+			const float dx = a_bound.center.x - camera.origin[0];
+			const float dy = a_bound.center.y - camera.origin[1];
+			const float dz = a_bound.center.z - camera.origin[2];
+			a_out.center[0] = dx * camera.viewRight[0] + dy * camera.viewRight[1] + dz * camera.viewRight[2];
+			a_out.center[1] = dx * camera.viewUp[0] + dy * camera.viewUp[1] + dz * camera.viewUp[2];
+			a_out.center[2] = dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2];
+			a_out.radius = radius + a_context.dilateMove + sun.margin + (std::isfinite(sun.reach) ? std::max(sun.reach, 0.0f) * a_context.angularSlack : 0.0f);
+			return true;
+		}
+
+		// The sweep lies beyond one of the receiver planes it can only move away from: out of reach without the full
+		// sweep (the cheap part of TestSun, where most casters end).
+		bool SunSweepBeyondReach(const FrameContext& a_context, const SunSweep& a_sweep, bool a_far) noexcept
+		{
+			const auto& sun = a_context.sun;
+			const auto* reachPlanes = a_far ? sun.farReachPlanes : sun.reachPlanes;
+			const int   reachCount = a_far ? sun.farReachCount : sun.reachCount;
+			for (int i = 0; i < reachCount; ++i) {
+				const auto& plane = reachPlanes[i];
+				if (ShadowGeometry::Dot(plane.n, a_sweep.center) + plane.d + a_sweep.radius < 0.0f) {
+					return true;
+				}
+			}
+			return false;
+		}
+
 		SunVerdict TestSun(const FrameContext& a_context, const RE::NiBound& a_bound, DepthRect* a_rect = nullptr, bool a_far = false) noexcept
 		{
 			const auto& snapshot = *a_context.snapshot;
 			const auto& camera = snapshot.camera;
 			const auto& sun = a_context.sun;
-			const float radius = a_bound.fRadius;
-			if (!camera.viewSpace || !(camera.depthB < 0.0f) || !(radius > 0.0f) || !(radius < 1.0e6f) ||
-				!std::isfinite(a_bound.center.x) || !std::isfinite(a_bound.center.y) || !std::isfinite(a_bound.center.z)) {
+			SunSweep    sweep{};
+			if (!SunSweepStart(a_context, a_bound, sweep)) {
 				return SunVerdict::kNeeded;
 			}
-			const float dx = a_bound.center.x - camera.origin[0];
-			const float dy = a_bound.center.y - camera.origin[1];
-			const float dz = a_bound.center.z - camera.origin[2];
-			const float center[3]{
-				dx * camera.viewRight[0] + dy * camera.viewRight[1] + dz * camera.viewRight[2],
-				dx * camera.viewUp[0] + dy * camera.viewUp[1] + dz * camera.viewUp[2],
-				dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2]
-			};
-			// (+ the cache's turn tolerance over the whole receiver range: a reused verdict must hold for a camera
-			// turned by that much, which shifts a point at depth z by z x the slack)
-			const float r0 = radius + a_context.dilateMove + sun.margin + (std::isfinite(sun.reach) ? std::max(sun.reach, 0.0f) * a_context.angularSlack : 0.0f);
+			const float (&center)[3] = sweep.center;
+			const float r0 = sweep.radius;
 			// (first person, which may lie outside the world view's planes: its own field of view, tested first)
 			// (not in the last cascade's slab: first person is drawn next to the eye)
 			if (!a_far && FirstPersonUnseen(a_context) && SweepNearEye(center, sun.dir, r0, sun.spread, 1.0e6f, kFirstPersonReach)) {
 				return SunVerdict::kNeeded;
 			}
-
-			const auto* reachPlanes = a_far ? sun.farReachPlanes : sun.reachPlanes;
-			const int   reachCount = a_far ? sun.farReachCount : sun.reachCount;
-			for (int i = 0; i < reachCount; ++i) {  // the cheap part of the sweep first (most casters end here)
-				const auto& plane = reachPlanes[i];
-				if (ShadowGeometry::Dot(plane.n, center) + plane.d + r0 < 0.0f) {
-					return SunVerdict::kOutside;
-				}
+			if (SunSweepBeyondReach(a_context, sweep, a_far)) {
+				return SunVerdict::kOutside;
 			}
 			float t0 = 0.0f, t1 = 0.0f;
 			if (!ShadowGeometry::SweepClip(center, sun.dir, r0, sun.spread, 1.0e6f, a_far ? sun.farPlanes : sun.planes, a_far ? sun.farPlaneCount : sun.planeCount, t0, t1)) {
@@ -1951,8 +2098,9 @@ namespace CBRO::Core::Occlusion
 			kSkipOutside,     // ... out of view
 			kSkipCaster,      // ... group 0, neither view needs it
 			kOutside,         // filed, judged out of view: the engine's own frustum test drops it from the main view
+			kNodePruned,      // never filed: its cell node or container was left out whole (SkipCellNode; recorded on the dump frame only, v1.92.7)
 		};
-		constexpr const char* kLeftOutPathNames[]{ "rejected", "rejected in every view", "main view drop", "parent dropped", "never filed: hidden", "never filed: out of view", "never filed: no view needs it", "out of view (engine's frustum test)" };
+		constexpr const char* kLeftOutPathNames[]{ "rejected", "rejected in every view", "main view drop", "parent dropped", "never filed: hidden", "never filed: out of view", "never filed: no view needs it", "out of view (engine's frustum test)", "never filed: its node pruned whole" };
 
 		enum class VerdictSource : std::uint8_t
 		{
@@ -1982,6 +2130,20 @@ namespace CBRO::Core::Occlusion
 			bool          bruteCached{ false }, bruteFresh{ false }, bruteSame{ false };
 			std::uint32_t bruteTriangles{ 0 }, bruteInView{ 0 }, bruteVisible{ 0 }, bruteUnoccupied{ 0 };
 			std::uint8_t  bruteDims[3]{}, bruteCount{ 0 };
+			// v1.92.10: of the in-view triangles, those whose screen box crosses the ray window (the region a missing object
+			// was seen in), how many the box test finds visible, and the first few in detail: where the test looked and what
+			// the depth held there (a hidden verdict with a far surface over the box means the test, not the depth, is off).
+			std::uint32_t bruteWindow{ 0 }, bruteWindowVisible{ 0 };
+			struct WindowSample
+			{
+				float   zNear{ 0.0f }, zFar{ 0.0f };  // the triangle's view depth range
+				float   ndc[4]{};                      // its screen box: x0, y0, x1, y1
+				float   farthest{ 0.0f };              // view depth of the farthest surface over that box (Hi-Z)
+				float   threshold{ 0.0f };             // view depth the hidden verdict compared against (0 when visible)
+				Verdict verdict{ Verdict::kInvalid };
+			};
+			WindowSample  windowSample[3]{};
+			std::uint8_t  windowSamples{ 0 };
 			float         bound[4]{};
 			float         ownOffset{ 0.0f };  // the object's own worldBound against the bound offered: center distance
 			float         ownRadius{ 0.0f };  // ... and its radius
@@ -2029,6 +2191,8 @@ namespace CBRO::Core::Occlusion
 		DepthPicture               g_picture;  // (under g_keptLock)
 		HiZ::Camera                g_pictureCamera{};  // (under g_keptLock) the depth frame's camera, for the scene scan
 		bool                       g_pictureCameraValid{ false };
+		HiZ::Camera                g_rayCamera{};  // (under g_keptLock) the same camera, kept for the set diff's ray window (v1.92.10: the scan consumes the flag above)
+		bool                       g_rayCameraValid{ false };
 		std::unordered_set<const void*> g_registered;  // (under g_keptLock) objects the main accumulator registered on that frame
 		// (under g_keptLock) objects offered to the main pass on that frame: bit 0 a Block::Add entry, bit 1 a top-level Group::Add
 		std::unordered_map<const void*, std::uint8_t> g_offered;
@@ -2071,6 +2235,8 @@ namespace CBRO::Core::Occlusion
 			g_picture = std::move(picture);
 			g_pictureCamera = camera;
 			g_pictureCameraValid = camera.viewSpace;
+			g_rayCamera = camera;
+			g_rayCameraValid = camera.viewSpace;
 		}
 
 		const char* FullVerdictName(Verdict a_verdict) noexcept
@@ -2340,12 +2506,13 @@ namespace CBRO::Core::Occlusion
 			}
 		}
 
-		// The screen window where the 2026-10-09 wall bottom went missing (lower left), as a grid of rays from the depth
-		// frame's camera: whatever is drawn there has a bound one of them crosses within kRayLength. Returns how far along
-		// the nearest such ray the bound's center lies, or a negative value when no ray crosses it.
-		constexpr float kRayWindow[4]{ -1.0f, -0.45f, -0.85f, 0.05f };  // NDC x from, to; y from, to
-		constexpr int   kRaySteps = 6;
-		constexpr float kRayLength = 4000.0f;
+		// A screen window (fRayWindowX0..Y1; the default is where the 2026-10-09 wall bottom went missing, lower left) as a
+		// grid of rays from the depth frame's camera: whatever is drawn there has a bound one of them crosses within
+		// fRayLength. Returns how far along the nearest such ray the bound's center lies, or a negative value when no ray
+		// crosses it. (v1.92.9: from the INI, so a dump can be aimed at the screen region a missing object was seen in.)
+		constexpr int kRaySteps = 6;
+		const float*  RayWindow() noexcept { return Settings::Get().rayWindow; }
+		float         RayLength() noexcept { return Settings::Get().rayLength; }
 
 		float RayWindowHit(const HiZ::Camera& a_camera, float a_x, float a_y, float a_z, float a_radius) noexcept
 		{
@@ -2356,8 +2523,8 @@ namespace CBRO::Core::Occlusion
 			float       best = -1.0f;
 			for (int i = 0; i < kRaySteps; ++i) {
 				for (int j = 0; j < kRaySteps; ++j) {
-					const float nx = kRayWindow[0] + (kRayWindow[1] - kRayWindow[0]) * (static_cast<float>(i) + 0.5f) / kRaySteps;
-					const float ny = kRayWindow[2] + (kRayWindow[3] - kRayWindow[2]) * (static_cast<float>(j) + 0.5f) / kRaySteps;
+					const float nx = RayWindow()[0] + (RayWindow()[1] - RayWindow()[0]) * (static_cast<float>(i) + 0.5f) / kRaySteps;
+					const float ny = RayWindow()[2] + (RayWindow()[3] - RayWindow()[2]) * (static_cast<float>(j) + 0.5f) / kRaySteps;
 					float d[3], length = 0.0f;
 					for (int k = 0; k < 3; ++k) {
 						d[k] = a_camera.viewDir[k] + nx / a_camera.scaleX * a_camera.viewRight[k] + ny / a_camera.scaleY * a_camera.viewUp[k];
@@ -2365,7 +2532,7 @@ namespace CBRO::Core::Occlusion
 					}
 					length = std::sqrt(length);
 					const float along = (c[0] * d[0] + c[1] * d[1] + c[2] * d[2]) / length;
-					const float t = std::clamp(along, 0.0f, kRayLength);
+					const float t = std::clamp(along, 0.0f, RayLength());
 					float       miss = 0.0f;
 					for (int k = 0; k < 3; ++k) {
 						const float e = c[k] - t * d[k] / length;
@@ -2425,6 +2592,7 @@ namespace CBRO::Core::Occlusion
 			for (std::uint32_t t = 0; t < triangles; ++t) {
 				float lo[3]{ kBig, kBig, kBig }, hi[3]{ -kBig, -kBig, -kBig };
 				float mlo[3]{ kBig, kBig, kBig }, mhi[3]{ -kBig, -kBig, -kBig };
+				float ndc[4]{ kBig, kBig, -kBig, -kBig };  // (v1.92.10) the vertices' screen box, those beyond the near distance
 				bool  valid = true;
 				for (int k = 0; k < 3; ++k) {
 					const auto index = look.indices[static_cast<std::size_t>(t) * 3 + k];
@@ -2441,18 +2609,42 @@ namespace CBRO::Core::Occlusion
 						mlo[a] = std::min(mlo[a], p[a]);
 						mhi[a] = std::max(mhi[a], p[a]);
 					}
+					if (v[2] > g_tunables.nearDistance) {
+						const float nx = camera.scaleX * v[0] / v[2], ny = camera.scaleY * v[1] / v[2];
+						ndc[0] = std::min(ndc[0], nx);
+						ndc[1] = std::min(ndc[1], ny);
+						ndc[2] = std::max(ndc[2], nx);
+						ndc[3] = std::max(ndc[3], ny);
+					}
 				}
 				if (!valid) {
 					continue;
 				}
 				const float center[3]{ (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f };
 				const float half[3]{ (hi[0] - lo[0]) * 0.5f, (hi[1] - lo[1]) * 0.5f, (hi[2] - lo[2]) * 0.5f };
-				const auto  verdict = TestViewBox(a_context, center, half);
+				DepthRect   rect;
+				const auto  verdict = TestViewBox(a_context, center, half, &rect);
 				if (verdict == Verdict::kOutside) {
 					continue;
 				}
 				++a_item.bruteInView;
 				a_item.bruteVisible += verdict != Verdict::kHidden;
+				const float* window = RayWindow();
+				if (ndc[2] >= ndc[0] && ndc[2] >= window[0] && ndc[0] <= window[1] && ndc[3] >= window[2] && ndc[1] <= window[3]) {
+					++a_item.bruteWindow;
+					a_item.bruteWindowVisible += verdict != Verdict::kHidden;
+					if (a_item.windowSamples < 3) {
+						auto& sample = a_item.windowSample[a_item.windowSamples++];
+						sample.zNear = lo[2];
+						sample.zFar = hi[2];
+						std::copy_n(ndc, 4, sample.ndc);
+						sample.verdict = verdict;
+						const auto& snapshot = *a_context.snapshot;
+						const float width = static_cast<float>(snapshot.width[0]), height = static_cast<float>(snapshot.height[0]);
+						sample.farthest = LinearDepth(camera, snapshot.MaxDepth((ndc[0] * 0.5f + 0.5f) * width, (0.5f - ndc[3] * 0.5f) * height, (ndc[2] * 0.5f + 0.5f) * width, (0.5f - ndc[1] * 0.5f) * height));
+						sample.threshold = verdict == Verdict::kHidden && rect.hidden ? LinearDepth(camera, rect.threshold) : 0.0f;
+					}
+				}
 				if (shape.count == 0) {
 					continue;  // (box only: every cell counts)
 				}
@@ -2478,6 +2670,9 @@ namespace CBRO::Core::Occlusion
 
 		void RecordLeftOut(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound, LeftOutPath a_path, const Record* a_record) noexcept
 		{
+			if (Recorder::On()) {
+				Recorder::NotePath(static_cast<std::uint8_t>(a_path));
+			}
 			if (!LeftOutFrame(a_context.clock) || !a_context.snapshot) {
 				return;
 			}
@@ -2667,6 +2862,174 @@ namespace CBRO::Core::Occlusion
 		};
 		thread_local TopDecision t_top;
 
+		// The verdict of the top entry decided last on this thread (v1.98, bChildInherit): a child with the same bound (a
+		// fade node with one mesh: 856 of the 1,367 let-through fade nodes a frame in the 2026-10-27 run) would get the same
+		// sphere verdict from the same tests, so it takes the parent's instead of a lookup, a judgement and a record of its
+		// own. Not when the child could get a mesh-shape test the node never had (big enough, the sphere visible or at the
+		// edge), nor from an exemption, a light or a force-visible filing. The decision inherited is always "file it":
+		// the engine's own frustum test still drops a child out of the view.
+		struct TopRecord
+		{
+			const RE::NiAVObject* object{ nullptr };
+			std::uint32_t         clock{ 0 };
+			std::uint8_t          outcome{ 0 };
+			std::uint8_t          verdict{ 0 };
+			std::uint8_t          flags{ 0 };
+			float                 bound[4]{};
+		};
+		// This frame's top decisions by object, per thread (direct-mapped): the engine files a node's children only when it
+		// finishes the block the node sits in, hundreds of entries after the node's own decision (FO4-ENGINE-NOTES 5.2), so
+		// the last decision alone never matched (v1.98 measured none).
+		constexpr std::size_t kTopTableSize = 4096;
+		thread_local std::array<TopRecord, kTopTableSize>* t_topTable{ nullptr };
+
+		TopRecord& TopSlot(const RE::NiAVObject* a_object) noexcept
+		{
+			if (!t_topTable) [[unlikely]] {
+				t_topTable = new std::array<TopRecord, kTopTableSize>();
+			}
+			const auto address = reinterpret_cast<std::uintptr_t>(a_object);
+			return (*t_topTable)[((address >> 5) ^ (address >> 17)) & (kTopTableSize - 1)];
+		}
+
+		const TopRecord* TopOf(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
+		{
+			if (!a_object) {
+				return nullptr;
+			}
+			const auto& slot = TopSlot(a_object);
+			return slot.object == a_object && slot.clock == a_context.clock ? &slot : nullptr;
+		}
+
+		// ---- stable-index decisions (v1.99.2, bStableIndex) --------------------------------------------------------
+		// The engine finishes a group's node entries in the order they were filed (FO4OG 5.2: 1147875 runs 558046 over the
+		// node blocks in order, each block's entries in index order, unbatched with no SubGroup), so the decision parent of
+		// a child (the fade node filing it, or the node ForEachChild walks) is the next filed node that has children, or a
+		// few further on. Each top-level node decision is recorded in that order, per group, and a child finds its parent's
+		// record with a cursor that only moves forward: no hash, no probe. What the record answers (dropped from the main
+		// view, filed force-visible for the trace, the player's, the verdict an inheriting child takes, the collection
+		// root) cost four table lookups per parent before (the two drop sets, the top table, the collection cache; ~14% of
+		// CBRO.dll's cull-stage samples in the 2026-10-27 v1.99 run, with the top table's write per filed entry). A parent
+		// the cursor doesn't find within kParentLookAhead (a nested node, a group filed out of order) is answered by those
+		// tables as before: the top-level drops and forced filings still go into the sets.
+		enum ParentState : std::uint8_t
+		{
+			kParentJudged = 1 << 0,     // outcome, verdict, flags and bound hold its verdict (as its TopRecord would)
+			kParentDropped = 1 << 1,    // a main-view drop (in g_drops)
+			kParentForced = 1 << 2,     // filed force-visible for the trace (in g_traceForced)
+			kParentPlayer = 1 << 3,     // the player's 3D
+			kParentScolKnown = 1 << 4,  // kParentScolRoot answers for the collection root
+			kParentScolRoot = 1 << 5,   // a static collection's root (its reference's base a SCOL)
+		};
+
+		struct ParentRecord
+		{
+			const RE::NiAVObject* object{ nullptr };
+			float                 bound[4]{};
+			std::uint8_t          outcome{ 0 };
+			std::uint8_t          verdict{ 0 };
+			std::uint8_t          flags{ 0 };
+			std::uint8_t          state{ 0 };
+		};
+
+		struct ParentSequence
+		{
+			const void*               group{ nullptr };
+			std::vector<ParentRecord> records;
+			std::size_t               cursor{ 0 };
+		};
+		std::array<ParentSequence, 4> g_parentSequences;  // (main thread: written while the groups are filed, read while they are finished)
+		DWORD                         g_mainThreadId{ 0 };
+		constexpr std::size_t         kParentLookAhead = 256;
+		constexpr std::size_t         kParentReserve = 8192;     // (records are not moved while the groups are finished)
+		thread_local const void*      t_decisionGroup{ nullptr };  // the group a top-level decision files into (set by SkipTopLevelImpl's callers)
+		// The nodes recorded this frame, one bit per hashed address (v1.99.3): the 2026-10-27 v1.99.2 run looked ~1,500-2,000
+		// parents a frame up that were never recorded (a fade node nested in a filed node, met through ForEachChild), each
+		// costing the cursor a scan of the look-ahead (~11% of CBRO.dll's cull-stage samples); a clear bit answers those.
+		std::array<std::uint64_t, 512> g_parentPresence{};
+
+		inline std::size_t ParentPresenceBit(const void* a_node) noexcept
+		{
+			return static_cast<std::size_t>(((reinterpret_cast<std::uintptr_t>(a_node) >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - 15));
+		}
+
+		bool StableIndexOn() noexcept
+		{
+			return g_tunables.stableIndex && GetCurrentThreadId() == g_mainThreadId;
+		}
+
+		void ClearParentSequences() noexcept
+		{
+			g_parentPresence.fill(0);
+			for (auto& sequence : g_parentSequences) {
+				sequence.group = nullptr;
+				sequence.records.clear();
+				if (sequence.records.capacity() < kParentReserve) {
+					sequence.records.reserve(kParentReserve);
+				}
+				sequence.cursor = 0;
+			}
+		}
+
+		ParentSequence* ParentSequenceOf(const void* a_group, bool a_create) noexcept
+		{
+			if (!a_group) {
+				return nullptr;
+			}
+			for (auto& sequence : g_parentSequences) {
+				if (sequence.group == a_group) {
+					return &sequence;
+				}
+				if (!sequence.group) {
+					if (!a_create) {
+						return nullptr;
+					}
+					sequence.group = a_group;
+					return &sequence;
+				}
+			}
+			return nullptr;
+		}
+
+		struct ParentRecordMemo
+		{
+			const RE::NiAVObject* parent{ nullptr };
+			std::uint32_t         clock{ 0 };
+			const ParentRecord*   record{ nullptr };
+		};
+		thread_local ParentRecordMemo t_parentRecord;
+
+		// The record of a child's decision parent, in the group being finished (null: none found; the tables answer).
+		// Siblings come one after another, so the answer is kept for them.
+		const ParentRecord* ParentRecordOf(const RE::NiAVObject* a_parent, std::uint32_t a_clock) noexcept
+		{
+			if (!a_parent || !StableIndexOn()) {
+				return nullptr;
+			}
+			if (t_parentRecord.parent == a_parent && t_parentRecord.clock == a_clock) {
+				return t_parentRecord.record;
+			}
+			if (const auto bit = ParentPresenceBit(a_parent); !((g_parentPresence[bit >> 6] >> (bit & 63)) & 1)) {
+				Bump(kStableParentNotRecorded);
+				t_parentRecord = { a_parent, a_clock, nullptr };
+				return nullptr;
+			}
+			const ParentRecord* found = nullptr;
+			if (const auto sequence = ParentSequenceOf(Hooks::CullGroups::CurrentGroup(), false)) {
+				const auto end = std::min(sequence->records.size(), sequence->cursor + kParentLookAhead);
+				for (auto i = sequence->cursor; i < end; ++i) {
+					if (sequence->records[i].object == a_parent) {
+						found = &sequence->records[i];
+						sequence->cursor = i + 1;
+						break;
+					}
+				}
+			}
+			Bump(found ? kStableParentHits : kStableParentOutOfOrder);
+			t_parentRecord = { a_parent, a_clock, found };
+			return found;
+		}
+
 		// Whether the parent of an object being added was dropped from the main view this frame. The engine
 		// adds a node's children one after another, so the answer is kept for the siblings (per thread).
 		struct ParentDecision
@@ -2678,11 +3041,28 @@ namespace CBRO::Core::Occlusion
 		thread_local ParentDecision t_parent;
 		thread_local ParentDecision t_forcedParent;  // (g_traceForced: ParentForced)
 
+		// The node whose decision a Block::Add child takes (v1.99): the fade node the engine is filing (AddP1FadeNode, its
+		// flattened geometry: the child's own parent is one of the node's sub-nodes, which nothing decided), else the
+		// child's parent. Before v1.99 a dropped fade node's geometry under a sub-node was judged one by one (674 a frame in
+		// the 2026-10-27 recording) and each new sub-node cost the memos below a probe and a read of its own.
+		const RE::NiAVObject* DecisionParent(const RE::NiAVObject* a_object) noexcept
+		{
+			if (g_tunables.childInherit) {
+				if (const auto node = Hooks::CullGroups::FadeNodeFiling()) {
+					return node;
+				}
+			}
+			return a_object->parent;
+		}
+
 		bool ParentDropped(const RE::NiAVObject* a_object, std::uint32_t a_clock, std::uint32_t a_tag) noexcept
 		{
-			const auto parent = a_object->parent;
+			const auto parent = DecisionParent(a_object);
 			if (!parent) {
 				return false;
+			}
+			if (const auto record = ParentRecordOf(parent, a_clock)) {
+				return (record->state & kParentDropped) != 0;
 			}
 			if (t_parent.parent != parent || t_parent.clock != a_clock) {
 				t_parent = { parent, a_clock, g_drops.Contains(parent, a_tag) };
@@ -2694,9 +3074,12 @@ namespace CBRO::Core::Occlusion
 		// the child; never hidden by implication).
 		bool ParentForced(const RE::NiAVObject* a_object, std::uint32_t a_clock, std::uint32_t a_tag) noexcept
 		{
-			const auto parent = a_object->parent;
+			const auto parent = DecisionParent(a_object);
 			if (!parent || !TraceFeed::On()) {
 				return false;
+			}
+			if (const auto record = ParentRecordOf(parent, a_clock)) {
+				return (record->state & kParentForced) != 0;
 			}
 			if (t_forcedParent.parent != parent || t_forcedParent.clock != a_clock) {
 				t_forcedParent = { parent, a_clock, g_traceForced.Contains(parent, a_tag) };
@@ -2932,15 +3315,21 @@ namespace CBRO::Core::Occlusion
 
 			Bump(kTested);
 			DepthRect rect{};
+			t_parallaxHit = false;
 			auto      verdict = Test(a_context, *a_add.bound, &rect);
 			// (last frame's verdict was edge: no depth for part of the object, so the hidden streak's backup stood through it)
 			const bool edgeBefore = a_old && a_old->outcome == Outcome::kKept && a_old->verdict == static_cast<std::uint8_t>(Verdict::kEdge);
 
 			// A big static mesh the sphere can't settle: judge it by its actual shape (MeshProxy decides
 			// which meshes have one; a mesh that moved or sways is left to its sphere).
+			const bool              reasons = g_keptReasons.load(std::memory_order_relaxed);  // (diagnostic, SetKeptReasons)
+			const MeshProxy::Shape* shapeUsed = nullptr;                                     // ... the shape the verdict came through
+			RE::NiBound             model{};
 			if (g_tunables.meshShapes && (verdict == Verdict::kVisible || verdict == Verdict::kNear || verdict == Verdict::kEdge) &&
 				a_add.bound->fRadius >= kShapeMinRadius && a_context.snapshot->camera.viewSpace && (TypeOf(a_add.object) & kTypeCullable)) {
-				RE::NiBound model{};
+				if (reasons) {
+					a_out.flags |= kRecordShapeNone;  // (taken back below when a shape decides)
+				}
 				if (const auto shape = MeshProxy::Find(a_add.object, model)) {
 					if (Moved(a_add.object)) {
 						Bump(kShapeMoving);
@@ -2948,6 +3337,10 @@ namespace CBRO::Core::Occlusion
 						Bump(kShapeAnimated);
 					} else {
 						Bump(kShapeTests);
+						if (reasons) {
+							a_out.flags = static_cast<std::uint8_t>((a_out.flags & ~kRecordShapeNone) | kRecordShaped);
+							shapeUsed = shape;
+						}
 						std::uint32_t cells = 0;
 						std::uint8_t  hint = a_old ? a_old->cellHint : std::uint8_t{ 0 };
 						const auto    shapeStart = a_timed ? __rdtsc() : 0;
@@ -2967,6 +3360,21 @@ namespace CBRO::Core::Occlusion
 							Bump(kShapeNoTransform);
 						}
 					}
+				}
+			}
+			// (diagnostic, SetKeptReasons: the same tests again without the parallax margin where it widened them; hidden then
+			// means the margin alone keeps the object)
+			if (reasons && t_parallaxHit && (verdict == Verdict::kVisible || verdict == Verdict::kEdge)) {
+				t_parallaxOff = true;
+				auto bare = Test(a_context, *a_add.bound);
+				if (shapeUsed && (bare == Verdict::kVisible || bare == Verdict::kNear || bare == Verdict::kEdge)) {
+					std::uint32_t cells = 0;
+					std::uint8_t  hint = a_out.cellHint;
+					bare = TestShape(a_context, a_add.object, model, *shapeUsed, cells, hint);
+				}
+				t_parallaxOff = false;
+				if (bare == Verdict::kHidden) {
+					a_out.flags |= kRecordParallaxKept;
 				}
 			}
 			a_out.verdict = static_cast<std::uint8_t>(verdict);
@@ -3595,28 +4003,66 @@ namespace CBRO::Core::Occlusion
 		{
 			const RE::NiAVObject* node{ nullptr };
 			std::uint32_t         clock{ 0 };
+			bool                  all{ true };  // every entry (false: the tracer knows the node, only its entries it doesn't know; v2.0)
 		};
 		thread_local TraceNode t_traceNode{};
 
+		// On its turn and, with a tracer that keeps what it is handed, not handed already (or its resend turn; v2.0).
+		bool TraceTurnDue(const void* a_object, std::uint32_t a_clock) noexcept
+		{
+			if (!TraceFeed::Turn(a_object, a_clock)) {
+				return false;
+			}
+			if (TraceFeed::Due(a_object, a_clock)) {
+				return true;
+			}
+			Bump(kTraceKnownSkipped);
+			return false;
+		}
+
 		// Whether an object about to be left out of every view is filed for the trace instead this frame: within its
-		// radius, on its turn, in a frame its bound moved, or under a node walked for it.
+		// radius, on its turn, in a frame its bound moved, or under a node walked for it. v2.0, a tracer that keeps what
+		// it is handed: on its turn only the first time (TraceTurnDue), a mover every frame within the tracer's mover
+		// radius and one frame in 8 farther, under a node walked for it only an entry it doesn't know (unless the walk is
+		// the node's resend).
 		bool TraceRefresh(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
 		{
 			if (!TraceFeed::On() || Observing()) {
 				return false;
 			}
+			if (t_moved) {
+				if (!TraceFeed::InReach(a_bound, a_context.eye)) {
+					return false;
+				}
+				if (!TraceFeed::MoverDue(a_object, a_bound, a_context.eye, a_context.clock)) {
+					Bump(kTraceMoverHeld);
+					return false;
+				}
+				Bump(kTraceMoved);
+				return true;
+			}
 			const auto parent = a_object->parent;
 			const bool underNode = t_traceNode.node && t_traceNode.clock == a_context.clock && parent &&
 			                       (parent == t_traceNode.node || parent->parent == t_traceNode.node);
-			if (!(t_moved || underNode || TraceFeed::Turn(a_object, a_context.clock)) || !TraceFeed::InReach(a_bound, a_context.eye)) {
+			if (!(underNode ? (t_traceNode.all || !TraceFeed::Known(a_object)) : TraceTurnDue(a_object, a_context.clock)) || !TraceFeed::InReach(a_bound, a_context.eye)) {
 				return false;
 			}
-			Bump(t_moved ? kTraceMoved : kTraceFiled);
+			Bump(kTraceFiled);
 			return true;
 		}
 
 		// A main-only entry (the main accumulator alone registers its group) filed for the trace: a main-view drop. False
 		// (not its turn, or the drop table full): left out as before.
+		bool TraceDropFiled(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
+		{
+			if (!g_drops.Insert(a_object, DropSet::Tag(a_context.clock))) {
+				Bump(kDropFull);
+				return false;
+			}
+			TraceFeed::Handed(a_object);
+			return true;
+		}
+
 		bool TraceDrop(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
 		{
 			if (!TraceRefresh(a_context, a_object, a_bound)) {
@@ -3626,6 +4072,7 @@ namespace CBRO::Core::Occlusion
 				Bump(kDropFull);
 				return false;
 			}
+			TraceFeed::Handed(a_object);
 			return true;
 		}
 
@@ -3657,28 +4104,28 @@ namespace CBRO::Core::Occlusion
 
 		// An out-of-view entry no view files (a main-only group's; group 0's with the sun down, when no shadow pass is known
 		// to file it) filed for the trace on its turn: a main-view drop the caller files force-visible. False: left as before.
-		bool TraceOutside(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		bool TraceOutsideFiled(const FrameContext& a_context, const RE::NiAVObject* a_object) noexcept
 		{
-			if (!TraceRefresh(a_context, a_object, a_bound)) {
-				return false;
-			}
 			if (!g_drops.Insert(a_object, DropSet::Tag(a_context.clock))) {
 				Bump(kDropFull);
 				return false;
 			}
 			MarkForced(a_context, a_object);
+			TraceFeed::Handed(a_object);
 			return true;
+		}
+
+		bool TraceOutside(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			return TraceRefresh(a_context, a_object, a_bound) && TraceOutsideFiled(a_context, a_object);
 		}
 
 		// A group-0 entry nothing needs (GroupZeroUnneeded) filed for the trace: a main-view drop and, with the sun up, out of
 		// the sun's cascades (SunCascade, on while the feed is). Out of view (a_hidden false) the caller files it
 		// force-visible (marked here). False: left out as before.
-		bool TraceKeep(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound, bool a_hidden, const Record& a_record) noexcept
+		bool TraceKeepFiled(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound, bool a_hidden, const Record& a_record) noexcept
 		{
 			const bool sunUp = a_context.sun.state == FrameContext::Sun::State::kOn;
-			if (!TraceRefresh(a_context, a_object, a_bound)) {
-				return false;
-			}
 			const auto tag = DropSet::Tag(a_context.clock);
 			if (!g_drops.Insert(a_object, tag) || (sunUp && !g_sunDrops.Insert(a_object, tag))) {
 				Bump(kDropFull);
@@ -3687,8 +4134,14 @@ namespace CBRO::Core::Occlusion
 			if (!a_hidden) {
 				MarkForced(a_context, a_object);
 			}
+			TraceFeed::Handed(a_object);
 			RecordLeftOut(a_context, a_object, a_bound, LeftOutPath::kDropped, &a_record);
 			return true;
+		}
+
+		bool TraceKeep(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound, bool a_hidden, const Record& a_record) noexcept
+		{
+			return TraceRefresh(a_context, a_object, a_bound) && TraceKeepFiled(a_context, a_object, a_bound, a_hidden, a_record);
 		}
 
 		// The object's outcome for this frame: reused from its last record (a_old, or null) when everything it depended
@@ -3846,6 +4299,9 @@ namespace CBRO::Core::Occlusion
 		// current, as OnVisible would; the fade value itself is left as it was. Main thread (the walk).
 		constexpr std::uint64_t kFrameNumberID = 734919;
 		constexpr std::size_t   kFadeFrameCounterOffset = 0x1B0;
+		constexpr std::size_t   kFadeCurrentOffset = 0x1A0;       // BSFadeNode::currentFade
+		constexpr std::size_t   kFadeRadiusOffset = 0x1A8;        // BSFadeNode::boundRadius (CheckFadeRadius; 0 on a chunk node)
+		constexpr std::uint64_t kFadeCompleteBit = std::uint64_t{ 1 } << 37;  // flag bit 37: the fade-in completed
 
 		const std::int32_t* FrameNumber() noexcept
 		{
@@ -3853,30 +4309,235 @@ namespace CBRO::Core::Occlusion
 			return frame;
 		}
 
-		void KeepFadeSeen(RE::NiAVObject* a_object) noexcept
+		// The counter only has to stay within 20 frames of the frame number, so a node is stamped on its turn, one frame in
+		// kFadeStampFrames (v1.92). Up to v1.91 every left-out node was stamped every frame: ~7,000 stores a frame to engine
+		// objects in a dense exterior (2026-10-26), each with a virtual IsFadeNode call, on the walk's critical path.
+		constexpr std::uint32_t kFadeStampFrames = 8;
+
+		bool FadeStampTurn(const void* a_object, std::uint32_t a_clock) noexcept
 		{
-			const auto frame = FrameNumber();
+			return (a_clock + static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(a_object) >> 4)) % kFadeStampFrames == 0;
+		}
+
+		// ---- the engine's fade data (BSFadeNode, FO4OG 7.8, 7.9) ----------------------------------------------------
+		constexpr std::uint64_t kFadeMultTableID = 804710;
+		constexpr std::uint64_t kFadeDistanceMultiplierID = 515159;
+		constexpr std::uint64_t kFadeEnabledID = 1220201;
+		constexpr std::uint64_t kFadeInThresholdID = 758162;  // fFadeInThreshold (the unseen rule's "near": id 928617)
+		// BSFadeNode::OnVisible(NiCamera&, bool) (531348) and what it calls (FO4OG 7.8, 7.9; decompiled 2026-10-27)
+		constexpr std::uint64_t kFadeUpdateID = 928617;             // the fade update for every type but 6: (node, fadeAmount +0x118, float[4] camera x y z lodAdjust)
+		constexpr std::uint64_t kComputeFadeAmountID = 1040250;     // BSFadeNode::ComputeFadeAmount(float[4] camera, float& distance) -> fade
+		constexpr std::uint64_t kDetermineMeshLODLevelID = 980443;  // BSFadeNode::DetermineMeshLODLevel(float distance)
+		constexpr std::uint64_t kFadeUpdateGateID = 1445134;        // byte: 0 = OnVisible runs no fade update at all
+		constexpr std::uint64_t kFadeOverrideID = 846038;           // float: -1 = none (type 6 then takes OnVisible's own branch)
+		constexpr std::uint64_t kFadeDeltaID = 160595;              // float: the numerator of every fade step
+		constexpr std::uint64_t kFadeInDivisorID = 538734;          // float: the fade-in step's divisor
+		constexpr std::uint64_t kFadeStepCapID = 1415799;           // float: the most a fade moves in one update
+		constexpr std::size_t   kCameraTranslateOffset = 0xA0;      // NiCamera world translate (OnVisible copies +0xA0, +0xA4, +0xA8, +0x194)
+		using FadeUpdateFn = std::int64_t (*)(void*, float, const float*);
+		using ComputeFadeAmountFn = float (*)(void*, const float*, float*);
+		using DetermineMeshLODLevelFn = void (*)(void*, float);
+		constexpr std::uint64_t kDrawWorldCameraID = 81406;  // global NiCamera*
+		constexpr std::size_t   kCameraLODAdjustOffset = 0x194;
+
+		struct FadeGlobals
+		{
+			const float*          multTable;
+			const float*          distanceMultiplier;
+			const std::uint8_t*   fading;
+			const std::uintptr_t* camera;
+			const float*          fadeInThreshold;
+			const std::uint8_t*   updateGate;
+			const float*          override;
+			const float*          delta;
+			const float*          inDivisor;
+			const float*          stepCap;
+			FadeUpdateFn          update;
+			ComputeFadeAmountFn   computeFadeAmount;
+			DetermineMeshLODLevelFn determineMeshLODLevel;
+		};
+		constexpr std::uint32_t   kFadeStartSamples = 8;  // fade-in starts named in the log per interval (v1.96.2)
+		std::atomic<std::uint32_t> g_fadeStartSamples{ 0 };
+
+		const FadeGlobals& FadeGlobalsOf() noexcept
+		{
+			static const FadeGlobals globals{
+				reinterpret_cast<const float*>(CBRO::Engine::OG(kFadeMultTableID).address()),
+				reinterpret_cast<const float*>(CBRO::Engine::OG(kFadeDistanceMultiplierID).address()),
+				reinterpret_cast<const std::uint8_t*>(CBRO::Engine::OG(kFadeEnabledID).address()),
+				reinterpret_cast<const std::uintptr_t*>(CBRO::Engine::OG(kDrawWorldCameraID).address()),
+				reinterpret_cast<const float*>(CBRO::Engine::OG(kFadeInThresholdID).address()),
+				reinterpret_cast<const std::uint8_t*>(CBRO::Engine::OG(kFadeUpdateGateID).address()),
+				reinterpret_cast<const float*>(CBRO::Engine::OG(kFadeOverrideID).address()),
+				reinterpret_cast<const float*>(CBRO::Engine::OG(kFadeDeltaID).address()),
+				reinterpret_cast<const float*>(CBRO::Engine::OG(kFadeInDivisorID).address()),
+				reinterpret_cast<const float*>(CBRO::Engine::OG(kFadeStepCapID).address()),
+				reinterpret_cast<FadeUpdateFn>(CBRO::Engine::OG(kFadeUpdateID).address()),
+				reinterpret_cast<ComputeFadeAmountFn>(CBRO::Engine::OG(kComputeFadeAmountID).address()),
+				reinterpret_cast<DetermineMeshLODLevelFn>(CBRO::Engine::OG(kDetermineMeshLODLevelID).address())
+			};
+			return globals;
+		}
+
+		// v1.97.0: the fade of a left-out node is run, not only kept. With previs active, every one of its list entries is
+		// force-visible in the finish loop (FO4OG 5.2 item 7) and every dynamic object visible from the camera position gets
+		// BSFadeNode::OnVisible(camera) inside the query (FO4OG 5.5d; with precombines off that is nearly every static
+		// reference): a node fades in, and out by distance, whether or not a view draws it, and is complete by the time it
+		// enters the view. In a CBRO frame previs is suspended in the cull and the query is skipped (5.5e), so only drawn nodes
+		// advanced; the v1.88.2 stamp alone froze the rest, and a node CBRO had hidden mid-fade, or had never shown, ran its
+		// fade on screen when it came back (137 mid-fade nodes a frame strafing in the v1.96.1 run; each re-queues its
+		// lighting every frame, 7.9). Now a left-out fade node gets what OnVisible would give it (FadeAdvance): the engine's own
+		// update with the engine's own camera data, then the frame counter; not the lighting queue and not the filing, which
+		// only a drawn node needs. A node mid-fade is updated every frame (as the query did); one complete, or never faded,
+		// on its turn (1 frame in 8: a complete node only needs its counter within the 20-frame rule, a far node at 0 does not
+		// move). Mid-fade nodes are remembered in a 64K-bit set so the other frames cost one bit test per left-out object.
+		constexpr std::size_t kFadeSetWords = 1024;
+		std::array<std::atomic<std::uint64_t>, kFadeSetWords> g_fadeSet{};
+		std::atomic<std::uint32_t>                            g_fadeSetClock{ 0 };
+		std::array<std::uintptr_t, 2>                         g_fadeVtables{};  // BSFadeNode, BSLeafAnimNode (other subclasses: the virtual call, on the turn)
+
+		inline std::size_t FadeSetBit(std::uintptr_t a_node) noexcept
+		{
+			return static_cast<std::size_t>(((a_node >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - 16));
+		}
+
+		// The fade update as BSFadeNode::OnVisible (531348) runs it (decompiled 2026-10-27): the skip for a complete bit-15
+		// node, the decal fade's step, type 6's own branch (ComputeFadeAmount, DetermineMeshLODLevel, the fade-in step) or
+		// id 928617 for the rest, the decal reset at fade 0, the frame counter. Returns false when OnVisible would not update.
+		bool FadeAdvance(std::uintptr_t a_node) noexcept
+		{
+			const auto& g = FadeGlobalsOf();
+			if (!*g.updateGate || !*g.camera) {
+				return false;
+			}
+			auto&      flags = *reinterpret_cast<std::uint64_t*>(a_node + 0x108);
+			auto&      currentFade = *reinterpret_cast<float*>(a_node + kFadeCurrentOffset);
+			auto&      decalFade = *reinterpret_cast<float*>(a_node + 0x1A4);
+			const auto fadeAmount = *reinterpret_cast<const float*>(a_node + 0x118);
+			const bool bit15 = (flags >> 15) & 1;
+			if (bit15 && fadeAmount == 1.0f && currentFade == 1.0f && decalFade == 1.0f) {
+				return false;
+			}
+			const auto  camera = *g.camera;
+			const float data[4]{
+				*reinterpret_cast<const float*>(camera + kCameraTranslateOffset),
+				*reinterpret_cast<const float*>(camera + kCameraTranslateOffset + 4),
+				*reinterpret_cast<const float*>(camera + kCameraTranslateOffset + 8),
+				*reinterpret_cast<const float*>(camera + kCameraLODAdjustOffset)
+			};
+			const float step = std::min(*g.delta / *g.inDivisor, *g.stepCap);
+			if ((flags & kFadeCompleteBit) && decalFade < 1.0f) {
+				decalFade = bit15 ? 1.0f : std::min(decalFade + step, 1.0f);
+			}
+			const auto type = *reinterpret_cast<const std::uint8_t*>(a_node + 0x11C);
+			if (type == 6 && *g.override == -1.0f) {
+				float distance = 0.0f;
+				g.computeFadeAmount(reinterpret_cast<void*>(a_node), data, &distance);
+				if (currentFade == 0.0f) {
+					decalFade = 0.0f;
+				}
+				if ((flags >> 12) & 1) {
+					g.determineMeshLODLevel(reinterpret_cast<void*>(a_node), distance);
+				}
+				if (!*g.fading) {
+					*reinterpret_cast<float*>(a_node + 0x1B4) = 1.0f;
+					decalFade = 1.0f;
+					currentFade = 1.0f;
+					flags |= kFadeCompleteBit;
+				}
+				if (!(flags & kFadeCompleteBit)) {
+					currentFade = std::min(currentFade + step, 1.0f);
+					if (currentFade >= 1.0f) {
+						flags |= kFadeCompleteBit;
+					}
+				}
+			} else {
+				g.update(reinterpret_cast<void*>(a_node), fadeAmount, data);
+				if (currentFade == 0.0f) {
+					decalFade = 0.0f;
+				}
+			}
+			*reinterpret_cast<std::int32_t*>(a_node + kFadeFrameCounterOffset) = *FrameNumber();
+			return true;
+		}
+
+		// a_turn: the node's turn is taken now whatever the frame (v1.98: an entry left untouched under a lease is stamped at
+		// its cluster's next walk, within the 20-frame rule).
+		void KeepFadeSeen(RE::NiAVObject* a_object, std::uint32_t a_clock, bool a_turn = false) noexcept
+		{
+			const auto node = reinterpret_cast<std::uintptr_t>(a_object);
+			const bool turn = a_turn || FadeStampTurn(a_object, a_clock);
+			const auto bit = FadeSetBit(node);
+			if (!turn && !((g_fadeSet[bit >> 6].load(std::memory_order_relaxed) >> (bit & 63)) & 1)) {
+				return;  // not its turn and not known mid-fade: nothing to do this frame
+			}
+			auto setClock = g_fadeSetClock.load(std::memory_order_relaxed);
+			if (a_clock - setClock >= 64 && g_fadeSetClock.compare_exchange_strong(setClock, a_clock, std::memory_order_relaxed)) {
+				for (auto& word : g_fadeSet) {
+					word.store(0, std::memory_order_relaxed);  // forgotten mid-fade nodes are found again on their next turn
+				}
+			}
 			__try {
-				if (a_object->IsFadeNode()) {
-					*reinterpret_cast<std::int32_t*>(reinterpret_cast<std::uintptr_t>(a_object) + kFadeFrameCounterOffset) = *frame;
-					Bump(kFadeKeptSeen);
+				const auto vtable = *reinterpret_cast<const std::uintptr_t*>(node);
+				if (vtable != g_fadeVtables[0] && vtable != g_fadeVtables[1] && (!turn || !a_object->IsFadeNode())) {
+					return;
+				}
+				const auto flags = *reinterpret_cast<const std::uint64_t*>(node + 0x108);
+				const auto before = *reinterpret_cast<const float*>(node + kFadeCurrentOffset);
+				if (flags & kFadeCompleteBit) {
+					if (turn && FadeAdvance(node)) {  // complete: the counter within the 20-frame rule, the distance fade-out
+						Bump(kFadeKeptSeen);
+					}
+					return;
+				}
+				if (before == 0.0f && !turn) {
+					return;  // never faded (or faded out): started on its turn
+				}
+				if (!FadeAdvance(node)) {
+					return;
+				}
+				Bump(kFadeAdvanced);
+				const auto after = *reinterpret_cast<const float*>(node + kFadeCurrentOffset);
+				if (before == 0.0f && after > 0.0f) {
+					Bump(kFadeStarted);
+				}
+				if (*reinterpret_cast<const std::uint64_t*>(node + 0x108) & kFadeCompleteBit) {
+					Bump(kFadeCompleted);
+				} else if (after > 0.0f) {
+					g_fadeSet[bit >> 6].fetch_or(std::uint64_t{ 1 } << (bit & 63), std::memory_order_relaxed);  // mid-fade: every frame until the next clear
 				}
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
 			}
 		}
 
+		// Whether a node is known mid-fade (the set), without touching it: an entry left untouched under a lease is visited
+		// for its fade update then (v1.98).
+		inline bool FadeMidWay(const void* a_object) noexcept
+		{
+			const auto bit = FadeSetBit(reinterpret_cast<std::uintptr_t>(a_object));
+			return (g_fadeSet[bit >> 6].load(std::memory_order_relaxed) >> (bit & 63)) & 1;
+		}
+
 		// The walk's outcome for the entry, counted as decided (the turn table's own share of what the main view keeps).
 		void JudgeOrLookup(const FrameContext& a_context, Stream& a_stream, const Hooks::CullGroups::BlockAdd& a_add, bool a_wantSun, Record& a_out)
 		{
+			const bool timed = BucketTimed(a_context);
+			const auto start = timed ? __rdtsc() : 0;
 			t_moved = false;
 			JudgeOrLookupRecord(a_context, a_stream, a_add, a_wantSun, a_out);
+			if (Recorder::On()) {
+				Recorder::NoteJudged(a_out, static_cast<std::uint8_t>(t_source));
+			}
 			if (g_tunables.keepFadeState && a_add.object && (a_out.outcome == Outcome::kHidden || a_out.outcome == Outcome::kOutside)) {
-				KeepFadeSeen(const_cast<RE::NiAVObject*>(a_add.object));
+				KeepFadeSeen(const_cast<RE::NiAVObject*>(a_add.object), a_context.clock);
 			}
 			if (a_out.outcome == Outcome::kKept && a_out.verdict == static_cast<std::uint8_t>(Verdict::kEdge)) {
 				Bump(kFinalEdge);
 			} else if (a_out.outcome == Outcome::kHidden && a_out.streak < g_tunables.confirmFrames) {
 				Bump(kFinalConfirming);
+			}
+			if (timed) {
+				Bump(kCyclesJudge, (__rdtsc() - start) * kTimingStride);
 			}
 		}
 
@@ -3919,13 +4580,415 @@ namespace CBRO::Core::Occlusion
 			return true;
 		}
 
+		// Diagnostic (SetKeptReasons, Core/SetDiff): why the main view keeps a geometry entry, into its history entry's lamp
+		// word (the lamp streak keeps the word's low bits). Walk threads, at the Block::Add filter, for every entry filed.
+		void NoteKeptReason(const FrameContext& a_context, RE::NiAVObject* a_object, const Record& a_record) noexcept
+		{
+			const bool drawn = a_record.outcome == Outcome::kKept || (a_record.outcome == Outcome::kHidden && a_record.streak < g_tunables.confirmFrames);
+			if (!drawn || !a_object->IsGeometry()) {
+				return;
+			}
+			const auto entry = FindEntry(reinterpret_cast<std::uintptr_t>(a_object));
+			if (!entry) {
+				return;
+			}
+			const std::uint64_t reason = 1u | (static_cast<std::uint64_t>(a_record.verdict & 7u) << 1) |
+			                             (static_cast<std::uint64_t>(static_cast<std::uint8_t>(a_record.outcome) & 3u) << 4) |
+			                             (static_cast<std::uint64_t>((a_record.flags & kRecordShaped) != 0) << 6) |
+			                             (static_cast<std::uint64_t>((a_record.flags & kRecordShapeNone) != 0) << 7) |
+			                             (static_cast<std::uint64_t>((a_record.flags & kRecordParallaxKept) != 0) << 8) |
+			                             (static_cast<std::uint64_t>(a_context.clock & 0x3FFu) << 10);
+			const auto old = entry->lamp.load(std::memory_order_relaxed);
+			entry->lamp.store((old & ~kReasonMask) | (reason << kReasonShift), std::memory_order_relaxed);
+		}
+
+		bool EntryOutside(const FrameContext& a_context, const RE::NiBound& a_bound) noexcept;
+		bool ShadowBeyondReach(const FrameContext& a_context, const RE::NiBound& a_bound) noexcept;
+
+		// A Block::Add child (the engine's push of a kept node's geometry: a fade node's geomArray records, a node's
+		// children) got a full judgement each: the worker's map, the sun test, the drop sets, the records, the recorder.
+		// The 2026-10-27 recording (Fallout London street, strafing): 3,900 judged children a frame, 2,050 of them out of
+		// the view with a sun shadow no view needs (NPC head parts behind the camera, object LOD meshes, effect shapes),
+		// ~150 ns each on the main thread, for a verdict the engine's own frustum test gives the main view anyway. So a
+		// plain static mesh out of the view (the entry walk's own cheap tests: EntryOutside with the cache's margins,
+		// ShadowBeyondReach, no spot lamp in reach) that isn't due for the trace is left out with no record, as the walk
+		// leaves out such a top-level entry (v1.96, bChildCheapTests). Static: a tri-shape vtable, no skin instance, and a
+		// world translation equal to previousWorld's (NiAVObject::UpdateWorldData copies the world into previousWorld
+		// before each move, FO4-ENGINE-NOTES 7.10): anything animated or moved this frame (the trace feed refreshes
+		// those), a node (its own bound is unmaintained), a light or a particle system takes the full path. Never in
+		// observe-only mode, nor on the left-out dump's frame. A child so left out has no record: when it enters the view
+		// it is judged afresh and, if hidden, confirms over confirmFrames first, as a walk-skipped entry does.
+		constexpr std::size_t         kSkinInstanceOffset = 0x140;  // BSGeometry::skinInstance (Core/MeshProxy)
+		std::array<std::uintptr_t, 3> g_staticShapeVtables{};
+
+		bool CheapChildOutside(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add) noexcept
+		{
+			if (!g_tunables.cheapChildren || !a_context.cull || Observing() || LeftOutFrame(a_context.clock)) {
+				return false;
+			}
+			const auto object = a_add.object;
+			const auto vtable = *reinterpret_cast<const std::uintptr_t*>(object);  // (the thunk read the object's flags already)
+			if (vtable != g_staticShapeVtables[0] && vtable != g_staticShapeVtables[1] && vtable != g_staticShapeVtables[2]) {
+				return false;
+			}
+			if (*reinterpret_cast<const std::uintptr_t*>(reinterpret_cast<std::uintptr_t>(object) + kSkinInstanceOffset) != 0) {
+				return false;
+			}
+			const auto& now = object->world.translate;
+			const auto& before = object->previousWorld.translate;
+			if (now.x != before.x || now.y != before.y || now.z != before.z) {
+				return false;
+			}
+			const auto& bound = *a_add.bound;
+			if (!EntryOutside(a_context, bound)) {
+				return false;
+			}
+			if (a_add.kind == Hooks::CullGroups::GroupKind::kSunShared && (!ShadowBeyondReach(a_context, bound) || SpotLampMayNeed(a_context, nullptr, bound))) {
+				return false;
+			}
+			if (TraceFeed::On()) {
+				const auto parent = object->parent;
+				const bool underNode = t_traceNode.node && t_traceNode.clock == a_context.clock && parent && (parent == t_traceNode.node || parent->parent == t_traceNode.node);
+				if ((underNode ? (t_traceNode.all || !TraceFeed::Known(object)) : TraceTurnDue(object, a_context.clock)) && TraceFeed::InReach(bound, a_context.eye)) {
+					return false;
+				}
+			}
+			t_source = VerdictSource::kNone;
+			return true;
+		}
+
+		// ---- the trace feed's direct handover (v1.99.3, bTraceDirect, bDeferSunOnly) -----------------------------------
+		// The 2026-10-27 v1.99.2 run: of the nodes the main view finished a frame, ~240 were filed for the trace alone (229
+		// out of view, force-visible, 697 pieces with the mark) and ~377 were sun-only drops (hidden, kept in group 0 for the
+		// cascades). For each the main view ran OnVisible, pushed every piece (AddP1, Block::Add, this filter, two drop-set
+		// inserts per forced piece), tested and registered them, and CBRO refused every registration only to hand it to the
+		// tracer; the forced ones were walked again by the sun traversal and the lamp passes (FO4OG 5.2 item 7). Now such an
+		// entry is handed over here: a geometry as it stands; a fade node as the finish loop would register it (558046:
+		// OnVisible with DrawWorld's camera, its fade and the LOD level the tracer reads; then, when the finish would call
+		// AddP1FadeNode, the geomArray brought up to date and each record AddP1FadeNode would push, FO4OG 5.2, 7.8), to
+		// the callback the refusals call. A trace filing no view needs is not filed at all; a sun-only drop is filed into
+		// group 0 inside the cascade cull's window (FileDeferred, previs suspended), after the main view registered group 0:
+		// the cascades and the lamps meet it, the main view never does. Any other node (ForEachChild's path) is filed as
+		// before.
+		constexpr std::uint64_t kOnVisibleID = 531348;         // BSFadeNode::OnVisible(NiCamera*, bool)
+		constexpr std::uint64_t kUpdateGeomArrayID = 1054059;  // BSFadeNode::AtomicUpdateGeomArray(node, 1)
+		constexpr std::size_t   kGeomArrayOffset = 0x168;      // geomArray records, 32 bytes each: bound +0, geometry +0x10, flags +0x18
+		constexpr std::size_t   kGeomArrayCountOffset = 0x178;
+		constexpr std::size_t   kGeomRecordSize = 0x20;
+		constexpr std::size_t   kFadeAmountOffset = 0x118;
+		constexpr std::size_t   kWorldRadiusOffset = 0xBC;
+		using OnVisibleFn = void (*)(void*, std::uintptr_t, bool);
+		using UpdateGeomArrayFn = std::uint32_t (*)(void*, std::uint32_t);
+
+		struct HandoverFns
+		{
+			OnVisibleFn       onVisible;
+			UpdateGeomArrayFn updateGeomArray;
+		};
+
+		const HandoverFns& HandoverFnsOf() noexcept
+		{
+			static const HandoverFns fns{
+				reinterpret_cast<OnVisibleFn>(CBRO::Engine::OG(kOnVisibleID).address()),
+				reinterpret_cast<UpdateGeomArrayFn>(CBRO::Engine::OG(kUpdateGeomArrayID).address())
+			};
+			return fns;
+		}
+
+		// A fade node as the main view's finish would take it: OnVisible, then (a_hand) its pieces to the tracer. Returns the
+		// pieces handed, or -1 when the object is no fade node (nothing done). a_fadeOnly (v2.0, an entry no view files,
+		// handed through the link): the fade update alone (FadeAdvance: its fade, LOD level and counter as OnVisible sets
+		// them, without OnVisible's lighting queue, which only a drawn node needs). a_kind, a_flags: the link's record.
+		int HandFadeNode(RE::NiAVObject* a_object, bool a_hand, bool a_fadeOnly, std::uint32_t a_kind, std::uint32_t a_flags) noexcept
+		{
+			const auto& fns = HandoverFnsOf();
+			const auto& fade = FadeGlobalsOf();
+			__try {
+				const auto node = reinterpret_cast<std::uintptr_t>(a_object);
+				if (!((*reinterpret_cast<const std::uint64_t*>(node + 0x108) >> 14) & 1) || !a_object->IsFadeNode()) {
+					return -1;
+				}
+				const auto camera = *fade.camera;
+				if (!camera) {
+					return -1;
+				}
+				if (a_fadeOnly) {
+					FadeAdvance(node);
+				} else {
+					fns.onVisible(a_object, camera, true);  // (as 558046 calls it in the main groups)
+				}
+				if (!a_hand) {
+					return 0;
+				}
+				// (558046's gate for AddP1FadeNode: no piece is filed past it)
+				const auto flags = *reinterpret_cast<const std::uint64_t*>(node + 0x108);
+				const bool fading = ((flags >> 15) & 1) || !*fade.fading || *reinterpret_cast<const float*>(node + kFadeCurrentOffset) > 0.0f;
+				const bool sized = ((flags >> 11) & 1) || *reinterpret_cast<const float*>(node + kWorldRadiusOffset) != 0.0f;
+				if (!fading || !sized || (flags & 1) || !(*reinterpret_cast<const float*>(node + kFadeAmountOffset) > 0.0f)) {
+					return 0;
+				}
+				fns.updateGeomArray(a_object, 1);
+				const auto count = *reinterpret_cast<const std::uint32_t*>(node + kGeomArrayCountOffset);
+				const auto records = *reinterpret_cast<const std::uintptr_t*>(node + kGeomArrayOffset);
+				int        handed = 0;
+				for (std::uint32_t i = 0; records && i < count; ++i) {
+					const auto record = records + i * kGeomRecordSize;
+					if (*reinterpret_cast<const std::uint32_t*>(record + 0x18) & 1) {
+						continue;  // (AddP1FadeNode skips it)
+					}
+					if (const auto geometry = *reinterpret_cast<RE::NiAVObject* const*>(record + 0x10)) {
+						TraceFeed::Take(geometry, a_object, a_kind, a_flags);
+						++handed;
+					}
+				}
+				return handed;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return -1;
+			}
+		}
+
+		// A top-level entry filed for the trace alone, on its turn, handed over instead (true; false: it isn't a geometry or a
+		// fade node, or the feed takes nothing, and it is filed as before). a_flags: the link's record flags.
+		bool HandEntry(RE::NiAVObject* a_object, std::uint32_t a_flags) noexcept
+		{
+			if (!g_tunables.traceDirect || !Hooks::CullGroups::TracerWanted() || GetCurrentThreadId() != g_mainThreadId) {
+				return false;
+			}
+			const auto kind = t_moved ? CBRO_TRACE_MOVED : CBRO_TRACE_TAKE;
+			if (a_object->IsGeometry()) {
+				TraceFeed::Take(a_object, a_object, kind, a_flags);
+				TraceFeed::Handed(a_object);
+				Bump(kTraceHanded);
+				Bump(kTraceHandedPieces);
+				return true;
+			}
+			const auto handed = HandFadeNode(a_object, true, TraceFeed::Linked(), kind, a_flags);
+			if (handed < 0) {
+				return false;
+			}
+			TraceFeed::Handed(a_object);
+			Bump(kTraceHanded);
+			Bump(kTraceHandedPieces, static_cast<std::uint64_t>(handed));
+			return true;
+		}
+
+		// A piece (Block::Add) filed for the trace alone, handed through the link instead (v2.0): a geometry, on the main
+		// thread. True when handed: the caller rejects it (hidden) or lets the frustum test leave it out (out of view), with
+		// no force mark and no main-view drop. Its anchor is the fade node filing it, else its parent.
+		bool HandChild(const Hooks::CullGroups::BlockAdd& a_add, std::uint32_t a_flags) noexcept
+		{
+			if (!TraceFeed::Linked() || !Hooks::CullGroups::TracerWanted() || GetCurrentThreadId() != g_mainThreadId || !a_add.object->IsGeometry()) {
+				return false;
+			}
+			const auto filing = Hooks::CullGroups::FadeNodeFiling();
+			TraceFeed::Take(a_add.object, filing ? filing : a_add.object->parent, t_moved ? CBRO_TRACE_MOVED : CBRO_TRACE_TAKE, a_flags);
+			TraceFeed::Handed(a_add.object);
+			Bump(kTraceChildHanded);
+			return true;
+		}
+
+		struct DeferredEntry
+		{
+			RE::NiAVObject* object;
+			void*           group;
+		};
+		std::vector<DeferredEntry> g_deferred;  // (main thread: held back in the cull, filed in the cascade window)
+
+		// Whether a sun-only drop's pieces go to the tracer this frame (they went every frame, as the refusals of their
+		// registrations had): to a tracer that keeps what it is handed (v2.0) only the first time, when it moved (the mover
+		// rule) or on its resend turn.
+		bool SunOnlyHandDue(const FrameContext& a_context, const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			if (!TraceFeed::Retains()) {
+				return true;
+			}
+			if (t_moved) {
+				return TraceFeed::MoverDue(a_object, a_bound, a_context.eye, a_context.clock);
+			}
+			if (!TraceFeed::Known(a_object) || TraceFeed::Due(a_object, a_context.clock)) {
+				return true;
+			}
+			Bump(kSunOnlyKnown);
+			return false;
+		}
+
+		// A group-0 entry the main view leaves out and the sun's cascades need (a confirmed-hidden caster): held back from the
+		// main view, filed in the cascade cull's window; OnVisible now, as the main view's finish would have run it, and its
+		// pieces to the tracer, as the refusals of their registrations handed them (SunOnlyHandDue). Only with the sun up
+		// (the cascade cull opens the window every frame then) and for a geometry or a fade node.
+		bool DeferSunOnly(const FrameContext& a_context, RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept
+		{
+			if (!g_tunables.deferSunOnly || !t_decisionGroup || a_context.sun.state != FrameContext::Sun::State::kOn ||
+				!Hooks::PrevisFeed::CascadeWindowReady() || GetCurrentThreadId() != g_mainThreadId) {
+				return false;
+			}
+			const bool hand = Hooks::CullGroups::TracerWanted() && SunOnlyHandDue(a_context, a_object, a_bound);
+			const auto kind = t_moved ? CBRO_TRACE_MOVED : CBRO_TRACE_TAKE;
+			if (a_object->IsGeometry()) {
+				if (hand) {
+					TraceFeed::Take(a_object, a_object, kind, CBRO_TRACE_HIDDEN | CBRO_TRACE_SUN_ONLY);
+					TraceFeed::Handed(a_object);
+					Bump(kSunOnlyHandedPieces);
+				}
+			} else {
+				const auto handed = HandFadeNode(a_object, hand, false, kind, CBRO_TRACE_HIDDEN | CBRO_TRACE_SUN_ONLY);
+				if (handed < 0) {
+					return false;
+				}
+				if (hand) {
+					TraceFeed::Handed(a_object);
+				}
+				Bump(kSunOnlyHandedPieces, static_cast<std::uint64_t>(handed));
+			}
+			g_deferred.push_back({ a_object, const_cast<void*>(t_decisionGroup) });
+			Bump(kSunOnlyDeferred);
+			return true;
+		}
+
+		// The cascade cull's window opened (Hooks::PrevisFeed, previs suspended): the held-back entries into their group.
+		void FileDeferred() noexcept
+		{
+			if (g_deferred.empty() || GetCurrentThreadId() != g_mainThreadId) {
+				return;
+			}
+			for (const auto& entry : g_deferred) {
+				Hooks::CullGroups::AddDirect(entry.group, entry.object, &entry.object->worldBound, 0);
+			}
+			Bump(kSunOnlyFiledLate, g_deferred.size());
+			g_deferred.clear();
+		}
+
 		// ---- the Block::Add filter (children, and top-level entries not left out at Group::Add) -------------
+
+		// The record of the fade node being filed (v1.99.1), looked up once per node: its geometry asks for it piece after
+		// piece, and the top table's probe for each piece's own parent (a sub-node, never decided) was a miss each time.
+		struct FilingTopMemo
+		{
+			const RE::NiAVObject* node{ nullptr };
+			std::uint32_t         clock{ 0 };
+			const TopRecord*      top{ nullptr };
+		};
+		thread_local FilingTopMemo t_filingTop;
+
+		const TopRecord* FilingTop(const FrameContext& a_context, const RE::NiAVObject* a_node) noexcept
+		{
+			if (t_filingTop.node != a_node || t_filingTop.clock != a_context.clock) {
+				t_filingTop = { a_node, a_context.clock, TopOf(a_context, a_node) };
+			}
+			const auto top = t_filingTop.top;
+			return top && top->object == a_node && top->clock == a_context.clock ? top : nullptr;  // (the slot may have been taken since)
+		}
+
+		// Whether the entry takes its parent's decision (t_topRecord): the parent is the top entry decided last on this
+		// thread, this frame, with this very bound, and its verdict is one the child's own tests would repeat.
+		bool InheritTop(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add) noexcept
+		{
+			if (!g_tunables.childInherit || Observing()) {
+				return false;
+			}
+			// (a fade node's geometry comes flattened, FO4OG 5.3: a parent other than the node filing it is one of the node's
+			// sub-nodes, which nothing decided; the node's record is asked for then, once per node)
+			const auto       filing = Hooks::CullGroups::FadeNodeFiling();
+			const auto       parent = a_add.object->parent;
+			const bool       viaFade = filing && filing != parent;
+			TopRecord        fromRecord{};
+			const TopRecord* top = nullptr;
+			if (const auto record = ParentRecordOf(viaFade ? filing : parent, a_context.clock)) {
+				if (!(record->state & kParentJudged)) {
+					return false;  // (forced, or not judged: as no TopRecord)
+				}
+				fromRecord.object = record->object;
+				fromRecord.clock = a_context.clock;
+				fromRecord.outcome = record->outcome;
+				fromRecord.verdict = record->verdict;
+				fromRecord.flags = record->flags;
+				std::copy_n(record->bound, 4, fromRecord.bound);
+				top = &fromRecord;
+			} else {
+				top = viaFade ? FilingTop(a_context, filing) : TopOf(a_context, parent);
+			}
+			if (!top) {
+				return false;
+			}
+			const auto& bound = *a_add.bound;
+			const bool  same = top->bound[0] == bound.center.x && top->bound[1] == bound.center.y && top->bound[2] == bound.center.z && top->bound[3] == bound.fRadius;
+			bool        inherit = false;
+			switch (static_cast<Outcome>(top->outcome)) {
+			case Outcome::kOutside:
+				// (a child's bound lies within its node's: out of the view too, and the engine's frustum test leaves it out of
+				// the main view. Not in group 0, where the child's own sun reach decides: CheapChildOutside.)
+				inherit = a_add.kind == Hooks::CullGroups::GroupKind::kMainOnly;
+				break;
+			case Outcome::kKept: {
+				if (top->flags & kRecordLight) {
+					break;
+				}
+				const auto verdict = static_cast<Verdict>(top->verdict);
+				if (verdict == Verdict::kHidden) {
+					break;  // kept by an exemption of the parent's
+				}
+				if (!same && !(top->bound[3] < kShapeMinRadius)) {
+					break;  // a smaller bound under a big node: the child's own sphere may settle what the node's couldn't (2026-10-27 capture: 15% of such children hidden; 3% under small nodes)
+				}
+				if ((verdict == Verdict::kVisible || verdict == Verdict::kEdge) && g_tunables.meshShapes && bound.fRadius >= kShapeMinRadius) {
+					break;  // the child's own shape may settle what the sphere couldn't
+				}
+				inherit = true;
+				break;
+			}
+			default:
+				break;
+			}
+			if (inherit && viaFade) {
+				Bump(kChildInheritedFade);
+			}
+			return inherit;
+		}
+
+		// Whether a Block::Add child is part of the player's 3D: for a fade node's flattened geometry, the node's answer,
+		// once per node (v1.99; its geometry can't be the player's unless it is).
+		struct FilingPlayer
+		{
+			const RE::NiAVObject* node{ nullptr };
+			std::uint32_t         clock{ 0 };
+			bool                  player{ false };
+		};
+		thread_local FilingPlayer t_filingPlayer;
+
+		bool ChildPlayerPart(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add) noexcept
+		{
+			if (g_tunables.childInherit) {
+				if (const auto node = Hooks::CullGroups::FadeNodeFiling()) {
+					if (const auto record = ParentRecordOf(node, a_context.clock)) {
+						return (record->state & kParentPlayer) != 0;
+					}
+					if (t_filingPlayer.node != node || t_filingPlayer.clock != a_context.clock) {
+						t_filingPlayer = { node, a_context.clock, PlayerPart(a_context, node, node->worldBound) };
+					}
+					return t_filingPlayer.player;
+				}
+			}
+			return PlayerPart(a_context, a_add.object, *a_add.bound);
+		}
+
+		// A child decided through the fade node filing it while its own parent is one of the node's sub-nodes (a count).
+		void NoteFadeDecided(const Hooks::CullGroups::BlockAdd& a_add) noexcept
+		{
+			if (g_tunables.childInherit) {
+				if (const auto node = Hooks::CullGroups::FadeNodeFiling(); node && node != a_add.object->parent) {
+					Bump(kChildFadeDecided);
+				}
+			}
+		}
 
 		const RE::NiBound* FilterDecide(const FrameContext& a_context, const Hooks::CullGroups::BlockAdd& a_add)
 		{
-			if (PlayerPart(a_context, a_add.object, *a_add.bound)) {
+			if (ChildPlayerPart(a_context, a_add)) {
 				Bump(kExemptPlayer);
 				Hooks::CullGroups::ForceVisible();  // (filed whatever the frustum says, as previs files it)
+				if (Recorder::On()) {
+					Recorder::NoteFlags(RecorderFormat::kPlayer);
+				}
 				return nullptr;  // (nor a drop: its children and the main accumulator file it too)
 			}
 			auto&  streams = Streams(a_context);
@@ -3934,10 +4997,15 @@ namespace CBRO::Core::Occlusion
 			case Hooks::CullGroups::GroupKind::kMainOnly: {
 				// (a child of an entry filed for the trace: main-only entries are main-view drops only then, TraceDrop, TraceOutside)
 				if (ParentForced(a_add.object, a_context.clock, DropSet::Tag(a_context.clock)) && !IsActorRoot(a_add.object)) {
+					NoteFadeDecided(a_add);
 					ForcedChild(a_context, a_add.object, *a_add.bound);
+					if (Recorder::On()) {
+						Recorder::NoteFlags(RecorderFormat::kInherited);
+					}
 					return nullptr;
 				}
 				if (TraceFeed::On() && ParentDropped(a_add.object, a_context.clock, DropSet::Tag(a_context.clock)) && !IsActorRoot(a_add.object)) {
+					NoteFadeDecided(a_add);
 					Bump(kTraceInherited);
 					if (!g_drops.Insert(a_add.object, DropSet::Tag(a_context.clock))) {
 						Bump(kDropFull);
@@ -3946,9 +5014,25 @@ namespace CBRO::Core::Occlusion
 					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kInherited, nullptr);
 					return nullptr;
 				}
+				if (InheritTop(a_context, a_add)) {
+					Bump(kChildInherited);
+					t_source = VerdictSource::kNone;
+					if (Recorder::On()) {
+						Recorder::NoteFlags(RecorderFormat::kInherited);
+					}
+					return nullptr;
+				}
+				if (CheapChildOutside(a_context, a_add)) {
+					Bump(kChildCheapOutside);
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kOutside, nullptr);
+					return nullptr;  // (the engine's frustum test leaves it out of the main view)
+				}
 				JudgeOrLookup(a_context, streams.child, a_add, false, out);
+				if (g_keptReasons.load(std::memory_order_relaxed)) {
+					NoteKeptReason(a_context, a_add.object, out);  // (diagnostic)
+				}
 				if (out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing()) {
-					if (TraceDrop(a_context, a_add.object, *a_add.bound)) {
+					if (TraceRefresh(a_context, a_add.object, *a_add.bound) && !HandChild(a_add, CBRO_TRACE_HIDDEN) && TraceDropFiled(a_context, a_add.object)) {
 						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
 						return nullptr;
 					}
@@ -3956,7 +5040,9 @@ namespace CBRO::Core::Occlusion
 					return &a_context.reject;
 				}
 				if (out.outcome == Outcome::kOutside) {
-					if (!Observing() && TraceOutside(a_context, a_add.object, *a_add.bound)) {
+					// (handed through the link: filed as any out-of-view piece, the frustum test leaves it out)
+					if (!Observing() && TraceRefresh(a_context, a_add.object, *a_add.bound) && !HandChild(a_add, CBRO_TRACE_OUTSIDE) &&
+						TraceOutsideFiled(a_context, a_add.object)) {
 						Hooks::CullGroups::ForceVisible();
 						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
 						return nullptr;
@@ -3976,10 +5062,15 @@ namespace CBRO::Core::Occlusion
 				}
 				const auto tag = DropSet::Tag(a_context.clock);
 				if (ParentForced(a_add.object, a_context.clock, tag) && !IsActorRoot(a_add.object)) {
+					NoteFadeDecided(a_add);
 					ForcedChild(a_context, a_add.object, *a_add.bound);
+					if (Recorder::On()) {
+						Recorder::NoteFlags(RecorderFormat::kInherited);
+					}
 					return nullptr;
 				}
 				if (ParentDropped(a_add.object, a_context.clock, tag) && !IsActorRoot(a_add.object)) {
+					NoteFadeDecided(a_add);
 					Bump(kDropInherited);
 					if (!g_drops.Insert(a_add.object, tag)) {
 						Bump(kDropFull);
@@ -3988,13 +5079,31 @@ namespace CBRO::Core::Occlusion
 					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kInherited, nullptr);
 					return nullptr;
 				}
+				if (InheritTop(a_context, a_add)) {
+					Bump(kChildInherited);
+					t_source = VerdictSource::kNone;
+					if (Recorder::On()) {
+						Recorder::NoteFlags(RecorderFormat::kInherited);
+					}
+					return nullptr;
+				}
+				if (CheapChildOutside(a_context, a_add)) {
+					Bump(kChildCheapRejected);
+					RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kCasterRejected, nullptr);
+					return &a_context.reject;
+				}
 				JudgeOrLookup(a_context, streams.child, a_add, true, out);
+				if (g_keptReasons.load(std::memory_order_relaxed)) {
+					NoteKeptReason(a_context, a_add.object, out);  // (diagnostic)
+				}
 				if (Observing()) {
 					return nullptr;
 				}
 				const bool hiddenConfirmed = out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames;
 				if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !(out.flags & kRecordLight) && GroupZeroUnneeded(a_context, out, a_add.object, *a_add.bound)) {
-					if (TraceKeep(a_context, a_add.object, *a_add.bound, hiddenConfirmed, out)) {
+					// (handed through the link: rejected in every view as without the feed)
+					if (TraceRefresh(a_context, a_add.object, *a_add.bound) && !HandChild(a_add, hiddenConfirmed ? CBRO_TRACE_HIDDEN : CBRO_TRACE_OUTSIDE) &&
+						TraceKeepFiled(a_context, a_add.object, *a_add.bound, hiddenConfirmed, out)) {
 						if (!hiddenConfirmed) {
 							Hooks::CullGroups::ForceVisible();
 						}
@@ -4015,8 +5124,10 @@ namespace CBRO::Core::Occlusion
 						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
 					}
 				} else if (out.outcome == Outcome::kOutside) {
-					// (with the sun up a shadow it may cast keeps it: the cascades file it within their range, 6.1)
-					if (a_context.sun.state != FrameContext::Sun::State::kOn && TraceOutside(a_context, a_add.object, *a_add.bound)) {
+					// (with the sun up a shadow it may cast keeps it: the cascades file it within their range, 6.1; handed through the
+					// link, it is filed as without the feed)
+					if (a_context.sun.state != FrameContext::Sun::State::kOn && TraceRefresh(a_context, a_add.object, *a_add.bound) && !HandChild(a_add, CBRO_TRACE_OUTSIDE) &&
+						TraceOutsideFiled(a_context, a_add.object)) {
 						Hooks::CullGroups::ForceVisible();
 						RecordLeftOut(a_context, a_add.object, *a_add.bound, LeftOutPath::kDropped, &out);
 					} else {
@@ -4033,6 +5144,7 @@ namespace CBRO::Core::Occlusion
 				}
 				const auto tag = DropSet::Tag(a_context.clock);
 				if (ParentDropped(a_add.object, a_context.clock, tag) && !IsActorRoot(a_add.object)) {
+					NoteFadeDecided(a_add);
 					Bump(kDropInherited);
 					if (!g_drops.Insert(a_add.object, tag)) {
 						Bump(kDropFull);
@@ -4042,6 +5154,9 @@ namespace CBRO::Core::Occlusion
 					return nullptr;
 				}
 				JudgeOrLookup(a_context, streams.child, a_add, false, out);
+				if (g_keptReasons.load(std::memory_order_relaxed)) {
+					NoteKeptReason(a_context, a_add.object, out);  // (diagnostic)
+				}
 				if (out.outcome == Outcome::kHidden && out.streak >= g_tunables.confirmFrames && !Observing()) {
 					if (!g_drops.Insert(a_add.object, tag)) {
 						Bump(kDropFull);
@@ -4074,7 +5189,7 @@ namespace CBRO::Core::Occlusion
 		thread_local ScolMemo    t_scol;
 		thread_local RE::NiBound t_scolBound;
 
-		const RE::NiBound* FindScolRoot(const RE::NiAVObject* a_parent) noexcept
+		const RE::NiBound* FindScolRoot(const RE::NiAVObject* a_parent, const RE::NiAVObject*& a_root, int& a_depth) noexcept
 		{
 			__try {
 				const RE::NiBound*    bound = nullptr;
@@ -4092,6 +5207,8 @@ namespace CBRO::Core::Occlusion
 						const auto& root = node->worldBound;
 						if (root.fRadius > 0.0f && root.fRadius < 1.0e5f && std::isfinite(root.center.x) && std::isfinite(root.center.y) && std::isfinite(root.center.z)) {
 							bound = &root;
+							a_root = node;
+							a_depth = depth;
 						}
 					}
 					break;
@@ -4102,14 +5219,107 @@ namespace CBRO::Core::Occlusion
 			}
 		}
 
+		// A parent's collection root, or that it has none (nearly every one: FindScolRoot was 0.12 ms a frame on the main thread
+		// in the 2026-10-26 profile, three dependent reads per distinct parent, most of them misses), is remembered per thread
+		// by its address and userData (the reference it stands for, which never changes while the node lives) for up to
+		// kScolCacheFrames. v1.92.3 cached the misses alone and walked a root found again each frame (~270 pieces a frame, the
+		// form reads: 0.05 ms listed 2026-10-27); v1.98 keeps the root too, and a hit is checked by the parent chain alone
+		// (the node at the depth it was found, still with its reference's userData): a node freed since can't be reached so.
+		struct ScolCacheEntry
+		{
+			const RE::NiAVObject* parent{ nullptr };
+			std::uintptr_t        userData{ 0 };
+			std::uint32_t         clock{ 0 };
+			const RE::NiAVObject* root{ nullptr };  // null: no root (a miss)
+			std::uintptr_t        rootUserData{ 0 };
+			std::uint8_t          depth{ 0 };
+		};
+		constexpr std::size_t   kScolCacheSize = 8192;  // direct-mapped by address (v1.98.1: twice v1.98's; ~2,500 distinct parents a frame)
+		constexpr std::uint32_t kScolCacheFrames = 64;
+
+		const RE::NiBound* ScolRootStillThere(const RE::NiAVObject* a_parent, const ScolCacheEntry& a_slot) noexcept
+		{
+			__try {
+				const RE::NiAVObject* node = a_parent;
+				for (int depth = 0; node && depth < a_slot.depth; ++depth) {
+					node = node->parent;
+				}
+				if (node != a_slot.root || node->userData != a_slot.rootUserData) {
+					return nullptr;
+				}
+				const auto& root = node->worldBound;
+				if (root.fRadius > 0.0f && root.fRadius < 1.0e5f && std::isfinite(root.center.x) && std::isfinite(root.center.y) && std::isfinite(root.center.z)) {
+					return &root;
+				}
+				return nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+
+		const RE::NiBound* ScolRootCached(const RE::NiAVObject* a_parent, std::uint32_t a_clock) noexcept
+		{
+			thread_local std::array<ScolCacheEntry, kScolCacheSize>* cache = nullptr;
+			if (!cache) [[unlikely]] {
+				cache = new std::array<ScolCacheEntry, kScolCacheSize>();
+			}
+			const auto address = reinterpret_cast<std::uintptr_t>(a_parent);
+			auto&      slot = (*cache)[((address >> 5) ^ (address >> 18)) & (kScolCacheSize - 1)];
+			const auto userData = a_parent->userData;
+			if (slot.parent == a_parent && slot.userData == userData && a_clock - slot.clock < kScolCacheFrames) {
+				if (!slot.root) {
+					return nullptr;
+				}
+				Bump(kScolSlotHits);
+				if (const auto bound = ScolRootStillThere(a_parent, slot)) {
+					Bump(kScolRootHits);
+					return bound;
+				}
+				Bump(kScolChainFails);
+			}
+			const RE::NiAVObject* root = nullptr;
+			int                   depth = 0;
+			const auto            bound = FindScolRoot(a_parent, root, depth);
+			slot = { a_parent, userData, a_clock, bound ? root : nullptr, bound && root ? root->userData : 0, static_cast<std::uint8_t>(depth) };
+			return bound;
+		}
+
+		// A collection root's bound when usable (as FindScolRoot takes it).
+		const RE::NiBound* UsableScolBound(const RE::NiAVObject* a_root) noexcept
+		{
+			const auto& root = a_root->worldBound;
+			return root.fRadius > 0.0f && root.fRadius < 1.0e5f && std::isfinite(root.center.x) && std::isfinite(root.center.y) && std::isfinite(root.center.z) ? &root : nullptr;
+		}
+
+		// Whether a node is a static collection's root: its userData a reference whose base is a SCOL (FindScolRoot's test at
+		// the node itself; the walk asks once per epoch).
+		bool IsScolReference(const RE::NiAVObject* a_object) noexcept
+		{
+			__try {
+				const auto form = reinterpret_cast<const RE::TESForm*>(a_object->userData);
+				if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kREFR) {
+					return false;
+				}
+				const auto base = reinterpret_cast<const RE::TESObjectREFR*>(form)->GetObjectReference();
+				return base && base->GetFormType() == RE::ENUM_FORM_ID::kSCOL;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
 		const RE::NiBound* ScolRootBound(const RE::NiAVObject* a_object, const RE::NiBound& a_bound, std::uint32_t a_clock) noexcept
 		{
-			const auto parent = a_object->parent;
+			const auto parent = DecisionParent(a_object);  // (v1.99: a fade node's geometry starts at the node, as its first ancestor with userData)
 			if (!parent) {
 				return nullptr;
 			}
 			if (t_scol.parent != parent || t_scol.clock != a_clock) {
-				t_scol = { parent, a_clock, FindScolRoot(parent) };
+				const auto record = ParentRecordOf(parent, a_clock);
+				if (record && (record->state & kParentScolKnown)) {
+					t_scol = { parent, a_clock, (record->state & kParentScolRoot) ? UsableScolBound(parent) : nullptr };  // (the walk's epoch classification)
+				} else {
+					t_scol = { parent, a_clock, ScolRootCached(parent, a_clock) };
+				}
 			}
 			const auto root = t_scol.root;
 			if (!root || !(a_bound.fRadius >= 0.0f)) {
@@ -4130,6 +5340,27 @@ namespace CBRO::Core::Occlusion
 			t_scolBound.fRadius = radius + 0.5f;
 			return &t_scolBound;
 		}
+
+		// The recorder's note of a Block::Add decision (a child, or an unjudged filing: whatever the top-level decision didn't cover).
+		void NoteChildDecision(const Hooks::CullGroups::BlockAdd& a_add, bool a_rejected) noexcept
+		{
+			std::uint16_t flags = a_rejected ? RecorderFormat::kLeftOut : 0;
+			if (Hooks::CullGroups::ForceVisiblePending()) {
+				flags |= RecorderFormat::kForced;
+			}
+			if ((a_add.object->GetFlags() >> 11) & 1) {
+				flags |= RecorderFormat::kAlwaysDraw;
+			}
+			if (a_add.kind == Hooks::CullGroups::GroupKind::kMainOnly) {
+				flags |= RecorderFormat::kGroup1;
+			}
+			if (Observing()) {
+				flags |= RecorderFormat::kObserveOnly;
+			}
+			Recorder::NoteEntry(Recorder::Origin::kChild, a_add.object, *a_add.bound, static_cast<std::uint8_t>(a_add.kind), flags, 0);
+		}
+
+		thread_local std::uint32_t t_childSurvey{ 0 };
 
 		const RE::NiBound* Filter(const Hooks::CullGroups::BlockAdd& a_in)
 		{
@@ -4152,6 +5383,30 @@ namespace CBRO::Core::Occlusion
 				}
 				return t_top.result;
 			}
+			// (survey, v1.94.1: whose children the engine pushes, and what is filed unjudged; 1 add in 32 per thread since
+			// v1.96: the parent's vtable and type were a cache miss per child, ~4,700 a frame on the main thread)
+			if ((++t_childSurvey & 31) == 0) {
+				static const auto niNodeVtable = RE::VTABLE::NiNode[0].address();
+				const auto        parent = const_cast<RE::NiNode*>(a_in.object->parent);
+				if (!parent) {
+					Bump(kChildOther, 32);
+				} else if (parent->IsFadeNode()) {
+					Bump(kChildOfFade, 32);
+				} else if (Util::TryReadVtable(parent) == niNodeVtable) {
+					Bump(kChildOfNode, 32);
+				} else {
+					Bump(kChildOther, 32);
+				}
+			}
+			// (the drop sets' slots for this object, in case the decision below inserts or looks it up: the judge in between
+			// hides the table's miss; v1.92.3)
+			g_drops.Prefetch(a_in.object);
+			if (TraceFeed::On()) {
+				g_traceForced.Prefetch(a_in.object);
+			}
+			if (RefreshTurn(a_in.object, context->clock)) {
+				PrefetchEntry(a_in.object);  // (the streak backups write its history entry on its turn; v1.98)
+			}
 			auto add = a_in;
 			if (g_tunables.scolRootBounds && !Observing()) {
 				if (const auto root = ScolRootBound(a_in.object, *a_in.bound, context->clock); root && root != a_in.bound) {
@@ -4161,8 +5416,15 @@ namespace CBRO::Core::Occlusion
 				}
 			}
 			const auto& a_add = add;
+			const bool  recording = Recorder::On();
+			if (recording) {
+				Recorder::BeginDecision();
+			}
 			if (!Timed(*context)) {
 				const auto result = FilterDecide(*context, a_add);
+				if (recording) {
+					NoteChildDecision(a_add, result != nullptr);
+				}
 				if (!result) {
 					RecordKeptRegion(*context, a_add);
 				}
@@ -4171,6 +5433,9 @@ namespace CBRO::Core::Occlusion
 			const auto start = __rdtsc();
 			const auto result = FilterDecide(*context, a_add);
 			Bump(kCycles, (__rdtsc() - start) * kTimingStride);
+			if (recording) {
+				NoteChildDecision(a_add, result != nullptr);
+			}
 			if (!result) {
 				RecordKeptRegion(*context, a_add);
 			}
@@ -4194,6 +5459,9 @@ namespace CBRO::Core::Occlusion
 				return false;
 			}
 			Bump(kRegistrationsDropped);
+			if (Recorder::On()) {
+				Recorder::NoteRegistration(a_object, true);
+			}
 			return true;
 		}
 
@@ -4203,7 +5471,164 @@ namespace CBRO::Core::Occlusion
 		// object out of view or confirmed hidden; in group 0 its sun shadow must also be unneeded. Never for an
 		// object the engine marks always-draw, nor a sky mesh (previs draws those whatever their bound), and never in
 		// observe-only mode.
+		// ---- survey counters (v1.92.4): what the engine does with the top-level fade nodes CBRO lets through ----------
+		// A. Distance fade (FO4-ENGINE-NOTES 7.8, 7.9). ComputeFadeAmount (id 1040250) gives a node past its far range a fade
+		// of 0 or below: the finish loop still runs OnVisible on it, but AddP1FadeNode then files none of its geometry
+		// (currentFade 0, flag bit 15 clear). Such a node costs the walk a Group::Add, CBRO a verdict and the engine a
+		// frustum test and OnVisible, for nothing drawn. Counted as ComputeFadeAmount computes it: s = the distance from
+		// the world-bound centre to the camera x lodAdjust (NiCamera +0x194) / mult(type +0x11C; the table id 804710);
+		// fade = 1 - (s - near) / (far - near), near / far (+0x198 / +0x19C) scaled by fDistanceMultiplier (id 515159);
+		// 1 when fading (id 1220201) is off or mult <= 0; type 6 only fades in.
+		// C. Single-record geometry lists: AddP1FadeNode pushes each geomArray record (count u32 at +0x178) through
+		// ChildPush; a node with one record pushes one child whose bound equals the node's, so that child could take the
+		// node's verdict without a lookup. Counted: kept nodes with one record, and the records of all kept nodes (the
+		// frame's ChildPush adds from them: a check of the +0x178 read against the ChildPush hook's count).
+		// One node in kFadeStampFrames a frame (the fade stamp's turn); the log scales the counts back.
+
+		void CountFadeTop(const FrameContext& a_context, RE::NiAVObject* a_object, const RE::NiBound& a_bound, bool a_skipped, bool a_forced) noexcept
+		{
+			const auto multTable = FadeGlobalsOf().multTable;
+			const auto distanceMultiplier = FadeGlobalsOf().distanceMultiplier;
+			const auto fading = FadeGlobalsOf().fading;
+			const auto camera = FadeGlobalsOf().camera;
+			__try {
+				if (!a_object->IsFadeNode()) {
+					return;
+				}
+				const auto node = reinterpret_cast<const std::byte*>(a_object);
+				const auto flags = *reinterpret_cast<const std::uint64_t*>(node + 0x108);
+				const auto type = *reinterpret_cast<const std::uint8_t*>(node + 0x11C);
+				const auto records = *reinterpret_cast<const std::uint32_t*>(node + 0x178);
+				const auto nearRange = *reinterpret_cast<const float*>(node + 0x198);
+				const auto farRange = *reinterpret_cast<const float*>(node + 0x19C);
+				const auto currentFade = *reinterpret_cast<const float*>(node + 0x1A0);
+				// the distance fade as ComputeFadeAmount (id 1040250) computes it: 1 unless the node fades by distance and is past its
+				// near range; and the frame counter's age (OnVisible of this frame has not run yet: the walk precedes the finish loop)
+				const float mult = multTable[type];
+				const bool  byDistance = type != 6 && mult > 0.0f && *fading && *camera;
+				float       fade = 1.0f;
+				if (byDistance) {
+					const float lodAdjust = *reinterpret_cast<const float*>(*camera + kCameraLODAdjustOffset);
+					const float dx = a_bound.center.x - a_context.eye[0];
+					const float dy = a_bound.center.y - a_context.eye[1];
+					const float dz = a_bound.center.z - a_context.eye[2];
+					const float s = std::sqrt(dx * dx + dy * dy + dz * dz) * lodAdjust / mult;
+					const float nearScaled = *distanceMultiplier * nearRange;
+					const float farScaled = *distanceMultiplier * farRange;
+					if (nearScaled < s) {
+						fade = 1.0f - (s - nearScaled) / (farScaled - nearScaled);
+					}
+				}
+				const auto age = static_cast<std::int64_t>(*FrameNumber()) - static_cast<std::int64_t>(*reinterpret_cast<const std::int32_t*>(node + kFadeFrameCounterOffset));
+				Bump(kFadeTopOffered);
+				if (!a_skipped) {
+					Bump(kFadeTopKept);
+					Bump(kFadeTopKeptEntries, records);
+					if (records == 1) {
+						Bump(kFadeTopKeptOne);
+					}
+					// (v1.94 survey: BSFadeNode::OnVisible re-queues the node's lighting, one pass over the scene's light list,
+					// when bit 51 is clear and bit 33 is set, or the node is mid-fade, or the scene node's byte +0x228 is set)
+					if ((flags >> 33) & 1) {
+						Bump(kFadeTopLightingBit33);
+						if (a_forced) {
+							Bump(kFadeTopLightingBit33Forced);
+						}
+					}
+					if (currentFade > 0.0f && currentFade < 1.0f) {
+						Bump(kFadeTopMidFade);
+						if (a_forced) {
+							Bump(kFadeTopMidFadeForced);
+						}
+						if (!(flags & kFadeCompleteBit)) {
+							Bump(kFadeTopMidFadeIn);
+							if (!(*reinterpret_cast<const float*>(node + kFadeRadiusOffset) < 600.0f)) {
+								Bump(kFadeTopMidFadeInBig);
+							}
+							Bump(age == 1 ? kFadeTopMidFadeInContinuous : kFadeTopMidFadeInResumed);
+							if (type == 3) {
+								Bump(kFadeTopMidFadeInActor);
+							}
+						}
+					}
+					// A fade-in starts at this frame's OnVisible for a node at fade 0 with bit 37 clear (id 928617): the unseen rule
+					// (frameCounter over 20 frames old) snaps it to 1 when near, else it stays 0 until near; stamped within 20 frames,
+					// it fades in from 0 on screen when near. Which stamp made it "seen" is the question: OnVisible itself last frame
+					// (a far node that just came within fFadeInThreshold: the engine's own distance fade-in, previs has the same), or
+					// a stamp 2-20 frames ago while out of the main view (CBRO's keepFadeState, or a culling process's OnVisible).
+					if (currentFade == 0.0f && !(flags & kFadeCompleteBit)) {
+						const bool nearEnough = fade > *FadeGlobalsOf().fadeInThreshold;  // ("near" is a Windows macro)
+						if (age > 20) {
+							Bump(kFadeStartUnseen);
+							if (nearEnough) {
+								Bump(kFadeStartUnseenNear);
+							}
+						} else {
+							Bump(age == 1 ? kFadeStartSeenLast : kFadeStartSeenRecent);
+							if (nearEnough) {
+								Bump(kFadeStartSeenNear);
+								if (g_fadeStartSamples.fetch_add(1, std::memory_order_relaxed) < kFadeStartSamples) {
+									char rtti[48]{};
+									char name[48]{};
+									Util::TryGetRTTIName(a_object, rtti, sizeof(rtti));
+									Util::TryGetObjectName(a_object, name, sizeof(name));
+									logger::info(
+										"fade start sample (fades in from 0 on screen from this frame): {} '{}' type {} fade radius {:.0f} bound r {:.0f} at {:.0f} units, frame counter {} frames old, distance fade {:.2f}, records {}, flags {:#x}{}",
+										rtti[0] ? rtti : "?", name, type, *reinterpret_cast<const float*>(node + kFadeRadiusOffset), a_bound.fRadius,
+										std::sqrt((a_bound.center.x - a_context.eye[0]) * (a_bound.center.x - a_context.eye[0]) + (a_bound.center.y - a_context.eye[1]) * (a_bound.center.y - a_context.eye[1]) + (a_bound.center.z - a_context.eye[2]) * (a_bound.center.z - a_context.eye[2])),
+										age, fade, records, flags, a_forced ? " (filed force-visible)" : "");
+								}
+							}
+						}
+					}
+					if ((flags >> 51) & 1) {
+						Bump(kFadeTopNoLighting);
+					}
+				}
+				if (!byDistance) {
+					return;  // (never fades out by distance)
+				}
+				if (!(fade <= 0.0f)) {
+					return;  // the distance fade is above 0: drawn, or fading out
+				}
+				if ((flags >> 15) & 1) {
+					Bump(kFadeTopPastFarBit15);
+				} else if (currentFade > 0.0f) {
+					Bump(kFadeTopFadingOut);
+				} else {
+					Bump(kFadeTopFaded);
+					if (!a_skipped) {
+						Bump(kFadeTopFadedKept);
+						Bump(kFadeTopFadedKeptEntries, records);
+					}
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+		}
+
+		// What the caller already knows of the entry (v1.99: the walk classifies its entries itself, and Group::Add's hook
+		// passes nothing): its player test and its sky test, so the decision doesn't read them again.
+		enum KnownEntry : std::uint8_t
+		{
+			kKnownNone = 0,
+			kKnownClassified = 1 << 0,
+			kKnownPlayer = 1 << 1,
+			kKnownSky = 1 << 2,
+			kKnownScolChecked = 1 << 3,  // (v1.99.2) the entry's collection-root answer is kKnownScolRoot
+			kKnownScolRoot = 1 << 4,
+		};
+
+		bool SkipTopLevelImpl(RE::NiAVObject* a_object, const RE::NiBound* a_bound, Hooks::CullGroups::GroupKind a_kind, std::uint8_t a_known);
+
 		bool SkipTopLevel(RE::NiAVObject* a_object, const RE::NiBound* a_bound, Hooks::CullGroups::GroupKind a_kind)
+		{
+			t_decisionGroup = Hooks::CullGroups::AddingGroup();
+			const bool skipped = SkipTopLevelImpl(a_object, a_bound, a_kind, kKnownNone);
+			t_decisionGroup = nullptr;
+			return skipped;
+		}
+
+		bool SkipTopLevelImpl(RE::NiAVObject* a_object, const RE::NiBound* a_bound, Hooks::CullGroups::GroupKind a_kind, std::uint8_t a_known)
 		{
 			const auto context = CurrentContext();
 			if (!context) {
@@ -4212,17 +5637,30 @@ namespace CBRO::Core::Occlusion
 			const bool timed = Timed(*context);
 			const auto start = timed ? __rdtsc() : 0;
 			NoteOffered(*context, a_object, 2);  // (diagnostic, one frame per still location)
+			g_drops.Prefetch(a_object);  // (as in Filter)
+			if (TraceFeed::On()) {
+				g_traceForced.Prefetch(a_object);
+			}
 
 			bool       skip = false;
 			bool       force = false;  // filed force-visible for the trace (TraceOutside, TraceKeep)
-			const bool player = PlayerPart(*context, a_object, *a_bound);
+			const bool known = (a_known & kKnownClassified) != 0;
+			const bool player = known ? (a_known & kKnownPlayer) != 0 : PlayerPart(*context, a_object, *a_bound);
+			const bool alwaysDraw = (a_object->GetFlags() >> 11) & 1;
+			const bool sky = !player && !alwaysDraw && (known ? (a_known & kKnownSky) != 0 : Hooks::CullGroups::IsSky(a_object));
+			const bool recording = Recorder::On();
+			if (recording) {
+				Recorder::BeginDecision();
+			}
+			Record out{};  // (kept for a same-bound child: t_topRecord)
+			bool   judged = false;
 			if (player) {
 				Bump(kExemptPlayer);
-			} else if (!((a_object->GetFlags() >> 11) & 1) && !Hooks::CullGroups::IsSky(a_object)) {
+			} else if (!alwaysDraw && !sky) {
 				auto&      streams = Streams(*context);
 				const bool group0 = a_kind == Hooks::CullGroups::GroupKind::kSunShared;
 				const Hooks::CullGroups::BlockAdd add{ nullptr, a_object, a_bound, -1, 0, true, a_kind, 0 };
-				Record                            out{};
+				judged = true;
 				if (group0) {
 					Bump(kShared);
 				}
@@ -4232,7 +5670,11 @@ namespace CBRO::Core::Occlusion
 				if (!Observing()) {
 					if (group0) {
 						if ((hiddenConfirmed || out.outcome == Outcome::kOutside) && !light && GroupZeroUnneeded(*context, out, a_object, *a_bound)) {
-							if (TraceKeep(*context, a_object, *a_bound, hiddenConfirmed, out)) {
+							const bool turn = TraceRefresh(*context, a_object, *a_bound);
+							if (turn && HandEntry(a_object, hiddenConfirmed ? CBRO_TRACE_HIDDEN : CBRO_TRACE_OUTSIDE)) {
+								RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);  // (handed to the tracer: no view files it, v1.99.3)
+								skip = true;
+							} else if (turn && TraceKeepFiled(*context, a_object, *a_bound, hiddenConfirmed, out)) {
 								force = !hiddenConfirmed;
 							} else {
 								Bump(kCasterSkipped);
@@ -4242,7 +5684,10 @@ namespace CBRO::Core::Occlusion
 							}
 						} else if (hiddenConfirmed) {
 							NoteFarCascade(*context, a_object, out);
-							if (!g_drops.Insert(a_object, DropSet::Tag(context->clock))) {
+							if (DeferSunOnly(*context, a_object, *a_bound)) {
+								RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);  // (filed for the cascades later, v1.99.3)
+								skip = true;
+							} else if (!g_drops.Insert(a_object, DropSet::Tag(context->clock))) {
 								Bump(kDropFull);
 							} else {
 								RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);
@@ -4251,12 +5696,19 @@ namespace CBRO::Core::Occlusion
 							if (!light) {
 								NoteFarCascade(*context, a_object, out);
 							}
-							// (with the sun up a shadow it may cast keeps it: the cascades file it within their range, 6.1)
-							force = context->sun.state != FrameContext::Sun::State::kOn && TraceOutside(*context, a_object, *a_bound);
+							// (with the sun up a shadow it may cast keeps it: the cascades file it within their range, 6.1; with the sun
+							// down a lamp may need it: filed as without the feed, its pieces handed over directly, v1.99.3)
+							if (context->sun.state != FrameContext::Sun::State::kOn && TraceRefresh(*context, a_object, *a_bound)) {
+								force = !HandEntry(a_object, CBRO_TRACE_OUTSIDE) && TraceOutsideFiled(*context, a_object);
+							}
 							RecordLeftOut(*context, a_object, *a_bound, force ? LeftOutPath::kDropped : LeftOutPath::kOutside, &out);
 						}
 					} else if (hiddenConfirmed) {
-						if (TraceDrop(*context, a_object, *a_bound)) {
+						const bool turn = TraceRefresh(*context, a_object, *a_bound);
+						if (turn && HandEntry(a_object, CBRO_TRACE_HIDDEN)) {
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);  // (handed to the tracer, not filed, v1.99.3)
+							skip = true;
+						} else if (turn && TraceDropFiled(*context, a_object)) {
 							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);
 						} else {
 							Bump(kSkippedHidden);
@@ -4264,7 +5716,11 @@ namespace CBRO::Core::Occlusion
 							skip = true;
 						}
 					} else if (out.outcome == Outcome::kOutside) {
-						if (TraceOutside(*context, a_object, *a_bound)) {
+						const bool turn = TraceRefresh(*context, a_object, *a_bound);
+						if (turn && HandEntry(a_object, CBRO_TRACE_OUTSIDE)) {
+							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);  // (handed to the tracer, not filed, v1.99.3)
+							skip = true;
+						} else if (turn && TraceOutsideFiled(*context, a_object)) {
 							force = true;
 							RecordLeftOut(*context, a_object, *a_bound, LeftOutPath::kDropped, &out);
 						} else if (!light) {
@@ -4276,8 +5732,65 @@ namespace CBRO::Core::Occlusion
 					}
 				}
 			}
+			if (FadeStampTurn(a_object, context->clock)) {
+				CountFadeTop(*context, a_object, *a_bound, skip, player || force);  // (survey, v1.92.4; the forced split v1.94.1)
+			}
+			if (recording) {
+				const auto flags = static_cast<std::uint16_t>(
+					(skip ? RecorderFormat::kLeftOut : 0) | ((player || force) ? RecorderFormat::kForced : 0) | (player ? RecorderFormat::kPlayer : 0) |
+					(alwaysDraw ? RecorderFormat::kAlwaysDraw : 0) | (sky ? RecorderFormat::kSky : 0) |
+					(a_kind == Hooks::CullGroups::GroupKind::kMainOnly ? RecorderFormat::kGroup1 : 0) | (Observing() ? RecorderFormat::kObserveOnly : 0));
+				Recorder::NoteEntry(Recorder::Origin::kEngineTop, a_object, *a_bound, static_cast<std::uint8_t>(a_kind), flags, 0);  // (the walk's: SetWalkSite turns it into kWalkTop)
+			}
 			if (!skip) {
 				t_top = { a_object, context->clock, nullptr, player || force };
+			}
+			// (v1.99.2: a node filed by a known group goes into its group's sequence instead of the top table)
+			bool recorded = false;
+			if (!skip && t_decisionGroup && StableIndexOn() && !a_object->IsGeometry()) {
+				if (const auto sequence = ParentSequenceOf(t_decisionGroup, true)) {
+					ParentRecord record{};
+					record.object = a_object;
+					if (judged && !force) {
+						record.state |= kParentJudged;
+						record.outcome = static_cast<std::uint8_t>(out.outcome);
+						record.verdict = out.verdict;
+						record.flags = out.flags;
+						std::copy_n(out.bound, 4, record.bound);
+					}
+					if (g_drops.Contains(a_object, DropSet::Tag(context->clock))) {
+						record.state |= kParentDropped;  // (inserted above: its line is in the cache)
+					}
+					if (force) {
+						record.state |= kParentForced;
+					}
+					if (player) {
+						record.state |= kParentPlayer;
+					}
+					if (a_known & kKnownScolChecked) {
+						record.state |= kParentScolKnown | ((a_known & kKnownScolRoot) ? kParentScolRoot : 0);
+					}
+					sequence->records.push_back(record);
+					const auto bit = ParentPresenceBit(a_object);
+					g_parentPresence[bit >> 6] |= std::uint64_t{ 1 } << (bit & 63);
+					recorded = true;
+					Bump(kStableRecorded);
+				}
+			}
+			if (recorded) {
+			} else if (!skip && judged && !force) {
+				auto& top = TopSlot(a_object);
+				top.object = a_object;
+				top.clock = context->clock;
+				top.outcome = static_cast<std::uint8_t>(out.outcome);
+				top.verdict = out.verdict;
+				top.flags = out.flags;
+				top.bound[0] = out.bound[0];
+				top.bound[1] = out.bound[1];
+				top.bound[2] = out.bound[2];
+				top.bound[3] = out.bound[3];
+			} else if (auto& top = TopSlot(a_object); top.object == a_object) {
+				top.object = nullptr;  // (an earlier decision of this frame's on the object, left out or forced now)
 			}
 			if (timed) {
 				Bump(kCycles, (__rdtsc() - start) * kTimingStride);
@@ -4305,6 +5818,21 @@ namespace CBRO::Core::Occlusion
 		constexpr int  kNodeContentsShift = 56;
 		std::uintptr_t g_niNodeVtable{ 0 };
 
+		// The scans below read each child's vtable and one more line (its world bound, or its flags and userData), a miss
+		// per child (0.11 ms a frame in the 2026-10-26 profile); the child a few slots ahead is fetched first (v1.92.3).
+		constexpr std::size_t kScanPrefetch = 4;
+
+		template <class T>
+		void PrefetchChild(const T& a_children, std::size_t a_index, std::size_t a_count, std::size_t a_line) noexcept
+		{
+			if (a_index < a_count) {
+				if (const auto ahead = reinterpret_cast<const char*>(a_children[static_cast<typename T::size_type>(a_index)].get())) {
+					_mm_prefetch(ahead, _MM_HINT_T0);
+					_mm_prefetch(ahead + a_line, _MM_HINT_T0);
+				}
+			}
+		}
+
 		std::uint8_t EntryScan(RE::NiAVObject* a_node, int a_depth) noexcept
 		{
 			const auto root = a_node->IsNode();
@@ -4322,8 +5850,11 @@ namespace CBRO::Core::Occlusion
 					found |= kSubtreeActor;
 				}
 			};
-			for (auto& child : root->children) {
-				const auto object = child.get();
+			const auto& children = root->children;
+			const auto  count = Util::UsedSlots(children);  // (the engine's bound, not size(): v1.92.11)
+			for (std::uint16_t i = 0; i < count; ++i) {
+				PrefetchChild(children, i + kScanPrefetch, count, 0x100);  // (vtable; flags, userData)
+				const auto object = children[i].get();
 				if (!object) {
 					continue;
 				}
@@ -4335,8 +5866,11 @@ namespace CBRO::Core::Occlusion
 					entry(object);
 					continue;
 				}
-				for (auto& grandchild : inner->children) {
-					const auto object2 = grandchild.get();
+				const auto& grandchildren = inner->children;
+				const auto  count2 = Util::UsedSlots(grandchildren);
+				for (std::uint16_t j = 0; j < count2; ++j) {
+					PrefetchChild(grandchildren, j + kScanPrefetch, count2, 0x100);
+					const auto object2 = grandchildren[j].get();
 					if (!object2) {
 						continue;
 					}
@@ -4367,13 +5901,483 @@ namespace CBRO::Core::Occlusion
 			return static_cast<std::uint8_t>((value >> kNodeContentsShift) & 7);
 		}
 
+		// ---- node caches: the entries' slots and their clusters (v1.94 slots; v1.98 clusters and leases, bWalkLeases) ------
+		// Per node a prune site offers (a cell's node 3, a container under it, a DrawWorld root, a cell's node 9), by child
+		// slot: the object seen there, its bound at the last touch and its classification (container, light, actor, sky), so
+		// a walk reads each entry's flags and bound only (v1.94). v1.98: the slots are grouped in runs of kClusterSlots,
+		// each with the sphere around its members' bounds at their last touch and whether any member holds it. Every
+		// frame used to touch every entry of every node offered (the walk's 5,979 and the scans' 4,925 in the 2026-10-27
+		// run, a cache miss or two each: 1.1 ms of the main thread's 3.7 ms cull), to find the few that moved and the few
+		// that meet the view. Now a cluster whose members all lay still at the last walk, held by nothing (an always-draw
+		// entry, a light, an actor, the player's, a sky mesh, an unusable bound, a marker) and whose sphere lies outside
+		// the view by the verdict's margins plus fWalkLeaseMargin, with no shadow or lamp needing it, is left out whole
+		// without touching a member: the engine's child array alone says the slots still hold the same objects. Its
+		// members are touched again at most iWalkLeaseFrames frames later (staggered, so a frame walks a part of them).
+		// What such a frame would have found: a member moved meanwhile (by less than the margin: still outside; by more:
+		// drawn up to the lease late, the one new risk, taken with the margin at 64 units and the lease at 4 frames), a
+		// member mid-fade (its fade is run anyway: the set, FadeMidWay), the trace's turn (walked as an entry), a marker
+		// pending (the cluster is walked). Node pruning reads the same clusters: a node whose clusters are all within
+		// their lease and outside the view is left out whole on their spheres, its entries untouched.
+		enum SlotKind : std::uint8_t
+		{
+			kSlotContainerKnown = 1 << 0,  // kSlotContainer decided for the slot's object
+			kSlotContainer = 1 << 1,       // an exact NiNode under a cell's node 3: its members are the entries
+			kSlotClassified = 1 << 2,      // kSlotLight, kSlotActor, kSlotSky decided for the slot's object, at `epoch`
+			kSlotLight = 1 << 3,           // a light type (TypeOf): never left out as out of view
+			kSlotActor = 1 << 4,           // an actor's root (userData a kACHR reference)
+			kSlotSky = 1 << 5,             // a sky mesh
+			kSlotGroup1 = 1 << 6,          // a root's child with flags bit 40 at the last walk: group 1 is its route
+			kSlotScolRoot = 1 << 7,        // a static collection's root (IsScolReference, at `epoch`; v1.99.2)
+		};
+
+		// Why a slot's entry holds its cluster out of a lease, set at each touch (the sticky reasons: the transient ones,
+		// in view, a shadow or lamp needing it, the trace's turn, are tested on the cluster's sphere each frame).
+		enum SlotHold : std::uint8_t
+		{
+			kHoldBad = 1 << 0,         // bound unusable (unmaintained, huge, NaN): judged, never leased
+			kHoldMoved = 1 << 1,       // the bound changed by more than kQuietMove since the touch before
+			kHoldAlwaysDraw = 1 << 2,  // the engine's always-draw bit (flags bit 11)
+			kHoldLight = 1 << 3,
+			kHoldActor = 1 << 4,
+			kHoldPlayer = 1 << 5,      // the player's 3D (filed force-visible for the trace every frame)
+			kHoldSky = 1 << 6,
+			kHoldMarker = 1 << 7,      // filed unjudged with a group marker
+		};
+
+		struct WalkSlot
+		{
+			const RE::NiAVObject* object{ nullptr };
+			float                 bound[4]{};    // the bound at the last touch (center, radius): a change is a move
+			bool                  seen{ false };  // bound valid
+			bool                  scanChanged{ false };  // the pruning scan found the bound changed, and no walk has seen that yet
+			std::uint8_t          kind{ 0 };
+			std::uint8_t          epoch{ 0 };
+			std::uint8_t          hold{ 0 };
+			bool                  boundDirty{ true };  // the bound changed (or the slot is new) since its cluster's sphere was built (v1.99)
+			bool                  handed{ false };     // its entry was handed to a tracer that keeps it (v2.0: a GONE record when it leaves)
+		};
+		static_assert(sizeof(WalkSlot) == 32);  // (two to a cache line: v1.99's certificates made it 64 and the walk's slot misses doubled; v1.99.1)
+
+		struct WalkCluster
+		{
+			float         center[3]{};
+			float         radius{ -1.0f };     // the sphere around the members' bounds at the last walk (< 0: no member)
+			std::uint32_t walkedClock{ 0 };    // the frame its members were last touched, all of them
+			std::uint8_t  members{ 0 };        // entries among its slots (containers and empty slots apart)
+			std::uint8_t  hold{ 0 };           // the members' holds, together
+			bool          valid{ false };      // touched whole since the slots were (re)built
+			bool          walked{ false };     // ... by the walk (the members classified: light, actor, sky, player, always-draw), not the pruning scan alone
+			std::uint16_t containers{ 0 };     // its slots holding containers, by bit (v1.99.1: a lease reads the masks, not the slots)
+			std::uint16_t group1{ 0 };         // ... holding entries routed to group 1
+			std::uint64_t children{ 0 };       // the signature of the child pointers it was finished with (ChildSignature)
+		};
+
+		struct WalkNodeCache
+		{
+			std::uint32_t            clock{ 0 };    // the last touch's frame (the sweep)
+			std::uint32_t            stagger{ 0 };  // the node's share of the lease schedule
+			bool                     traced{ false };  // walked whole for a tracer that keeps what it is handed (v2.0: its later trace walks take only what it doesn't know)
+			std::vector<WalkSlot>    slots;         // by child slot
+			std::vector<WalkCluster> clusters;      // by run of kClusterSlots slots
+		};
+
+		std::unordered_map<const void*, WalkNodeCache> g_walkNodes;  // (main thread)
+		std::uint32_t                                  g_walkSweep{ 0 };
+		constexpr std::uint32_t                        kWalkSweepFrames = 1024;  // a node not touched for this long is forgotten
+		constexpr std::size_t                          kClusterSlots = 16;
+		constexpr float                                kQuietMove = 8.0f;  // a bound shifting by less between touches (swaying) doesn't hold its cluster
+		thread_local int                               t_walkDepth{ 0 };
+		thread_local bool                              t_prunedFromCache{ false };  // (SkipCellNode: EntriesOutside answered from the clusters)
+
+		// A slot's entry leaves it (another child took the slot, it was AppCulled, its node's cache is dropped): an entry
+		// handed to a tracer that keeps it is gone for the tracer (v2.0, the link's GONE record).
+		inline void SlotLeft(WalkSlot& a_slot) noexcept
+		{
+			if (a_slot.handed) {
+				a_slot.handed = false;
+				TraceFeed::Gone(a_slot.object);
+				Bump(kTraceGone);
+			}
+		}
+
+		void CacheLeft(WalkNodeCache& a_cache) noexcept
+		{
+			if (TraceFeed::Linked()) {
+				for (auto& slot : a_cache.slots) {
+					SlotLeft(slot);
+				}
+			}
+		}
+
+		WalkNodeCache& NodeCacheOf(const RE::NiNode* a_root, std::size_t a_count, std::uint32_t a_clock)
+		{
+			auto& cache = g_walkNodes[a_root];
+			cache.clock = a_clock;
+			if (cache.slots.size() != a_count) {
+				// (v2.0: an entry handed to the tracer that still holds its slot stays handed: a detached child leaves its slot
+				// null and AttachChild(child, false) appends at the count, FO4OG 7.13, 10.17, so a rebuilt node's entries mostly
+				// keep their slots)
+				std::vector<WalkSlot> slots(a_count);
+				if (TraceFeed::Linked()) {
+					const auto& children = a_root->children;
+					for (std::size_t i = 0; i < cache.slots.size(); ++i) {
+						auto& old = cache.slots[i];
+						if (!old.handed) {
+							continue;
+						}
+						if (i < a_count && children[static_cast<std::uint16_t>(i)].get() == old.object) {
+							slots[i].object = old.object;
+							slots[i].handed = true;
+						} else {
+							SlotLeft(old);
+						}
+					}
+				}
+				cache.slots = std::move(slots);
+				cache.traced = false;
+				cache.clusters.assign((a_count + kClusterSlots - 1) / kClusterSlots, WalkCluster{});
+				cache.stagger = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(a_root) >> 6);
+				Bump(kWalkCachesRebuilt);
+			}
+			return cache;
+		}
+
+		inline bool UsableBound(const RE::NiBound& a_bound) noexcept
+		{
+			return a_bound.fRadius > 1.0f && a_bound.fRadius < 1.0e6f && std::isfinite(a_bound.center.x) && std::isfinite(a_bound.center.y) && std::isfinite(a_bound.center.z);
+		}
+
+		// The bound at a touch, into the slot: a shift past the quiet allowance since the touch before holds the cluster.
+		// Returns whether the bound changed at all (the walk's own "moved").
+		bool NoteSlotBound(WalkSlot& a_slot, const RE::NiBound& a_bound) noexcept
+		{
+			const bool changed = !a_slot.seen || a_slot.bound[0] != a_bound.center.x || a_slot.bound[1] != a_bound.center.y || a_slot.bound[2] != a_bound.center.z || a_slot.bound[3] != a_bound.fRadius;
+			if (a_slot.seen && changed) {
+				const float dx = a_bound.center.x - a_slot.bound[0], dy = a_bound.center.y - a_slot.bound[1], dz = a_bound.center.z - a_slot.bound[2];
+				const float dr = a_bound.fRadius - a_slot.bound[3];
+				if (!(dx * dx + dy * dy + dz * dz <= kQuietMove * kQuietMove) || !(std::fabs(dr) <= kQuietMove)) {
+					a_slot.hold |= kHoldMoved;
+				}
+			}
+			a_slot.bound[0] = a_bound.center.x;
+			a_slot.bound[1] = a_bound.center.y;
+			a_slot.bound[2] = a_bound.center.z;
+			a_slot.bound[3] = a_bound.fRadius;
+			a_slot.seen = true;
+			if (changed) {
+				a_slot.boundDirty = true;  // (its cluster's sphere is built again: FinishCluster)
+			}
+			return changed;
+		}
+
+		// Grows a_union (empty while !a_any) to hold a_bound.
+		void GrowSphere(RE::NiBound& a_union, bool& a_any, const RE::NiBound& a_bound) noexcept
+		{
+			if (!a_any) {
+				a_union = a_bound;
+				a_any = true;
+				return;
+			}
+			const float cx = a_bound.center.x - a_union.center.x;
+			const float cy = a_bound.center.y - a_union.center.y;
+			const float cz = a_bound.center.z - a_union.center.z;
+			const float d = std::sqrt(cx * cx + cy * cy + cz * cz);
+			if (d + a_bound.fRadius > a_union.fRadius) {
+				if (d + a_union.fRadius <= a_bound.fRadius) {
+					a_union = a_bound;
+				} else {
+					const float radius = (d + a_union.fRadius + a_bound.fRadius) * 0.5f;
+					const float t = (radius - a_union.fRadius) / d;
+					a_union.center.x += cx * t;
+					a_union.center.y += cy * t;
+					a_union.center.z += cz * t;
+					a_union.fRadius = radius;
+				}
+			}
+		}
+
+		inline RE::NiBound SlotBound(const WalkSlot& a_slot) noexcept
+		{
+			return RE::NiBound{ RE::NiPoint3{ a_slot.bound[0], a_slot.bound[1], a_slot.bound[2] }, a_slot.bound[3] };
+		}
+
+		inline RE::NiBound ClusterBound(const WalkCluster& a_cluster) noexcept
+		{
+			return RE::NiBound{ RE::NiPoint3{ a_cluster.center[0], a_cluster.center[1], a_cluster.center[2] }, a_cluster.radius };
+		}
+
+		// A run of child slots' signature (v1.99.1): a lease compares the child array with the signature its cluster was
+		// finished with, instead of each slot's object (a lease then costs the child array's lines, no slot: the slot
+		// compares were ~7% of CBRO's cull-stage samples in the 2026-10-27 v1.99 run).
+		inline std::uint64_t MixChild(const void* a_object, std::size_t a_index) noexcept
+		{
+			auto x = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(a_object)) + a_index;
+			x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+			x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+			return x ^ (x >> 31);
+		}
+
+		template <class Children>
+		std::uint64_t ChildSignature(const Children& a_children, std::size_t a_first, std::size_t a_last) noexcept
+		{
+			std::uint64_t signature = 0;
+			for (auto i = a_first; i < a_last; ++i) {
+				signature += MixChild(a_children[static_cast<std::uint16_t>(i)].get(), i);
+			}
+			return signature;
+		}
+
+		// The cluster's sphere, members and hold from its slots, after every one of them was touched this frame.
+		void FinishCluster(WalkNodeCache& a_cache, std::size_t a_index, std::uint32_t a_clock, bool a_walked) noexcept
+		{
+			auto&       cluster = a_cache.clusters[a_index];
+			RE::NiBound sphere{};
+			bool        any = false;
+			std::uint8_t hold = 0;
+			std::uint8_t members = 0;
+			const auto first = a_index * kClusterSlots;
+			const auto last = std::min(first + kClusterSlots, a_cache.slots.size());
+			// (v1.99: the sphere is built again only when a member's bound changed or the members did; most frames none did)
+			bool          rebuild = !cluster.valid;
+			std::uint16_t containers = 0;
+			std::uint16_t group1 = 0;
+			std::uint64_t children = 0;
+			for (auto i = first; i < last; ++i) {
+				auto& slot = a_cache.slots[i];
+				children += MixChild(slot.object, i);
+				if (!slot.object) {
+					continue;
+				}
+				const auto bit = static_cast<std::uint16_t>(1u << (i - first));
+				if (slot.kind & kSlotContainer) {
+					containers |= bit;
+					continue;
+				}
+				if (slot.kind & kSlotGroup1) {
+					group1 |= bit;
+				}
+				++members;
+				hold |= slot.hold;
+				if (!slot.seen) {
+					hold |= kHoldBad;
+				}
+				if (slot.boundDirty) {
+					slot.boundDirty = false;
+					rebuild = true;
+				}
+			}
+			if (members != cluster.members) {
+				rebuild = true;
+			}
+			cluster.hold = hold;
+			cluster.members = members;
+			cluster.valid = true;
+			cluster.walked = a_walked;
+			cluster.walkedClock = a_clock;
+			cluster.containers = containers;
+			cluster.group1 = group1;
+			cluster.children = children;
+			if (!rebuild) {
+				return;
+			}
+			for (auto i = first; i < last; ++i) {
+				const auto& slot = a_cache.slots[i];
+				if (slot.object && !(slot.kind & kSlotContainer) && slot.seen) {
+					GrowSphere(sphere, any, SlotBound(slot));
+				}
+			}
+			if (any) {
+				cluster.center[0] = sphere.center.x;
+				cluster.center[1] = sphere.center.y;
+				cluster.center[2] = sphere.center.z;
+				cluster.radius = sphere.fRadius;
+			} else {
+				cluster.radius = -1.0f;
+			}
+		}
+
+		// A cluster is touched again at most leaseFrames frames after its last touch, on a frame of its own in the schedule.
+		bool LeaseDue(const FrameContext& a_context, const WalkNodeCache& a_cache, std::size_t a_index, const WalkCluster& a_cluster) noexcept
+		{
+			if (!a_cluster.valid || a_context.clock - a_cluster.walkedClock > g_tunables.leaseFrames) {
+				return true;
+			}
+			return (a_context.clock + a_cache.stagger + static_cast<std::uint32_t>(a_index)) % (g_tunables.leaseFrames + 1) == 0;
+		}
+
+		// The cluster's sphere lies entirely outside the view, by the verdict's margins and the lease margin on top.
+		bool ClusterOutside(const FrameContext& a_context, const WalkCluster& a_cluster) noexcept
+		{
+			if (!(a_cluster.radius >= 0.0f)) {
+				return false;
+			}
+			const auto& camera = a_context.snapshot->camera;
+			if (!camera.viewSpace) {
+				return false;
+			}
+			const float dx = a_cluster.center[0] - camera.origin[0];
+			const float dy = a_cluster.center[1] - camera.origin[1];
+			const float dz = a_cluster.center[2] - camera.origin[2];
+			const float z = dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2];
+			const float x = dx * camera.viewRight[0] + dy * camera.viewRight[1] + dz * camera.viewRight[2];
+			const float y = dx * camera.viewUp[0] + dy * camera.viewUp[1] + dz * camera.viewUp[2];
+			return SphereOutsideView(a_context, x, y, z, a_cluster.radius + a_context.dilateMove + std::max(z, 0.0f) * a_context.angularSlack + g_tunables.leaseMargin);
+		}
+
 		// A grouping node's own worldBound is NOT maintained by the engine: the v1.20/v1.21 samples showed r=1 on every
 		// cell node and container, and that is what their always-draw bit stands for ("never cull me by my bound").
 		// v1.21 judged them by that bound and most of the scene vanished. So a node is judged by its ENTRIES' bounds
-		// (the objects the engine files, whose bounds it culls by), all of them, every frame: skippable only if every
-		// entry lies entirely outside the current view (with the usual dilation), with the sphere around all of them
-		// (for the sun sweep) returned. An entry whose bound looks unmaintained too (radius <= 1, e.g. a nested
-		// container) or invalid holds the node; the pass stops at the first entry that isn't outside.
+		// (the objects the engine files, whose bounds it culls by), all of them: skippable only if every entry lies
+		// entirely outside the current view (with the usual dilation), with the sphere around all of them (for the
+		// sun sweep) returned. An entry whose bound looks unmaintained too (radius <= 1, e.g. a nested container) or
+		// invalid holds the node; the pass stops at the first entry that isn't outside. The scan fills the node's slots
+		// and clusters as it goes (and a container's, two levels down), so that later frames can answer from the
+		// clusters' spheres (CachedEntriesOutside) until their lease runs out.
+		// One cluster of a node's slots read (v1.98.1; v1.98 read the whole node): each entry touched, its bound into the
+		// slot and into the sphere; false at the first entry that meets the view or can't be judged by its bound (the node
+		// is walked then, its remaining clusters untouched). A container found among the slots is scanned through
+		// ScanEntries (two levels down at most). The cluster is finished once every slot was touched.
+		bool ScanEntries(const FrameContext& a_context, RE::NiNode* a_root, int a_depth, RE::NiBound& a_union, bool& a_any, std::uint32_t& a_count) noexcept;
+		bool CachedEntriesOutside(const FrameContext& a_context, RE::NiNode* a_root, int a_depth, RE::NiBound& a_union, bool& a_any, std::uint32_t& a_count, bool& a_usable) noexcept;
+
+		bool ScanCluster(const FrameContext& a_context, RE::NiNode* a_root, WalkNodeCache& a_cache, std::size_t a_cluster, int a_depth, RE::NiBound& a_union, bool& a_any, std::uint32_t& a_count) noexcept
+		{
+			const auto& camera = a_context.snapshot->camera;
+			const auto& children = a_root->children;
+			const auto  count = a_cache.slots.size();
+			const bool  resumed = g_tunables.walkLeases && a_cache.clusters[a_cluster].valid && a_context.clock - a_cache.clusters[a_cluster].walkedClock > 1;
+			const auto  first = a_cluster * kClusterSlots;
+			const auto  last = std::min(first + kClusterSlots, count);
+			for (auto i = first; i < last; ++i) {
+				PrefetchChild(children, i + kScanPrefetch, count, 0x80);  // (vtable; world bound)
+				const auto object = children[static_cast<std::uint16_t>(i)].get();
+				auto&      slot = a_cache.slots[i];
+				if (slot.object != object) {
+					SlotLeft(slot);
+					slot = WalkSlot{};
+					slot.object = object;
+				}
+				if (!object) {
+					continue;
+				}
+				const auto inner = a_depth >= 2 && Util::TryReadVtable(object) == g_niNodeVtable ? object->IsNode() : nullptr;
+				if (inner) {
+					slot.kind |= static_cast<std::uint8_t>(kSlotContainerKnown | kSlotContainer);
+					bool usable = true;
+					if (g_tunables.walkLeases && CachedEntriesOutside(a_context, inner, 1, a_union, a_any, a_count, usable)) {
+						continue;  // (its own clusters answered)
+					}
+					if ((g_tunables.walkLeases && usable) || !ScanEntries(a_context, inner, 1, a_union, a_any, a_count)) {
+						return false;
+					}
+					continue;
+				}
+				slot.hold = 0;
+				const auto& bound = object->worldBound;
+				if (!UsableBound(bound)) {
+					slot.hold |= kHoldBad;
+					return false;  // unmaintained or bad: the node is walked normally
+				}
+				slot.scanChanged = NoteSlotBound(slot, bound) || slot.scanChanged;  // (the walk of this frame, if any, still sees the move)
+				const float dx = bound.center.x - camera.origin[0];
+				const float dy = bound.center.y - camera.origin[1];
+				const float dz = bound.center.z - camera.origin[2];
+				const float z = dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2];
+				const float x = dx * camera.viewRight[0] + dy * camera.viewRight[1] + dz * camera.viewRight[2];
+				const float y = dx * camera.viewUp[0] + dy * camera.viewUp[1] + dz * camera.viewUp[2];
+				if (!SphereOutsideView(a_context, x, y, z, bound.fRadius + a_context.dilateMove + std::max(z, 0.0f) * a_context.angularSlack)) {
+					return false;
+				}
+				// (v1.96) The node may be left out whole, its entries never visited again while it is: a fade node among them
+				// keeps its fade as the walk's skipped entries do (bKeepFadeState), or the engine restarts it from 0 when the
+				// node comes back (a pop-in, and a lighting re-queue for every frame of the fade).
+				if (g_tunables.keepFadeState) {
+					KeepFadeSeen(object, a_context.clock, resumed);
+				}
+				GrowSphere(a_union, a_any, bound);
+				++a_count;
+			}
+			FinishCluster(a_cache, a_cluster, a_context.clock, false);
+			return true;
+		}
+
+		bool ScanEntries(const FrameContext& a_context, RE::NiNode* a_root, int a_depth, RE::NiBound& a_union, bool& a_any, std::uint32_t& a_count) noexcept
+		{
+			const auto count = Util::UsedSlots(a_root->children);  // (the engine's bound, not size(): v1.92.11)
+			auto&      cache = NodeCacheOf(a_root, count, a_context.clock);
+			for (std::size_t c = 0; c < cache.clusters.size(); ++c) {
+				if (!ScanCluster(a_context, a_root, cache, c, a_depth, a_union, a_any, a_count)) {
+					return false;
+				}
+			}
+			return true;
+		}
+
+		// Node pruning answered from the clusters (v1.98): a cluster within its lease, held by nothing, its slots still
+		// holding the objects its sphere was built from (the child array alone) answers by that sphere, no entry touched.
+		// Any other cluster is read again, one at a time (v1.98.1: v1.98 gave the whole node up at the first such cluster,
+		// and the stagger makes one due every frame in a node of five clusters or more). a_usable false: no cache for the
+		// node yet, or its child count changed (a scan from scratch follows). False with a_usable: an entry, or a leased
+		// cluster's sphere, meets the view.
+		bool CachedEntriesOutside(const FrameContext& a_context, RE::NiNode* a_root, int a_depth, RE::NiBound& a_union, bool& a_any, std::uint32_t& a_count, bool& a_usable) noexcept
+		{
+			const auto found = g_walkNodes.find(a_root);
+			if (found == g_walkNodes.end()) {
+				a_usable = false;
+				return false;
+			}
+			auto&       cache = found->second;
+			const auto& children = a_root->children;
+			const auto  count = Util::UsedSlots(children);
+			if (cache.slots.size() != count) {
+				a_usable = false;
+				return false;
+			}
+			cache.clock = a_context.clock;
+			for (std::size_t c = 0; c < cache.clusters.size(); ++c) {
+				const auto& cluster = cache.clusters[c];
+				const auto  first = c * kClusterSlots;
+				const auto  last = std::min(first + kClusterSlots, static_cast<std::size_t>(count));
+				// (v1.99.1: the child array against the signature the cluster was finished with, no slot read)
+				const bool  leased = cluster.valid && !cluster.hold && !LeaseDue(a_context, cache, c, cluster) && ChildSignature(children, first, last) == cluster.children;
+				if (!leased) {
+					Bump(kCellNodeClustersRescanned);
+					if (!ScanCluster(a_context, a_root, cache, c, a_depth, a_union, a_any, a_count)) {
+						return false;
+					}
+					continue;
+				}
+				if (cluster.radius >= 0.0f && !ClusterOutside(a_context, cluster)) {
+					return false;  // (meets the view: the node is walked, which touches its entries again)
+				}
+				for (auto i = first; i < last; ++i) {
+					const auto object = children[static_cast<std::uint16_t>(i)].get();
+					if (!object) {
+						continue;
+					}
+					if (cluster.containers & (1u << (i - first))) {
+						const auto inner = reinterpret_cast<RE::NiNode*>(object);
+						bool       usable = true;
+						if (CachedEntriesOutside(a_context, inner, 1, a_union, a_any, a_count, usable)) {
+							continue;
+						}
+						if (usable || !ScanEntries(a_context, inner, 1, a_union, a_any, a_count)) {
+							return false;  // (an entry of the container meets the view; or it had no cache yet and was scanned)
+						}
+						continue;
+					}
+					if (g_tunables.keepFadeState && FadeMidWay(object)) {
+						KeepFadeSeen(object, a_context.clock);  // (its fade runs on: the one touch a lease allows)
+					}
+				}
+				if (cluster.radius >= 0.0f) {
+					GrowSphere(a_union, a_any, ClusterBound(cluster));
+					a_count += cluster.members;
+				}
+			}
+			return true;
+		}
+
 		bool EntriesOutside(const FrameContext& a_context, RE::NiAVObject* a_node, int a_depth, RE::NiBound& a_union, std::uint32_t& a_count) noexcept
 		{
 			const auto root = a_node->IsNode();
@@ -4384,66 +6388,20 @@ namespace CBRO::Core::Occlusion
 			if (!camera.viewSpace) {
 				return false;
 			}
-			bool       any = false;
-			const auto consider = [&](RE::NiAVObject* a_object) -> bool {
-				const auto& bound = a_object->worldBound;
-				if (!(bound.fRadius > 1.0f) || !(bound.fRadius < 1.0e6f) || !std::isfinite(bound.center.x) || !std::isfinite(bound.center.y) || !std::isfinite(bound.center.z)) {
-					return false;  // unmaintained or bad: the node is walked normally
+			bool any = false;
+			a_count = 0;
+			t_prunedFromCache = false;
+			if (g_tunables.walkLeases && !LeftOutFrame(a_context.clock)) {
+				bool       usable = true;
+				const bool outside = CachedEntriesOutside(a_context, root, a_depth, a_union, any, a_count, usable);
+				if (usable) {
+					t_prunedFromCache = outside && any;
+					return outside && any;
 				}
-				const float dx = bound.center.x - camera.origin[0];
-				const float dy = bound.center.y - camera.origin[1];
-				const float dz = bound.center.z - camera.origin[2];
-				const float z = dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2];
-				const float x = dx * camera.viewRight[0] + dy * camera.viewRight[1] + dz * camera.viewRight[2];
-				const float y = dx * camera.viewUp[0] + dy * camera.viewUp[1] + dz * camera.viewUp[2];
-				if (!SphereOutsideView(a_context, x, y, z, bound.fRadius + a_context.dilateMove + std::max(z, 0.0f) * a_context.angularSlack)) {
-					return false;
-				}
-				if (!any) {
-					a_union = bound;
-					any = true;
-				} else {
-					// Grow the union sphere to hold this one.
-					const float cx = bound.center.x - a_union.center.x;
-					const float cy = bound.center.y - a_union.center.y;
-					const float cz = bound.center.z - a_union.center.z;
-					const float d = std::sqrt(cx * cx + cy * cy + cz * cz);
-					if (d + bound.fRadius > a_union.fRadius) {
-						if (d + a_union.fRadius <= bound.fRadius) {
-							a_union = bound;
-						} else {
-							const float radius = (d + a_union.fRadius + bound.fRadius) * 0.5f;
-							const float t = (radius - a_union.fRadius) / d;
-							a_union.center.x += cx * t;
-							a_union.center.y += cy * t;
-							a_union.center.z += cz * t;
-							a_union.fRadius = radius;
-						}
-					}
-				}
-				++a_count;
-				return true;
-			};
-			for (auto& child : root->children) {
-				const auto object = child.get();
-				if (!object) {
-					continue;
-				}
-				const auto inner = a_depth >= 2 && Util::TryReadVtable(object) == g_niNodeVtable ? object->IsNode() : nullptr;
-				if (!inner) {
-					if (!consider(object)) {
-						return false;
-					}
-					continue;
-				}
-				for (auto& grandchild : inner->children) {
-					const auto object2 = grandchild.get();
-					if (object2 && !consider(object2)) {
-						return false;
-					}
-				}
+				any = false;
+				a_count = 0;
 			}
-			return any;
+			return ScanEntries(a_context, root, a_depth, a_union, any, a_count) && any;
 		}
 
 		// The first few nodes offered, for the log: what they are.
@@ -4461,7 +6419,7 @@ namespace CBRO::Core::Occlusion
 			const auto node = a_node->IsNode();
 			logger::info(
 				"node pruning: sample index {} type {} name '{}' flags {:#x} children {} own r={:.0f} (unmaintained: not used) contents {:#x} (1 too big, 2 actor entry, 4 always-draw entry) {}: {} entries outside, their sphere r={:.0f}",
-				a_index, type[0] ? type : "?", name, a_node->GetFlags(), node ? node->children.size() : 0u, a_node->worldBound.fRadius, a_contents,
+				a_index, type[0] ? type : "?", name, a_node->GetFlags(), node ? Util::UsedSlots(node->children) : 0u, a_node->worldBound.fRadius, a_contents,
 				a_outside ? "all entries outside the view" : "meets the view (or held)", a_entries, a_unionRadius);
 		}
 
@@ -4479,8 +6437,423 @@ namespace CBRO::Core::Occlusion
 			if (!TraceFeed::Turn(a_node, a_context.clock) || !TraceFeed::InReach(a_bound, a_context.eye)) {
 				return false;
 			}
-			t_traceNode = { a_node, a_context.clock };
+			// (v2.0: a node walked whole for a tracer that keeps what it is handed: its later trace walks take only the entries
+			// the tracer doesn't know, but on the node's resend turn; known by the node's cache, not the known table, which the
+			// tracer's forgetting of a piece clears up its parents)
+			bool all = true;
+			if (TraceFeed::Retains()) {
+				if (const auto found = g_walkNodes.find(a_node); found != g_walkNodes.end()) {
+					all = !found->second.traced || TraceFeed::ResendTurn(a_node, a_context.clock);
+					found->second.traced = true;
+				}
+			}
+			t_traceNode = { a_node, a_context.clock, all };
 			return true;
+		}
+
+		// The left-out dump (v1.92.7): the entries of a node pruned whole, as EntriesOutside walked them, each recorded as
+		// never filed with its own bound (the dump frame only).
+		void RecordPrunedEntries(const FrameContext& a_context, RE::NiAVObject* a_node, int a_depth) noexcept
+		{
+			const auto root = a_node->IsNode();
+			if (!root) {
+				return;
+			}
+			t_source = VerdictSource::kNone;
+			const auto record = [&](RE::NiAVObject* a_object) {
+				RecordLeftOut(a_context, a_object, a_object->worldBound, LeftOutPath::kNodePruned, nullptr);
+			};
+			const auto& children = root->children;
+			const auto  count = Util::UsedSlots(children);  // (the engine's bound, not size(): v1.92.11)
+			for (std::uint16_t i = 0; i < count; ++i) {
+				const auto object = children[i].get();
+				if (!object) {
+					continue;
+				}
+				const auto inner = a_depth >= 2 && Util::TryReadVtable(object) == g_niNodeVtable ? object->IsNode() : nullptr;
+				if (!inner) {
+					record(object);
+					continue;
+				}
+				const auto& grandchildren = inner->children;
+				const auto  count2 = Util::UsedSlots(grandchildren);
+				for (std::uint16_t j = 0; j < count2; ++j) {
+					if (const auto object2 = grandchildren[j].get()) {
+						record(object2);
+					}
+				}
+			}
+		}
+
+		// ---- the entry walk (v1.94, bEntryWalk) -------------------------------------------------------------------
+		// A node a prune site offers that pruning can't leave out whole (an entry meets the view, or holds an always-draw
+		// entry or an actor, or its sun shadow may reach the view) used to go back to the engine, which offered every one
+		// of its entries to Group::Add one by one: the walk's loop and RTTI call, CBRO's Group::Add hook, and for each
+		// entry the top-level decision (SkipTopLevel: the record lookup, the async candidate, the trace checks, the
+		// counters), ~200 ns an entry in view or not. In a dense exterior some 4,400 of the 5,800 entries offered a frame
+		// were out of view with no shadow needed (2026-10-26 profile: the cull stage spent ~1.5 ms in CBRO.dll and ~1.2 ms
+		// in the engine's walk and adds). So CBRO walks such a node itself, in the engine's order and by its rules
+		// (Hooks::PrevisFeed::EnumerateCandidates R3c, R3d, R4Child: a null or AppCulled child is skipped; an exact-NiNode
+		// child of a cell's node 3 is a container whose members are the entries, without the AppCulled test; a root's
+		// child goes to group 1 with flags bit 40 set, else group 0; a root that is a fade node is the engine's, filed
+		// whole into the group array), and tells the engine to skip the node. An entry the cheap tests here can leave out
+		// is never offered to anything: its bound unchanged since the last walk (the trace feed's "moved" rule), no light,
+		// not always-draw, outside the view (the verdict's own test and margins), its sun shadow beyond the receivers'
+		// reach planes (TestSun's first test) or, with the sun down, beyond every recorded lamp's reach (EvaluateSun's
+		// sun-off rule with no lamp within reach), no spot lamp within reach, not the trace's turn, not the player's, not
+		// a sky mesh, not a dump frame. Every other entry goes through the top-level decision as Group::Add would have
+		// offered it (SkipTopLevel; its result reused by the Block::Add filter) and, when kept, is filed through the
+		// engine's Group::Add (AddDirect). A group marker pending on the entry's block files it unjudged, as GroupAdd
+		// does. Per node the slot cache keeps, by child slot, the object seen there, its bound at the last walk and its
+		// classification (container, light), so a walk reads each entry's flags and bound only. Whole-node pruning runs
+		// first, unchanged (SkipCellNode). Main thread, inside DrawWorld's cull.
+		// The shadow of a caster bound is unneeded whatever the depth says: with the sun up its sweep lies beyond the
+		// receivers' reach planes; with the sun down no recorded lamp (point or spot, the list complete) is within reach.
+		// False: unknown here (the full path decides).
+		bool ShadowBeyondReach(const FrameContext& a_context, const RE::NiBound& a_bound) noexcept
+		{
+			switch (a_context.sun.state) {
+			case FrameContext::Sun::State::kOn: {
+				SunSweep sweep{};
+				if (!SunSweepStart(a_context, a_bound, sweep)) {
+					return false;
+				}
+				if (FirstPersonUnseen(a_context) && SweepNearEye(sweep.center, a_context.sun.dir, sweep.radius, a_context.sun.spread, 1.0e6f, kFirstPersonReach)) {
+					return false;
+				}
+				return SunSweepBeyondReach(a_context, sweep, false);
+			}
+			case FrameContext::Sun::State::kOff: {
+				const auto& lamps = ShadowLights::Lamps();
+				if (!g_tunables.lampGroupTrim || !lamps.complete || lamps.count == 0 || lamps.overflow != 0) {
+					return false;
+				}
+				for (std::uint32_t i = 0; i < lamps.count; ++i) {
+					const auto& lamp = lamps.items[i];
+					const float dx = a_bound.center.x - lamp.position.x, dy = a_bound.center.y - lamp.position.y, dz = a_bound.center.z - lamp.position.z;
+					const float reach = lamp.reach + a_bound.fRadius;
+					if (dx * dx + dy * dy + dz * dz <= reach * reach) {
+						return false;
+					}
+				}
+				return true;
+			}
+			default:
+				return false;
+			}
+		}
+
+		// The bound lies entirely outside the view, by the verdict's own test and margins (Test, TestViewSpace: the
+		// cache's move tolerance and its turn tolerance at the bound's depth). An unmaintained or bad bound is judged.
+		bool EntryOutside(const FrameContext& a_context, const RE::NiBound& a_bound) noexcept
+		{
+			if (!(a_bound.fRadius > 1.0f) || !(a_bound.fRadius < 1.0e6f) || !std::isfinite(a_bound.center.x) || !std::isfinite(a_bound.center.y) || !std::isfinite(a_bound.center.z)) {
+				return false;
+			}
+			const auto& camera = a_context.snapshot->camera;
+			if (!camera.viewSpace) {
+				return false;
+			}
+			const float dx = a_bound.center.x - camera.origin[0];
+			const float dy = a_bound.center.y - camera.origin[1];
+			const float dz = a_bound.center.z - camera.origin[2];
+			const float z = dx * camera.viewDir[0] + dy * camera.viewDir[1] + dz * camera.viewDir[2];
+			const float x = dx * camera.viewRight[0] + dy * camera.viewRight[1] + dz * camera.viewRight[2];
+			const float y = dx * camera.viewUp[0] + dy * camera.viewUp[1] + dz * camera.viewUp[2];
+			return SphereOutsideView(a_context, x, y, z, a_bound.fRadius + a_context.dilateMove + std::max(z, 0.0f) * a_context.angularSlack);
+		}
+
+		// A node's walk for the trace (v2.0): none, its entries the tracer doesn't know (a node it knows, on its turn), all.
+		enum TraceWalk : std::uint8_t
+		{
+			kTraceWalkNone,
+			kTraceWalkNew,
+			kTraceWalkAll
+		};
+
+		// One entry of a walked node. a_group1: the engine's route for it. a_trace: the node is walked for the trace this
+		// frame (kTraceWalkAll: every entry takes the full path). a_site: the engine site the add would have come from (the
+		// audit). a_resumed: its cluster was left out whole since its last walk (a fade node's turn is made up).
+		void WalkEntry(const FrameContext& a_context, RE::NiAVObject* a_object, WalkSlot& a_slot, bool a_group1, std::uint8_t a_trace, std::uintptr_t a_site, std::uint16_t a_loop, bool a_resumed)
+		{
+			const bool full = a_trace == kTraceWalkAll;
+			Bump(kWalkEntries);
+			const auto  group = Hooks::CullGroups::WalkGroup(a_group1);
+			const auto  kind = a_group1 ? Hooks::CullGroups::GroupKind::kMainOnly : Hooks::CullGroups::GroupKind::kSunShared;
+			const auto& bound = a_object->worldBound;
+			Hooks::CullGroups::NoteEntryOffered(group, a_object, a_site);
+			// (a move the pruning scan found this frame counts here too: the scan wrote the slot's bound before the walk)
+			const bool scanMoved = a_slot.scanChanged;
+			a_slot.hold = static_cast<std::uint8_t>(scanMoved ? (a_slot.hold & kHoldMoved) : 0);
+			a_slot.scanChanged = false;
+			a_slot.kind = static_cast<std::uint8_t>((a_slot.kind & ~kSlotGroup1) | (a_group1 ? kSlotGroup1 : 0));
+			const bool moved = NoteSlotBound(a_slot, bound) || scanMoved;
+			if (!UsableBound(bound)) {
+				a_slot.hold |= kHoldBad;
+			}
+			// (v1.99: the group's own marker bytes first, then the entry's block: MarkerPending reads the entry's vtable, the one
+			// line of it the walk's prefetch doesn't fetch, for a marker that is almost never pending)
+			if (Hooks::CullGroups::MarkerPendingAny(group) && Hooks::CullGroups::MarkerPending(group, a_object)) {
+				Bump(kWalkMarkerFiled);
+				a_slot.hold |= kHoldMarker;
+				if (Recorder::On()) {
+					Recorder::NoteEntry(Recorder::Origin::kWalkMarker, a_object, bound, static_cast<std::uint8_t>(kind), static_cast<std::uint16_t>((moved ? RecorderFormat::kMoved : 0) | (a_group1 ? RecorderFormat::kGroup1 : 0)), a_loop);
+				}
+				Hooks::CullGroups::AddDirect(group, a_object, &bound, 0);  // (as GroupAdd files it: the Block::Add filter judges it)
+				return;
+			}
+			const auto epoch = static_cast<std::uint8_t>(a_context.clock / kEpochFrames);
+			if (!(a_slot.kind & kSlotClassified) || a_slot.epoch != epoch) {
+				// (once per epoch: the type's table, the reference's form type, the shader property: a miss or two each)
+				std::uint8_t kinds = kSlotClassified;
+				if (TypeOf(a_object) & kTypeLight) {
+					kinds |= kSlotLight;
+				}
+				if (IsActorRoot(a_object)) {
+					kinds |= kSlotActor;
+				}
+				if (Hooks::CullGroups::IsSky(a_object)) {
+					kinds |= kSlotSky;
+				}
+				if (g_tunables.stableIndex && IsScolReference(a_object)) {
+					kinds |= kSlotScolRoot;
+				}
+				a_slot.kind = static_cast<std::uint8_t>((a_slot.kind & (kSlotContainerKnown | kSlotContainer | kSlotGroup1)) | kinds);
+				a_slot.epoch = epoch;
+			}
+			const bool alwaysDraw = (a_object->GetFlags() >> 11) & 1;
+			const bool light = (a_slot.kind & kSlotLight) != 0;
+			const bool sky = (a_slot.kind & kSlotSky) != 0;
+			const bool player = PlayerPart(a_context, a_object, bound);
+			a_slot.hold |= static_cast<std::uint8_t>((alwaysDraw ? kHoldAlwaysDraw : 0) | (light ? kHoldLight : 0) | ((a_slot.kind & kSlotActor) ? kHoldActor : 0) | (sky ? kHoldSky : 0) | (player ? kHoldPlayer : 0));
+			if (!full && !moved && !alwaysDraw && !light && !LeftOutFrame(a_context.clock) && EntryOutside(a_context, bound) &&
+				ShadowBeyondReach(a_context, bound) && !SpotLampMayNeed(a_context, nullptr, bound) &&
+				!(TraceFeed::On() && (a_trace == kTraceWalkNew ? !TraceFeed::Known(a_object) : TraceTurnDue(a_object, a_context.clock)) && TraceFeed::InReach(bound, a_context.eye)) &&
+				!player && !sky) {
+				Bump(kWalkSkipped);
+				if (Recorder::On()) {
+					Recorder::NoteEntry(Recorder::Origin::kWalkSkipped, a_object, bound, static_cast<std::uint8_t>(kind), static_cast<std::uint16_t>(RecorderFormat::kLeftOut | (a_group1 ? RecorderFormat::kGroup1 : 0)), a_loop);
+				}
+				if (g_tunables.keepFadeState) {
+					KeepFadeSeen(a_object, a_context.clock, a_resumed);  // (as the top-level decision does for an entry out of view)
+				}
+				return;
+			}
+			Bump(kWalkOffered);
+			PrefetchEntry(a_object);  // (the verdict path's streak backup and classification look its history entry up; v1.98)
+			if (Recorder::On()) {
+				Recorder::SetWalkSite(a_loop, static_cast<std::uint16_t>((moved ? RecorderFormat::kMoved : 0) | (full ? RecorderFormat::kTraceTurn : 0) | (alwaysDraw ? RecorderFormat::kAlwaysDraw : 0)));
+			}
+			// (its collection root, known when the reference was read: a root, or a reference to something else)
+			const auto scol = static_cast<std::uint8_t>((a_slot.kind & kSlotScolRoot) ? (kKnownScolChecked | kKnownScolRoot) : (g_tunables.stableIndex && a_object->userData) ? kKnownScolChecked : 0);
+			t_decisionGroup = group;
+			const bool skipped = SkipTopLevelImpl(a_object, &bound, kind, static_cast<std::uint8_t>(kKnownClassified | (player ? kKnownPlayer : 0) | (sky ? kKnownSky : 0) | scol));
+			t_decisionGroup = nullptr;
+			if (TraceFeed::Linked() && TraceFeed::LastHanded() == a_object) {
+				a_slot.handed = true;  // (a GONE record when it leaves the slot)
+			}
+			if (Recorder::On()) {
+				Recorder::SetWalkSite(0, 0);  // (consumed by its note, or dropped with a decision that made none)
+			}
+			if (skipped) {
+				return;
+			}
+			Bump(kWalkFiled);
+			Hooks::CullGroups::AddDirect(group, a_object, &bound, 0);
+		}
+
+		bool SkipCellNode(RE::NiAVObject* a_node, std::uint32_t a_index);
+
+		// The node's entries, in the engine's order and by its rules. False: the engine walks the node after all.
+		bool WalkNodeEntries(const FrameContext& a_context, RE::NiAVObject* a_node, std::uint32_t a_index)
+		{
+			using Hooks::PrevisFeed::Site;
+			const auto root = a_node->IsNode();
+			if (!root) {
+				return false;
+			}
+			const bool roots = a_index == Hooks::CullGroups::kRootIndex;
+			if (roots && ((a_node->GetFlags() >> 14) & 1) && a_node->IsFadeNode()) {
+				Bump(kWalkFadeRoots);
+				return false;  // (the engine files such a root whole into the group array)
+			}
+			const bool containers = a_index == 3;                                   // a cell's node 3: exact-NiNode children are containers (R3c)
+			const bool testCulled = a_index != Hooks::CullGroups::kContainerIndex;  // (a container's members get no AppCulled test, R3c)
+			const auto site = Hooks::PrevisFeed::SiteAddress(roots ? Site::kR4Child : testCulled ? Site::kR3d : Site::kR3c);
+			const bool traceWalk = t_traceNode.node && t_traceNode.clock == a_context.clock && (a_node == t_traceNode.node || a_node->parent == t_traceNode.node);
+			const bool full = traceWalk && t_traceNode.all;
+			const auto trace = static_cast<std::uint8_t>(full ? kTraceWalkAll : traceWalk ? kTraceWalkNew : kTraceWalkNone);
+			const auto loop = static_cast<std::uint16_t>(roots ? 255 : a_index == Hooks::CullGroups::kContainerIndex ? 254 : a_index);  // (the recorder's site code)
+			const auto& children = root->children;
+			const auto  count = Util::UsedSlots(children);  // (the engine's bound, not size(): v1.92.11)
+			auto&       cache = NodeCacheOf(root, count, a_context.clock);
+			const bool  leases = g_tunables.walkLeases && !full && !LeftOutFrame(a_context.clock);
+			const auto  group0 = Hooks::CullGroups::WalkGroup(false);
+			const auto  group1 = Hooks::CullGroups::WalkGroup(true);
+			// (v1.99.3: a cluster's child pointers and slots are fetched a cluster ahead; the slot reads were the walk's largest
+			// stall in the v1.99.2 profile, ~9% of CBRO.dll's cull-stage samples)
+			const auto fetchCluster = [&](std::size_t a_first) {
+				const auto end = std::min(a_first + kClusterSlots, static_cast<std::size_t>(count));
+				for (auto i = a_first; i < end; i += 8) {
+					_mm_prefetch(reinterpret_cast<const char*>(&children[static_cast<std::uint16_t>(i)]), _MM_HINT_T0);
+				}
+				for (auto i = a_first; i < end; i += 2) {
+					_mm_prefetch(reinterpret_cast<const char*>(&cache.slots[i]), _MM_HINT_T0);
+				}
+			};
+			fetchCluster(0);
+			for (std::size_t c = 0; c < cache.clusters.size(); ++c) {
+				auto&      cluster = cache.clusters[c];
+				const auto first = c * kClusterSlots;
+				const auto last = std::min(first + kClusterSlots, static_cast<std::size_t>(count));
+				if (last < count) {
+					fetchCluster(last);
+				}
+				Bump(kWalkClusters);
+				bool dormant = leases;
+				if (dormant && !cluster.walked) {
+					Bump(kWalkClusterNotWalked);
+					dormant = false;
+				}
+				if (dormant && (cluster.hold || !(cluster.radius >= 0.0f))) {
+					Bump(cluster.members == 0 ? kWalkClusterNoMembers : (cluster.hold & kHoldMarker) ? kWalkClusterHeldMarker : (cluster.hold & ~(kHoldBad | kHoldMoved)) ? kWalkClusterHeldKind : kWalkClusterHeldBad);
+					dormant = false;
+				}
+				if (dormant && LeaseDue(a_context, cache, c, cluster)) {
+					Bump(kWalkClusterDue);
+					dormant = false;
+				}
+				if (dormant && ChildSignature(children, first, last) != cluster.children) {
+					// (the slots no longer hold the objects the sphere was built from: told by the child array alone, v1.99.1)
+					Bump(kWalkClusterSlotsChanged);
+					dormant = false;
+				}
+				if (dormant && !ClusterOutside(a_context, cluster)) {
+					Bump(kWalkClusterInView);
+					dormant = false;
+				}
+				if (dormant) {
+					const auto sphere = ClusterBound(cluster);
+					if (!ShadowBeyondReach(a_context, sphere)) {
+						Bump(kWalkClusterShadow);
+						dormant = false;
+					} else if (SpotLampMayNeed(a_context, nullptr, sphere)) {
+						Bump(kWalkClusterLamp);
+						dormant = false;
+					} else if (Hooks::CullGroups::MarkerPendingAny(group0) || (roots && Hooks::CullGroups::MarkerPendingAny(group1))) {
+						dormant = false;  // (the next entry filed must take the marker: as WalkEntry files such an entry)
+						Bump(kWalkLeaseMarkerHeld);
+					}
+				}
+				if (dormant) {
+					Bump(kWalkClustersDormant);
+					const bool traceReach = TraceFeed::On() && TraceFeed::InReach(ClusterBound(cluster), a_context.eye);
+					for (auto i = first; i < last; ++i) {
+						// (v1.99.1: the object from the child array, its kind from the cluster's masks: a slot is read only on the
+						// trace's turn or for the recorder)
+						const auto object = children[static_cast<std::uint16_t>(i)].get();
+						if (!object) {
+							continue;
+						}
+						const auto bit = static_cast<std::uint16_t>(1u << (i - first));
+						if (cluster.containers & bit) {
+							SkipCellNode(object, Hooks::CullGroups::kContainerIndex);  // (its own clusters decide)
+							continue;
+						}
+						const bool group1Route = (cluster.group1 & bit) != 0;
+						if (traceReach && (trace == kTraceWalkNew ? !TraceFeed::Known(object) : TraceTurnDue(object, a_context.clock)) &&
+							TraceFeed::InReach(SlotBound(cache.slots[i]), a_context.eye)) {
+							Bump(kWalkLeaseTraceVisits);
+							WalkEntry(a_context, object, cache.slots[i], group1Route, trace, site, loop, true);
+							continue;
+						}
+						Bump(kWalkEntries);
+						Bump(kWalkLeased);
+						Hooks::CullGroups::NoteEntryOffered(group1Route ? group1 : group0, object, site);
+						if (Recorder::On()) {
+							const auto kind = group1Route ? Hooks::CullGroups::GroupKind::kMainOnly : Hooks::CullGroups::GroupKind::kSunShared;
+							Recorder::NoteEntry(Recorder::Origin::kWalkSkipped, object, SlotBound(cache.slots[i]), static_cast<std::uint8_t>(kind), static_cast<std::uint16_t>(RecorderFormat::kLeftOut | RecorderFormat::kLeased | (group1Route ? RecorderFormat::kGroup1 : 0)), loop);
+						}
+						if (g_tunables.keepFadeState && FadeMidWay(object)) {
+							Bump(kWalkLeaseFadeVisits);
+							KeepFadeSeen(object, a_context.clock);  // (its fade runs on: the one touch a lease allows)
+						}
+					}
+					continue;
+				}
+				const bool resumed = leases && cluster.valid && a_context.clock - cluster.walkedClock > 1;
+				for (auto i = first; i < last; ++i) {
+					// (each entry's flags and bound lines are a first touch: the child a few slots ahead is fetched first)
+					if (i + kScanPrefetch < count) {
+						if (const auto ahead = reinterpret_cast<const char*>(children[static_cast<std::uint16_t>(i + kScanPrefetch)].get())) {
+							_mm_prefetch(ahead + 0x80, _MM_HINT_T0);
+							_mm_prefetch(ahead + 0x100, _MM_HINT_T0);
+						}
+					}
+					const auto object = children[static_cast<std::uint16_t>(i)].get();
+					auto&      slot = cache.slots[i];
+					if (slot.object != object) {
+						SlotLeft(slot);
+						slot = WalkSlot{};
+						slot.object = object;
+					}
+					if (!object) {
+						continue;
+					}
+					const auto flags = object->GetFlags();
+					if (testCulled && (flags & 1)) {
+						Bump(kWalkCulled);
+						SlotLeft(slot);  // (hidden from every view: gone for the tracer until shown again)
+						// AppCulled: the engine's loop skips it before anything else. Its bound is read once for its cluster's
+						// sphere (v1.98: Runtime Combiner's originals are many), never held by.
+						slot.hold = 0;
+						if (!slot.seen && UsableBound(object->worldBound)) {
+							NoteSlotBound(slot, object->worldBound);
+						}
+						continue;
+					}
+					if (containers) {
+						if (!(slot.kind & kSlotContainerKnown)) {
+							slot.kind |= static_cast<std::uint8_t>(kSlotContainerKnown | (Util::TryReadVtable(object) == g_niNodeVtable ? kSlotContainer : 0));
+						}
+						if (slot.kind & kSlotContainer) {
+							SkipCellNode(object, Hooks::CullGroups::kContainerIndex);  // (pruned whole, or its members walked here)
+							continue;
+						}
+					}
+					WalkEntry(a_context, object, slot, roots && ((flags >> 40) & 1), trace, site, loop, resumed);
+				}
+				FinishCluster(cache, c, a_context.clock, true);
+			}
+			Bump(kWalkNodes);
+			return true;
+		}
+
+		// True: CBRO walked the node (the engine skips it). Timed as a whole, once per outermost node.
+		bool WalkNode(const FrameContext& a_context, RE::NiAVObject* a_node, std::uint32_t a_index)
+		{
+			if (!Hooks::CullGroups::GroupAddHooked()) {
+				return false;
+			}
+			if (a_context.clock - g_walkSweep >= kWalkSweepFrames) {
+				g_walkSweep = a_context.clock;
+				std::erase_if(g_walkNodes, [&](auto& a_entry) {
+					if (a_context.clock - a_entry.second.clock < kWalkSweepFrames) {
+						return false;
+					}
+					CacheLeft(a_entry.second);
+					return true;
+				});
+			}
+			const bool timed = t_walkDepth == 0 && Timed(a_context);
+			const auto start = timed ? __rdtsc() : 0;
+			++t_walkDepth;
+			const bool walked = WalkNodeEntries(a_context, a_node, a_index);
+			--t_walkDepth;
+			if (timed) {
+				Bump(kCyclesEntryWalk, (__rdtsc() - start) * kTimingStride);
+			}
+			return walked;
 		}
 
 		bool SkipCellNode(RE::NiAVObject* a_node, std::uint32_t a_index)
@@ -4491,7 +6864,10 @@ namespace CBRO::Core::Occlusion
 			}
 			if (a_index == 9) {
 				Bump(kCellNodesOther);
-				return false;
+				if (Recorder::On()) {
+					Recorder::NoteNode(a_node, a_index, false, 0, 0, a_node->worldBound);
+				}
+				return g_tunables.entryWalk && WalkNode(*context, a_node, a_index);  // (never pruned whole; its entries walked by CBRO, v1.94)
 			}
 			const bool timed = Timed(*context);
 			const auto start = timed ? __rdtsc() : 0;
@@ -4523,7 +6899,21 @@ namespace CBRO::Core::Occlusion
 			} else {
 				Bump(kCellNodesSkipped);
 				Bump(kCellNodeEntriesSkipped, entries);
+				if (t_prunedFromCache) {
+					Bump(kCellNodesCached);
+					Bump(kCellNodeEntriesCached, entries);
+				}
 				skip = true;
+				if (LeftOutFrame(context->clock)) {
+					RecordPrunedEntries(*context, a_node, depth);  // (the left-out dump, v1.92.7)
+				}
+			}
+			if (Recorder::On()) {
+				// (for a node, "player" stands for an actor among its entries)
+				const auto flags = static_cast<std::uint16_t>(
+					((contents & kSubtreeAlwaysDraw) ? RecorderFormat::kAlwaysDraw : 0) | ((contents & kSubtreeActor) ? RecorderFormat::kPlayer : 0) |
+					((contents & kSubtreeLight) ? RecorderFormat::kLight : 0) | (outside ? RecorderFormat::kOutside : 0));
+				Recorder::NoteNode(a_node, a_index, skip, entries, flags, unionBound);
 			}
 			if (g_nodeSamples.load(std::memory_order_relaxed) < 8) {
 				SampleNode(a_node, a_index, contents, outside, entries, unionBound.fRadius);
@@ -4532,6 +6922,9 @@ namespace CBRO::Core::Occlusion
 				const auto cycles = (__rdtsc() - start) * kTimingStride;
 				Bump(kCycles, cycles);
 				Bump(kCyclesNodeScan, cycles);
+			}
+			if (!skip && g_tunables.entryWalk) {
+				return WalkNode(*context, a_node, a_index);  // (v1.94: the node's entries filed by CBRO itself, the engine's loop skipped)
 			}
 			return skip;
 		}
@@ -4778,10 +7171,25 @@ namespace CBRO::Core::Occlusion
 		g_tunables.spotOnlyCascadeTrim = settings.spotOnlyCascadeTrim;
 		g_tunables.scolRootBounds = settings.scolRootBounds;
 		g_tunables.keepFadeState = settings.keepFadeState;
+		g_tunables.entryWalk = settings.entryWalk && settings.cellNodePruning;
+		g_tunables.cheapChildren = settings.childCheapTests;
+		g_tunables.childInherit = settings.childInherit;
+		g_tunables.stableIndex = settings.stableIndex && settings.childInherit;
+		g_tunables.traceDirect = settings.traceDirect;
+		g_tunables.deferSunOnly = settings.deferSunOnly;
+		if (g_tunables.deferSunOnly) {
+			g_deferred.reserve(2048);
+			Hooks::PrevisFeed::SetCascadeOpenCallback(&FileDeferred);
+		}
+		g_tunables.walkLeases = settings.walkLeases && settings.entryWalk && settings.cellNodePruning;
+		g_tunables.leaseFrames = std::clamp(settings.walkLeaseFrames, 1u, 16u);
+		g_tunables.leaseMargin = std::clamp(settings.walkLeaseMargin, 0.0f, 4096.0f);
 		g_tunables.viewOverhang = settings.viewOverhang;
 		g_tunables.viewOverhangTurn = settings.viewOverhangTurn;
 		g_mergedVtable = RE::VTABLE::BSMergeInstancedTriShape[0].address();
 		g_niNodeVtable = RE::VTABLE::NiNode[0].address();
+		g_staticShapeVtables = { RE::VTABLE::BSTriShape[0].address(), RE::VTABLE::BSSubIndexTriShape[0].address(), RE::VTABLE::BSMeshLODTriShape[0].address() };
+		g_fadeVtables = { RE::VTABLE::BSFadeNode[0].address(), RE::VTABLE::BSLeafAnimNode[0].address() };
 		MeshProxy::Install();
 
 		g_table = std::make_unique<Entry[]>(kTableSize);
@@ -4795,6 +7203,8 @@ namespace CBRO::Core::Occlusion
 		Hooks::CullGroups::SetGroupFilter(&SkipTopLevel);
 		Hooks::CullGroups::SetMainViewFilter(&MainView);
 		Hooks::CullGroups::SetCellNodeFilter(&SkipCellNode);
+		logger::info("occlusion: entry walk {} (bEntryWalk={}; needs bCellNodePruning=1 and the Group::Add hook)", g_tunables.entryWalk ? "on" : "off", settings.entryWalk);
+		logger::info("occlusion: cheap child tests {} (bChildCheapTests={}): a static mesh child out of the view that no view needs is left out with no verdict", g_tunables.cheapChildren ? "on" : "off", settings.childCheapTests);
 	}
 
 	void NoteLightFlip(bool a_spot, const RE::NiPoint3& a_center, float a_radius, SphereVerdict a_verdict, SphereReason a_reason) noexcept
@@ -4856,6 +7266,16 @@ namespace CBRO::Core::Occlusion
 	void BeginFrame(const FrameContext& a_context)
 	{
 		g_mainStats = &LocalStats();  // (BeginFrame runs on the main thread)
+		Hooks::CullGroups::SetFrameEye(a_context.eye, a_context.cull && (a_context.eye[0] != 0.0f || a_context.eye[1] != 0.0f || a_context.eye[2] != 0.0f));
+		g_mainThreadId = GetCurrentThreadId();
+		ClearParentSequences();
+		if (!g_deferred.empty()) {
+			Bump(kSunOnlyDropped, g_deferred.size());  // (no cascade window last frame: never filed)
+			g_deferred.clear();
+		}
+		if (const auto scene = static_cast<const std::uint8_t*>(Hooks::CullGroups::SceneNode()); scene && scene[0x228]) {
+			Bump(kFrameLightingByte);  // (v1.94 survey: OnVisible re-queues every visible fade node's lighting while it is set)
+		}
 		g_flipClock.store(a_context.clock, std::memory_order_relaxed);  // (flip samples: a few per kind per frame)
 		for (auto& taken : g_flipTaken) {
 			taken.store(0, std::memory_order_relaxed);
@@ -4881,6 +7301,12 @@ namespace CBRO::Core::Occlusion
 			g_sunDrops.Clear();
 			g_traceForced.Clear();
 		}
+		// (the sets' presence bits for this frame's tag, before the context below publishes its clock)
+		const auto dropTag = DropSet::Tag(a_context.clock);
+		g_drops.BeginTag(dropTag);
+		g_farDrops.BeginTag(dropTag);
+		g_sunDrops.BeginTag(dropTag);
+		g_traceForced.BeginTag(dropTag);
 		MeshProxy::BeginFrame();
 
 		if (a_context.parallaxMove > 0.0f || a_context.readback) {
@@ -4931,6 +7357,36 @@ namespace CBRO::Core::Occlusion
 		SetOverhangs(a_context);
 		SetSunPlanes(a_context);
 		SetLampPlanes(a_context);
+	}
+
+	void SetKeptReasons(bool a_on) noexcept
+	{
+		g_keptReasons.store(a_on, std::memory_order_relaxed);
+	}
+
+	KeptReason LastKeptReason(const void* a_object) noexcept
+	{
+		KeptReason out{};
+		if (!g_table || !g_keptReasons.load(std::memory_order_relaxed)) {
+			return out;
+		}
+		const auto entry = PeekEntry(reinterpret_cast<std::uintptr_t>(a_object));
+		if (!entry) {
+			return out;
+		}
+		const auto reason = (entry->lamp.load(std::memory_order_relaxed) & kReasonMask) >> kReasonShift;
+		if (!(reason & 1u) || ((reason >> 10) & 0x3FFu) != (Clock() & 0x3FFu)) {
+			return out;
+		}
+		out.valid = true;
+		out.verdict = static_cast<std::uint8_t>((reason >> 1) & 7u);
+		const auto outcome = static_cast<Outcome>((reason >> 4) & 3u);
+		out.confirming = outcome == Outcome::kHidden;
+		out.exempt = outcome == Outcome::kKept && out.verdict == static_cast<std::uint8_t>(Verdict::kHidden);
+		out.shaped = ((reason >> 6) & 1u) != 0;
+		out.shapeNone = ((reason >> 7) & 1u) != 0;
+		out.parallaxKept = ((reason >> 8) & 1u) != 0;
+		return out;
 	}
 
 	void SetObserveOnly(bool a_observeOnly)
@@ -5091,8 +7547,9 @@ namespace CBRO::Core::Occlusion
 			Bump(kTableFull);
 			return LampVerdict::kNeeded;
 		}
-		const auto streak = HiddenStreak(entry->lamp.load(std::memory_order_relaxed), context->clock);
-		entry->lamp.store((static_cast<std::uint64_t>(streak) << 32) | context->clock, std::memory_order_relaxed);
+		const auto lampWord = entry->lamp.load(std::memory_order_relaxed);
+		const auto streak = HiddenStreak(lampWord, context->clock);
+		entry->lamp.store((lampWord & ~kLowBits) | (static_cast<std::uint64_t>(streak) << 32) | context->clock, std::memory_order_relaxed);  // (the high bits: the set-diff reasons)
 		return streak < g_tunables.confirmFrames ? LampVerdict::kConfirming : LampVerdict::kMisses;
 	}
 
@@ -5160,15 +7617,36 @@ namespace CBRO::Core::Occlusion
 		}
 	}
 
+	float RayWindowHitOnDepthFrame(float a_x, float a_y, float a_z, float a_radius) noexcept
+	{
+		std::scoped_lock lock(g_keptLock);
+		return g_rayCameraValid ? RayWindowHit(g_rayCamera, a_x, a_y, a_z, a_radius) : -1.0f;
+	}
+
 	namespace
 	{
+		// v1.92.10: the ray-window triangles of a left-out mesh (BruteShape), for the dump line.
+		std::string RayWindowText(const LeftOutItem& a_item)
+		{
+			if (a_item.bruteWindow == 0) {
+				return a_item.bruteRead > 0 ? std::string(" [ray window: no triangle crosses it]") : std::string{};
+			}
+			std::string text = std::format(" [ray window: {} triangles cross it, {} of them visible;", a_item.bruteWindow, a_item.bruteWindowVisible);
+			for (std::uint8_t i = 0; i < a_item.windowSamples; ++i) {
+				const auto& s = a_item.windowSample[i];
+				text += std::format(" {}: view depth {:.0f}..{:.0f} at ndc ({:.3f},{:.3f})-({:.3f},{:.3f}), farthest surface over it {:.0f}, threshold {:.0f} -> {}{}",
+					i + 1, s.zNear, s.zFar, s.ndc[0], s.ndc[1], s.ndc[2], s.ndc[3], s.farthest, s.threshold, FullVerdictName(s.verdict), i + 1 < a_item.windowSamples ? ";" : "");
+			}
+			return text + "]";
+		}
+
 		constexpr float kNearReach = 1500.0f;  // the left-out dump's and the scene scan's "near the eye" (bound within this)
 
 		void LogLeftOut(std::vector<LeftOutItem>& a_items, std::uint32_t a_clock, const HiZ::Camera* a_camera)
 		{
 			constexpr const char* kOutcomeNames[]{ "none", "out of view", "hidden", "kept" };
-			std::array<std::uint32_t, 8> byPath{};
-			std::array<std::uint32_t, 4> bySource{};
+			std::array<std::uint32_t, 9> byPath{};
+			std::array<std::uint32_t, std::size(kVerdictSourceNames)> bySource{};
 			std::map<std::string, std::uint32_t> byNow;
 			std::uint32_t checked = 0, outsideBound = 0, ownMismatch = 0;
 			const auto suspicious = [](const LeftOutItem& a_item) {
@@ -5229,7 +7707,8 @@ namespace CBRO::Core::Occlusion
 							 a_item.bruteRead == 0 ? std::string(" [brute: mesh unreadable]") :
 							 std::format(" [brute: cached {} fresh {} same {} | shape {}x{}x{} cells {} | triangles {}, in view {} (not hidden {}), in view in no occupied cell {}]",
 								 a_item.bruteCached, a_item.bruteFresh, a_item.bruteSame, a_item.bruteDims[0], a_item.bruteDims[1], a_item.bruteDims[2], a_item.bruteCount,
-								 a_item.bruteTriangles, a_item.bruteInView, a_item.bruteVisible, a_item.bruteUnoccupied)),
+								 a_item.bruteTriangles, a_item.bruteInView, a_item.bruteVisible, a_item.bruteUnoccupied)) +
+								RayWindowText(a_item),
 					a_item.ownOffset, a_item.ownRadius, vertices);
 			};
 			// First every one whose bound crosses the ray window (nearest along the rays first; may repeat below).
@@ -5242,7 +7721,7 @@ namespace CBRO::Core::Occlusion
 				}
 				std::ranges::sort(hits, [](const auto& a_left, const auto& a_right) { return a_left.first < a_right.first; });
 				logger::info("==== left out, bound crossing the ray window (NDC x {:.2f}..{:.2f}, y {:.2f}..{:.2f}, up to {:.0f} along): {} ====",
-					kRayWindow[0], kRayWindow[1], kRayWindow[2], kRayWindow[3], kRayLength, hits.size());
+					RayWindow()[0], RayWindow()[1], RayWindow()[2], RayWindow()[3], RayLength(), hits.size());
 				for (std::size_t i = 0; i < hits.size() && i < 250; ++i) {
 					line(*hits[i].second, "x");
 				}
@@ -5258,15 +7737,32 @@ namespace CBRO::Core::Occlusion
 					++printed;
 				}
 			}
-			// Then every one whose bound center lies in the middle third of the screen, nearest first.
-			printed = 0;
-			for (auto& item : a_items) {
-				if (printed >= 400) {
-					break;
+			// Then every one whose sphere reaches the view (center in front, its screen extent touching the frame), largest
+			// on screen first (v1.92.7: up to v1.92.6 the middle third of the screen nearest first, which left out a far object
+			// missing at the 2026-10-26 A/B spot).
+			{
+				std::vector<LeftOutItem*> inView;
+				for (auto& item : a_items) {
+					if (!item.object || !item.inFront || !(item.viewDepth > 0.0f)) {
+						continue;
+					}
+					const float ex = a_camera ? item.bound[3] / item.viewDepth * a_camera->scaleX : 0.0f;
+					const float ey = a_camera ? item.bound[3] / item.viewDepth * a_camera->scaleY : 0.0f;
+					if (std::abs(item.ndc[0]) - ex <= 1.0f && std::abs(item.ndc[1]) - ey <= 1.0f) {
+						inView.push_back(&item);
+					}
 				}
-				if (item.object && item.inFront && std::abs(item.ndc[0]) <= 1.0f / 3.0f && std::abs(item.ndc[1]) <= 1.0f / 3.0f) {
-					line(item, "-");
-					item.object = nullptr;
+				std::ranges::sort(inView, [](const LeftOutItem* a_left, const LeftOutItem* a_right) {
+					return a_left->bound[3] / std::max(a_left->viewDepth, 1.0f) > a_right->bound[3] / std::max(a_right->viewDepth, 1.0f);
+				});
+				logger::info("==== left out, sphere reaching the view: {} (largest on screen first, up to 400) ====", inView.size());
+				printed = 0;
+				for (auto* item : inView) {
+					if (printed >= 400) {
+						break;
+					}
+					line(*item, "-");
+					item->object = nullptr;
 					++printed;
 				}
 			}
@@ -5385,7 +7881,7 @@ namespace CBRO::Core::Occlusion
 			}
 			std::ranges::sort(scan.rayLines, [](const auto& a_left, const auto& a_right) { return a_left.first < a_right.first; });
 			logger::info("==== scene scan: meshes whose bound crosses the ray window (NDC x {:.2f}..{:.2f}, y {:.2f}..{:.2f}): {} (nearest along the rays first) ====",
-				kRayWindow[0], kRayWindow[1], kRayWindow[2], kRayWindow[3], scan.rayLines.size());
+				RayWindow()[0], RayWindow()[1], RayWindow()[2], RayWindow()[3], scan.rayLines.size());
 			for (const auto& [t, line] : scan.rayLines) {
 				logger::info("{}", line);
 			}
@@ -5617,9 +8113,24 @@ namespace CBRO::Core::Occlusion
 		const auto   recheck = part(kCyclesRecheck);
 		const auto   record = part(kCyclesRecord);
 		const auto   nodeScan = part(kCyclesNodeScan);
+		const auto mainPart = [](Counter a_counter) {
+			const auto now = g_mainStats ? g_mainStats->values[a_counter].load(std::memory_order_relaxed) : 0;
+			const auto since = now - g_mainReported[a_counter];
+			g_mainReported[a_counter] = now;
+			return since;
+		};
+		const auto   mainEvaluate = mainPart(kCyclesEvaluate);
+		const auto   mainSun = mainPart(kCyclesSun);
+		const auto   mainLookup = mainPart(kCyclesLookup);
+		const auto   mainReuse = mainPart(kCyclesReuse);
+		const auto   mainRecord = mainPart(kCyclesRecord);
+		const auto   mainNodeScan = mainPart(kCyclesNodeScan);
+		const auto   mainJudge = mainPart(kCyclesJudge);
+		const auto   mainEntryWalk = mainPart(kCyclesEntryWalk);
 		const double perMs = g_calibration.cyclesPerMs;
 		const auto   ms = [perMs](std::uint64_t a_cycles) { return perMs > 0.0 ? static_cast<double>(a_cycles) / perMs : 0.0; };
-		return { ms(delta), ms(mainDelta), ms(evaluate), ms(shape), ms(sun), ms(lookup), ms(reuse), ms(recheck), ms(record), ms(nodeScan) };
+		return { ms(delta), ms(mainDelta), ms(evaluate), ms(shape), ms(sun), ms(lookup), ms(reuse), ms(recheck), ms(record), ms(nodeScan),
+			ms(mainEvaluate), ms(mainSun), ms(mainLookup), ms(mainReuse), ms(mainRecord), ms(mainNodeScan), ms(mainJudge), ms(mainEntryWalk) };
 	}
 
 	float RejectedPerFrame() noexcept
@@ -5648,7 +8159,7 @@ namespace CBRO::Core::Occlusion
 		std::array<double, kCounterCount> delta{};
 		for (std::size_t i = 0; i < kCounterCount; ++i) {
 			if (i == kCycles || i == kCyclesEvaluate || i == kCyclesShape || i == kCyclesSun || i == kCyclesLookup || i == kCyclesReuse || i == kCyclesRecheck ||
-				i == kCyclesRecord || i == kCyclesNodeScan) {
+				i == kCyclesRecord || i == kCyclesNodeScan || i == kCyclesJudge || i == kCyclesEntryWalk) {
 				continue;  // reported by TakeTestMilliseconds
 			}
 			const auto total = Total(static_cast<Counter>(i));
@@ -5664,12 +8175,12 @@ namespace CBRO::Core::Occlusion
 		g_lastLightsRejected.store(static_cast<float>(per(kLightsRejected)));
 
 		logger::info(
-			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | the player's 3D, never judged {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f} | judged by the depth frame's edge through a view overhang of up to {:.3f}: hidden objects {:.0f}, sun shadows behind surfaces {:.0f} (evaluations, not reuses) | screen boxes widened for a near occluder's parallax {:.0f} | fade nodes left out kept seen (no fade restart) {:.0f}",
+			"occlusion per frame: tested {:.0f} | rejected {:.0f}{} | confirming {:.0f} | visible {:.0f} | kept: edge {:.0f} near {:.0f} | not in view: outside {:.0f} behind {:.0f} | hidden but exempt: type {:.0f} light {:.0f} actor {:.0f} | the player's 3D, never judged {:.0f} | invalid {:.0f} | no-context {:.0f} | table-full {:.0f} | judged by the depth frame's edge through a view overhang of up to {:.3f}: hidden objects {:.0f}, sun shadows behind surfaces {:.0f} (evaluations, not reuses) | screen boxes widened for a near occluder's parallax {:.0f} | fade nodes left out, complete, updated and counter kept on their turn (1 frame in 8 each) {:.0f} | fades run while left out, by the engine's own update (as previs's query ran OnVisible on every object visible from the camera position): updates {:.0f}, started {:.0f}, completed {:.0f}",
 			per(kTested), per(kRejected),
 			observing ? std::format(" (decide-only: would reject {:.0f})", per(kWouldReject)) : std::string{},
 			per(kConfirming), per(kVisible), per(kEdge), per(kNear), per(kOutside), per(kBehind),
 			per(kExemptType), per(kExemptLight), per(kExemptActor), per(kExemptPlayer),
-			per(kInvalid), per(kNoContext), per(kTableFull), g_tunables.viewOverhang, per(kOverhangHidden), per(kSunOverhang), per(kParallaxWidened), per(kFadeKeptSeen));
+			per(kInvalid), per(kNoContext), per(kTableFull), g_tunables.viewOverhang, per(kOverhangHidden), per(kSunOverhang), per(kParallaxWidened), per(kFadeKeptSeen), per(kFadeAdvanced), per(kFadeStarted), per(kFadeCompleted));
 		const auto sky = Hooks::CullGroups::TakeSkyCounts();
 		logger::info(
 			"occlusion merged meshes per frame: {:.0f} decided | hidden {:.0f} | confirming {:.0f} | instance tests {:.0f} | instance entries {:.0f}, rejected {:.0f} || previs-forced entries hidden {:.0f} || sky meshes given previs's force-visible mark {:.2f}, CBRO drops of them ignored {:.2f} || the player's 3D entries given it {:.1f}",
@@ -5678,8 +8189,8 @@ namespace CBRO::Core::Occlusion
 			static_cast<double>(Hooks::CullGroups::TakeForcedVisible()) / frames);
 		const auto art = Hooks::CullGroups::TakeCellArtCounts();
 		logger::info(
-			"cell art node 9 per frame (AppCulled by the engine, previs draws its chunks by id): nodes {:.2f} | children filed into group 0 {:.1f}",
-			static_cast<double>(art.nodes) / frames, static_cast<double>(art.filed) / frames);
+			"cell art node 9 per frame (AppCulled by the engine, previs draws its chunks by id): nodes {:.2f} | walked by the entry walk {:.2f} | children filed into group 0 whole {:.1f}",
+			static_cast<double>(art.nodes) / frames, static_cast<double>(art.walked) / frames, static_cast<double>(art.filed) / frames);
 		if (const auto rooms = Hooks::CullGroups::TakeOutsideRoomsCounts(); rooms.frames || rooms.roomFrames) {
 			const auto perFrame = [](std::uint64_t a_count, std::uint64_t a_frames) { return a_frames ? static_cast<double>(a_count) / static_cast<double>(a_frames) : 0.0; };
 			if (rooms.frames) {
@@ -5719,10 +8230,38 @@ namespace CBRO::Core::Occlusion
 			"trace feed per frame (Renderer Replacer's scene; {}): refused registrations handed over {:.0f} | objects left out of every view otherwise, filed for it: on their turn {:.1f}, moved {:.1f}, main-only children with them {:.1f}, cell nodes walked {:.2f} (their sun-cascade registrations count with the spot-only ones above) | of those, out of view and filed force-visible {:.1f}, their children with the mark {:.1f}",
 			TraceFeed::On() ? "on"sv : "off"sv, static_cast<double>(Hooks::CullGroups::TakeRefusedRegistrations()) / frames, per(kTraceFiled), per(kTraceMoved), per(kTraceInherited), per(kTraceCellNodes),
 			per(kTraceForced), per(kTraceForcedChildren));
-		logger::info("occlusion static collection pieces per frame (judged and filed with the collection's bound): {:.1f}", per(kScolWidened));
+		logger::info("occlusion static collection pieces per frame (judged and filed with the collection's bound): {:.1f} (the root from the cache, its parent chain checked {:.1f}; parents found in the cache with a root {:.1f}, their chain check failed {:.1f})", per(kScolWidened), per(kScolRootHits), per(kScolSlotHits), per(kScolChainFails));
 		logger::info(
-			"occlusion node pruning per frame: offered by the scene walk: cell node 3 {:.1f}, container {:.1f}; by DrawWorld's root loop {:.1f} | skipped whole {:.1f} ({:.0f} entries never filed) | walked: an entry meets the view {:.1f}, holds an always-draw entry or an actor {:.1f}, sun shadow may reach the view {:.1f} || cell node 9 seen {:.1f} (never pruned) | nodes with their own always-draw bit {:.1f}",
-			per(kCellNodesSeen), per(kContainersSeen), per(kRootsSeen), per(kCellNodesSkipped), per(kCellNodeEntriesSkipped), per(kCellNodesInView), per(kCellNodesHeld), per(kCellNodesSunNeeded), per(kCellNodesOther), per(kCellNodesAlwaysDraw));
+			"occlusion node pruning per frame: offered by the scene walk: cell node 3 {:.1f}, container {:.1f}; by DrawWorld's root loop {:.1f} | skipped whole {:.1f} ({:.0f} entries never filed), of them on their clusters' cached spheres {:.1f} ({:.0f} entries untouched, {:.1f} clusters read again on the way) | walked: an entry meets the view {:.1f}, holds an always-draw entry or an actor {:.1f}, sun shadow may reach the view {:.1f} || cell node 9 seen {:.1f} (never pruned) | nodes with their own always-draw bit {:.1f}",
+			per(kCellNodesSeen), per(kContainersSeen), per(kRootsSeen), per(kCellNodesSkipped), per(kCellNodeEntriesSkipped), per(kCellNodesCached), per(kCellNodeEntriesCached), per(kCellNodeClustersRescanned), per(kCellNodesInView), per(kCellNodesHeld), per(kCellNodesSunNeeded), per(kCellNodesOther), per(kCellNodesAlwaysDraw));
+		logger::info(
+			"entry walk per frame (bEntryWalk {}: nodes pruning can't leave out whole, walked by CBRO itself): nodes {:.1f} (fade-node roots left to the engine {:.2f}, slot caches rebuilt {:.2f}) | entries {:.0f}: left out by the cheap tests {:.0f}, offered to the top-level decision {:.0f}, of them filed {:.0f}; filed unjudged (a group marker pending) {:.1f} || leases (bWalkLeases {}, {} frames, margin {:.0f}): clusters {:.0f}, left out whole on their cached sphere {:.0f}, their entries untouched {:.0f} (visited for a fade mid-way {:.1f}, walked for the trace's turn {:.1f}); clusters walked for a pending marker {:.2f} | clusters walked, not leased: never finished by the walk {:.0f}, no entry of their own (containers only) {:.0f}, held by a bad or moved bound {:.0f}, by an always-draw, light, sky, actor or player member {:.0f}, by a marker filing {:.0f}, lease due {:.0f}, child array changed {:.0f}, sphere meets the view {:.0f}, sun shadow may reach {:.0f}, lamp may need {:.0f} | AppCulled children read {:.0f}",
+			g_tunables.entryWalk ? "on" : "off", per(kWalkNodes), per(kWalkFadeRoots), per(kWalkCachesRebuilt), per(kWalkEntries), per(kWalkSkipped), per(kWalkOffered), per(kWalkFiled), per(kWalkMarkerFiled),
+			g_tunables.walkLeases ? "on" : "off", g_tunables.leaseFrames, g_tunables.leaseMargin, per(kWalkClusters), per(kWalkClustersDormant), per(kWalkLeased), per(kWalkLeaseFadeVisits), per(kWalkLeaseTraceVisits), per(kWalkLeaseMarkerHeld),
+			per(kWalkClusterNotWalked), per(kWalkClusterNoMembers), per(kWalkClusterHeldBad), per(kWalkClusterHeldKind), per(kWalkClusterHeldMarker), per(kWalkClusterDue), per(kWalkClusterSlotsChanged), per(kWalkClusterInView), per(kWalkClusterShadow), per(kWalkClusterLamp), per(kWalkCulled));
+		logger::info("stable-index decisions per frame (bStableIndex {}): node decisions recorded in filing order {:.0f} | children's decision parents found by the cursor {:.0f}; not found: never recorded {:.1f} (no scan), recorded but not ahead of the cursor {:.1f} (the drop sets, the top table and the collection cache answered those)",
+			g_tunables.stableIndex ? "on" : "off", per(kStableRecorded), per(kStableParentHits), per(kStableParentNotRecorded), per(kStableParentOutOfOrder));
+		logger::info("trace handover per frame (bTraceDirect {}, bDeferSunOnly {}): entries filed for the trace alone handed over directly {:.1f}, with {:.0f} pieces | sun-only drops held back from the main view {:.1f}, their pieces handed {:.0f} (not again: the tracer keeps them {:.1f}); filed for the cascades in their window {:.1f}, never filed (no window) {:.2f}",
+			g_tunables.traceDirect ? "on" : "off", g_tunables.deferSunOnly ? "on" : "off", per(kTraceHanded), per(kTraceHandedPieces), per(kSunOnlyDeferred), per(kSunOnlyHandedPieces), per(kSunOnlyKnown), per(kSunOnlyFiledLate), per(kSunOnlyDropped));
+		{
+			const auto link = TraceFeed::TakeCounts();
+			const auto perCount = [&](std::uint64_t a_value) { return static_cast<double>(a_value) / frames; };
+			logger::info("trace link per frame (v2: {}): left out on their turn, the tracer keeping them {:.0f} | movers held back past its mover radius {:.1f} | pieces filed for the trace alone handed through the link {:.1f} | entries handed that left their slot (GONE) {:.2f} || records: take {:.1f}, moved {:.1f}, gone {:.2f}; read by the tracer {:.1f}, lost unread {} | the tracer's forget calls {:.2f} ({:.2f} known entries forgotten), table cleared {}",
+				TraceFeed::Linked() ? "the tracer keeps what it is handed, through the direct link"sv : TraceFeed::Retains() ? "the tracer keeps what it is handed, through the refused callback"sv : TraceFeed::On() ? "off: the tracer asks every turn"sv : "off"sv,
+				per(kTraceKnownSkipped), per(kTraceMoverHeld), per(kTraceChildHanded), per(kTraceGone), perCount(link.records[CBRO_TRACE_TAKE]), perCount(link.records[CBRO_TRACE_MOVED]),
+				perCount(link.records[CBRO_TRACE_GONE]), perCount(link.read), link.lost, perCount(link.forgetCalls), perCount(link.forgotten), link.cleared);
+		}
+		const auto sampled = [&](Counter a_counter) { return per(a_counter) * kFadeStampFrames; };
+		logger::info(
+			"top-level fade nodes per frame (survey, 1 node in {} sampled, scaled): offered {:.0f} | let through {:.0f}, their geometry records {:.0f} (their ChildPush adds), with one record {:.0f} | past the far fade range: fade still running out {:.0f}, flag bit 15 set {:.0f}, at fade 0 (no mesh of them filed) {:.0f}, of which let through {:.0f} with {:.0f} records | lighting re-queued among the let-through (OnVisible: flag bit 33 {:.0f}, of them filed force-visible for the trace or as the player's {:.0f}; mid-fade {:.0f}, force-visible {:.0f}, fading in {:.0f} (radius >= 600, no snap rule {:.0f}; stamped last frame {:.0f}, left out meanwhile {:.0f}; actors {:.0f}); bit 51 never {:.0f}) | frames with the scene node's lighting byte +0x228 set {:.0f}% || fade-in starts (let through at fade 0, bit 37 clear): frame counter over 20 frames old {:.0f} (near: snapped to 1 {:.0f}) | stamped within 20 frames {:.0f} (by OnVisible last frame {:.0f}, 2-20 frames ago {:.0f}; near: fade in from 0 on screen {:.0f})",
+			kFadeStampFrames, sampled(kFadeTopOffered), sampled(kFadeTopKept), sampled(kFadeTopKeptEntries), sampled(kFadeTopKeptOne),
+			sampled(kFadeTopFadingOut), sampled(kFadeTopPastFarBit15), sampled(kFadeTopFaded), sampled(kFadeTopFadedKept), sampled(kFadeTopFadedKeptEntries),
+			sampled(kFadeTopLightingBit33), sampled(kFadeTopLightingBit33Forced), sampled(kFadeTopMidFade), sampled(kFadeTopMidFadeForced), sampled(kFadeTopMidFadeIn), sampled(kFadeTopMidFadeInBig), sampled(kFadeTopMidFadeInContinuous), sampled(kFadeTopMidFadeInResumed), sampled(kFadeTopMidFadeInActor), sampled(kFadeTopNoLighting), 100.0 * per(kFrameLightingByte),
+			sampled(kFadeStartUnseen), sampled(kFadeStartUnseenNear), sampled(kFadeStartSeenLast) + sampled(kFadeStartSeenRecent), sampled(kFadeStartSeenLast), sampled(kFadeStartSeenRecent), sampled(kFadeStartSeenNear));
+		g_fadeStartSamples.store(0, std::memory_order_relaxed);
+		logger::info(
+			"Block::Add entries per frame not decided at the top level (the engine's child pushes, and unjudged filings; 1 in 32 sampled, scaled): under a fade node {:.0f} | under a chunk container (exact NiNode) {:.0f} | under another node {:.0f} || left out by the cheap tests alone (a static mesh out of the view, no verdict): no view needs it {:.0f} | out of the main view, left to the engine's frustum test {:.0f} || decided with their kept top entry (the same bound, or a small entry; bChildInherit) {:.0f} (reached through the fade node filing them {:.0f}) | dropped or forced with the fade node filing them, their parent one of its sub-nodes {:.0f}",
+			per(kChildOfFade), per(kChildOfNode), per(kChildOther), per(kChildCheapRejected), per(kChildCheapOutside), per(kChildInherited), per(kChildInheritedFade), per(kChildFadeDecided));
 		logger::info("Group::Add callers of the main-pass top-level adds considered: {}", Hooks::CullGroups::TakeGroupAddSites(frames));
 		logger::info(
 			"occlusion lamp shadow volumes per frame (casters of point lights): outside the view {:.0f} | misses every visible surface {:.0f} | confirming {:.0f} | needed {:.0f} | unknown {:.0f}",

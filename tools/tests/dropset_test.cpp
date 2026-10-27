@@ -4,7 +4,9 @@
 //  2. concurrent inserts from many threads, with duplicates and concurrent lookups, lose nothing and
 //     never store an object twice in one frame;
 //  3. a full neighbourhood makes Insert fail, and a failed object is never reported as present;
-//  4. Clear() at the tag wrap forgets a stale tag that would otherwise alias.
+//  4. Clear() at the tag wrap forgets a stale tag that would otherwise alias;
+//  5. the presence bits (BeginTag) never hide an object: inserts before BeginTag, a repeated BeginTag,
+//     and lookups without one all fall back to the table.
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +47,9 @@ int main()
 		std::uint64_t inserted = 0, full = 0;
 		for (std::uint32_t clock = 1; clock <= 2000; ++clock) {
 			const auto tag = DropSet::Tag(clock);
+			if (clock % 5) {
+				set.BeginTag(tag);  // (one frame in five without: the table alone answers)
+			}
 			std::unordered_set<std::uint64_t> in;
 			const int count = 500 + static_cast<int>(rng() % 12000);  // up to ~12.5k drops a frame
 			for (int k = 0; k < count; ++k) {
@@ -80,6 +85,7 @@ int main()
 		constexpr int kThreads = 12;
 		for (std::uint32_t clock = 1; clock <= 300; ++clock) {
 			const auto tag = DropSet::Tag(clock);
+			set.BeginTag(tag);
 			std::vector<std::vector<std::uint64_t>> work(kThreads);
 			std::vector<std::uint64_t>             all;
 			for (int i = 0; i < 9000; ++i) {
@@ -172,6 +178,32 @@ int main()
 			CHECK(DropSet::Tag(c) >= 1 && DropSet::Tag(c) <= DropSet::kTagMask, "tag %u out of range\n", DropSet::Tag(c));
 		}
 		std::printf("4. tag wrap: stale tag forgotten by Clear()\n");
+	}
+
+	// ---- 5. presence bits ---------------------------------------------------------------------------------
+	{
+		DropSet set;
+		set.Allocate();
+		const auto a = Obj(0x5'0000'0010ull);
+		const auto b = Obj(0x5'0000'0020ull);
+		const auto tag = DropSet::Tag(9);
+		set.Insert(a, tag);  // before BeginTag
+		set.BeginTag(tag);
+		set.Insert(b, tag);
+		CHECK(set.Contains(a, tag), "insert before BeginTag lost\n");
+		CHECK(set.Contains(b, tag), "insert after BeginTag lost\n");
+		const auto next = DropSet::Tag(10);
+		set.BeginTag(next);
+		set.Insert(a, next);
+		set.BeginTag(next);  // repeated: must not clear
+		CHECK(set.Contains(a, next), "repeated BeginTag cleared the bits\n");
+		CHECK(set.Contains(b, tag), "the other parity's bits changed\n");  // (a's slot now holds the newer tag)
+		int present = 0;
+		for (std::uint64_t k = 1; k <= 1000; ++k) {
+			present += set.Contains(Obj(0x6'0000'0000ull + k * 16), next) ? 1 : 0;
+		}
+		CHECK(present == 0, "absent objects reported present: %d\n", present);
+		std::printf("5. presence bits: early inserts, repeated BeginTag, parities\n");
 	}
 
 	std::printf(g_failures ? "FAILED: %d check(s)\n" : "all checks passed\n", g_failures);
