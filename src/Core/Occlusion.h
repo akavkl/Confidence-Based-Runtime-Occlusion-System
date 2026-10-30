@@ -235,6 +235,8 @@ namespace CBRO::Core::Occlusion
 	void                      CountLampVerdict(LampVerdict a_verdict) noexcept;  // for the stats (per-thread counters)
 	// Whether an object is the player's third-person 3D or lies under it (never left out of a view with bCullPlayer=0).
 	[[nodiscard]] bool IsPlayerPart(const RE::NiAVObject* a_object, const RE::NiBound& a_bound) noexcept;
+	// Whether an object is an actor's 3D root or lies under one (a parent walk of up to 32 nodes).
+	[[nodiscard]] bool IsActorPart(const RE::NiAVObject* a_object) noexcept;
 
 	[[nodiscard]] std::uint32_t Clock() noexcept;         // advances once per culled frame
 	[[nodiscard]] bool          Deciding() noexcept;      // observe-only (config or diagnostic): decide but never hide

@@ -41,6 +41,29 @@ namespace CBRO::Core::ShadowLights
 		constexpr std::uint64_t kSeenFlag = std::uint64_t{ 1 } << 42;
 		constexpr std::uint64_t kAlwaysDrawFlag = std::uint64_t{ 1 } << 11;
 		constexpr std::uint64_t kPreProcessedFlag = std::uint64_t{ 1 } << 26;
+		// Which face of a two-face lamp a caster goes into (Ghidra 2026-10-30, FO4-ENGINE-NOTES 6.2): the engine's test
+		// TestParabolicCulling (580593, 0x142977950; the light's sphere, then the plane through the lamp along face 0's
+		// direction, culler +0x1B0 normal / +0x1BC constant) returns 0 (outside the sphere), 1 (face 0 only: the bound lies
+		// wholly in front of the plane) or, with a back face (culler +0x1A8), 3 (both faces) for everything else: wholly
+		// behind included. Slot 27 (873832) files codes 1 and 3 into face 0 (+0x190) and 2 and 3 into face 1, but no code 2
+		// is ever returned. Face 0 keeps only what lies in front of that plane (RENDER_SHADOWMAP_PB: TEXCOORD1.z = sign x
+		// view z x 0.5 + 0.5, its pixel shader discards below 0.5; face 1 is the same camera mirrored, sign -1), so a caster
+		// wholly behind is drawn into face 0 only to have every pixel discarded. The test's two call sites: DoParabolicCulling
+		// (780925) +0x17 and slot 0x19 (1540567) +0x115 (its compound-frustum branch). Lamps with one face (no back) keep
+		// the engine's codes.
+		constexpr std::uint64_t kFaceTestID = 580593;
+		constexpr std::uint64_t kDoParabolicCullingID = 780925;
+		constexpr std::uint64_t kProcessObjectID = 1540567;
+		constexpr std::size_t   kFaceTestSiteDo = 0x17;
+		constexpr std::size_t   kFaceTestSiteCompound = 0x115;
+		constexpr std::size_t   kFacePlaneOffset = 0x1B0;         // NiPlane: normal, constant
+		constexpr std::size_t   kBackAccumulatorOffset = 0x1A8;
+		constexpr std::int32_t  kFaceBoth = 3;
+		constexpr std::int32_t  kFaceBackOnly = 2;
+		// World units a bound must lie behind the plane: far above the float error of the plane distance at world
+		// coordinates (~0.02), negligible as a caster size.
+		constexpr float kBehindMargin = 1.0f;
+
 		// Shadow filtering reaches this far around a lookup (a generous 5 degrees seen from the light, plus a
 		// little): a caster within it of a visible point's light segment may still darken that point.
 		constexpr float kFilterSlope = 0.0875f;
@@ -160,6 +183,8 @@ namespace CBRO::Core::ShadowLights
 			std::uint32_t        skippedAlwaysDraw{ 0 };   // flag bit 11: the engine passes it untested
 			std::uint32_t        skippedPreProcessed{ 0 }; // flag bit 26 with the culler's +0x11E clear: bit 39 decides
 			std::uint32_t        outsideReach{ 0 };        // outside the light's culling sphere: the engine's own test fails it
+			bool                 cached{ false };          // Renderer Replacer keeps this lamp's shadow faces (LampCached)
+			std::uint32_t        keptCached{ 0 };          // ... casters kept untested for it
 		};
 		thread_local Region t_region{};
 		bool                g_volumes{ true };  // bLampShadowVolumes
@@ -174,7 +199,16 @@ namespace CBRO::Core::ShadowLights
 		std::atomic<std::uint64_t> g_casterSkippedMode{ 0 };
 		std::atomic<std::uint64_t> g_casterSkippedAlwaysDraw{ 0 };
 		std::atomic<std::uint64_t> g_casterSkippedPreProcessed{ 0 };
+		std::atomic<std::uint64_t> g_cachedLights{ 0 };      // point lights Renderer Replacer keeps the faces of
+		std::atomic<std::uint64_t> g_casterKeptCached{ 0 };  // ... casters kept untested for them
 		std::atomic<std::uint64_t> g_casterOutsideReach{ 0 };
+		// Face routing (bLampFaceRouting): the face test's previous call targets and its counts.
+		using FaceTestFn = std::int32_t (*)(void*, const RE::NiBound*);
+		std::uintptr_t             g_faceTestDo{ 0 };
+		std::uintptr_t             g_faceTestCompound{ 0 };
+		bool                       g_faceRouting{ false };
+		std::atomic<std::uint64_t> g_faceBoth{ 0 };      // codes 3 of two-face lamps
+		std::atomic<std::uint64_t> g_faceBackOnly{ 0 };  // ... wholly behind face 0's plane: face 1 only
 		// The point lights' culls (Process(camera) with the engine's traversal inside), timed (v1.54): limited to the view
 		// (the per-object test runs), emptied (all-fail), and the rest (left to the engine).
 		std::atomic<std::int64_t>  g_cullTicks[3]{};
@@ -485,6 +519,31 @@ namespace CBRO::Core::ShadowLights
 			return true;
 		}
 
+		// Renderer Replacer's lamp shadow cache, through its export (the direct link, bLampKeepCached): whether it keeps
+		// the shadow faces of the lamp at this position across frames. Such a face draws its static casters from kept
+		// depth, so leaving one out for the view saves nothing, and a caster left out in one frame and back in the next
+		// (the shadow-volume test against a depth the upscaler jitters every frame flips at silhouettes) changes the
+		// face's casters, which makes it draw its kept depth again. Without Renderer Replacer (or an older one) false.
+		bool g_keepCached{ true };
+
+		bool LampCached(const RE::NiPoint3& a_lamp) noexcept
+		{
+			using KeptFn = bool (*)(const float*);
+			static const KeptFn kept = [] {
+				const auto module = GetModuleHandleW(L"ShaderReplacer.dll");
+				const auto fn = module ? reinterpret_cast<KeptFn>(GetProcAddress(module, "SR_LampShadowKept")) : nullptr;
+				logger::info("shadow lights: Renderer Replacer's lamp shadow cache {}", fn ? "found (SR_LampShadowKept): lamps it keeps keep their casters (actors still judged)" :
+				                                                                  module ? "not offered by this ShaderReplacer.dll (no SR_LampShadowKept)" :
+				                                                                           "absent (no ShaderReplacer.dll)");
+				return fn;
+			}();
+			if (!g_keepCached || !kept) {
+				return false;
+			}
+			const float position[3]{ a_lamp.x, a_lamp.y, a_lamp.z };
+			return kept(position);
+		}
+
 		// Where this light's casters can shadow a visible point: the view cone (Occlusion, this frame) with
 		// its planes pushed out until they hold the light, by the filter's reach, and by the camera's movement
 		// since the cone was measured. False if the view or the light's sphere isn't known.
@@ -576,6 +635,7 @@ namespace CBRO::Core::ShadowLights
 			float                push{ 0.0f };
 			RE::NiPoint3         lamp{};
 			float                reach{ 0.0f };
+			bool                 cached{ false };  // Renderer Replacer keeps this light's shadow face (LampCached)
 		};
 		SpotRegion g_spotRegion;
 		bool       g_spotTrim{ true };  // bSpotCasterTrim
@@ -590,6 +650,8 @@ namespace CBRO::Core::ShadowLights
 			std::uint64_t volumeConfirming{ 0 };  // kept: the volume misses, not yet for confirmFrames frames
 			std::uint64_t alwaysDraw{ 0 };        // kept untested (flag bit 11: the bound may not be maintained)
 			std::uint64_t unreadable{ 0 };
+			std::uint64_t cachedLights{ 0 };      // judged lights Renderer Replacer keeps the face of
+			std::uint64_t keptCached{ 0 };        // ... their casters kept untested
 		};
 		SpotCasterStats g_spotCasterStats;
 
@@ -664,6 +726,10 @@ namespace CBRO::Core::ShadowLights
 				++stats.alwaysDraw;
 				return false;
 			}
+			if (g_spotRegion.cached && !Occlusion::IsActorPart(a_object)) {
+				++stats.keptCached;
+				return false;
+			}
 			bool       volumeRan = false;
 			auto       verdict = Occlusion::LampVerdict::kUnknown;
 			const auto fate = JudgeCaster(g_spotRegion.cone, g_spotRegion.push, g_spotRegion.lamp, g_spotRegion.reach, const_cast<RE::NiAVObject*>(a_object), bound, volumeRan, verdict);
@@ -717,6 +783,7 @@ namespace CBRO::Core::ShadowLights
 			Region       region{};
 			const bool   active = a_camera && a_scene && MakeRegion(a_self, a_camera, region);
 			if (active) {
+				region.cached = LampCached(region.lamp);
 				t_region = region;
 				const auto mode = *reinterpret_cast<const std::uint32_t*>(static_cast<const std::byte*>(a_self) + kCullModeOffset);
 				g_regionModes[mode == 0 ? 0 : mode == 3 ? 1 : mode == 4 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
@@ -731,8 +798,49 @@ namespace CBRO::Core::ShadowLights
 				g_casterSkippedAlwaysDraw.fetch_add(t_region.skippedAlwaysDraw, std::memory_order_relaxed);
 				g_casterSkippedPreProcessed.fetch_add(t_region.skippedPreProcessed, std::memory_order_relaxed);
 				g_casterOutsideReach.fetch_add(t_region.outsideReach, std::memory_order_relaxed);
+				g_cachedLights.fetch_add(t_region.cached, std::memory_order_relaxed);
+				g_casterKeptCached.fetch_add(t_region.keptCached, std::memory_order_relaxed);
 			}
 			t_region = saved;
+		}
+
+		// The engine's face test, then: a caster it files into both faces of a two-face lamp goes into face 1 only when its
+		// bound lies wholly behind face 0's plane (a NaN distance keeps both). CBRO frames only (previs mode: untouched).
+		template <std::uintptr_t* Previous>
+		std::int32_t FaceTestThunk(void* a_culler, const RE::NiBound* a_bound)
+		{
+			const auto code = reinterpret_cast<FaceTestFn>(*Previous)(a_culler, a_bound);
+			if (code != kFaceBoth || !g_faceRouting || !Occlusion::Active()) {
+				return code;
+			}
+			const auto base = static_cast<const std::byte*>(a_culler);
+			if (!*reinterpret_cast<const std::uintptr_t*>(base + kBackAccumulatorOffset)) {
+				return code;
+			}
+			g_faceBoth.fetch_add(1, std::memory_order_relaxed);
+			const auto* plane = reinterpret_cast<const float*>(base + kFacePlaneOffset);
+			const float along = plane[0] * a_bound->center.x + plane[1] * a_bound->center.y + plane[2] * a_bound->center.z - plane[3];
+			if (along + a_bound->fRadius < -kBehindMargin) {
+				g_faceBackOnly.fetch_add(1, std::memory_order_relaxed);
+				return kFaceBackOnly;
+			}
+			return code;
+		}
+
+		// Wraps one call of the face test; the previous target is stored before the site is written (a cull may run).
+		bool WrapFaceSite(std::uint64_t a_function, std::size_t a_offset, std::uintptr_t& a_previous, std::uintptr_t a_thunk, const char* a_name)
+		{
+			const auto site = CBRO::Engine::OG(a_function).address() + a_offset;
+			const auto current = Util::ReadCall5Target(site);
+			if (!current) {
+				logger::error("shadow lights: {} site {} is not a call rel32; the engine's face test stays", a_name, Util::DescribeCodeAddress(site));
+				return false;
+			}
+			if (current != CBRO::Engine::OG(kFaceTestID).address()) {
+				logger::info("shadow lights: {} site {} calls {} (not the engine's function directly); chained", a_name, Util::DescribeCodeAddress(site), Util::DescribeCodeAddress(current));
+			}
+			a_previous = current;
+			return Util::WriteCall5(site, a_thunk, a_name) != 0;
 		}
 
 		void ProcessObject(void* a_self, RE::NiAVObject* a_object)
@@ -754,6 +862,8 @@ namespace CBRO::Core::ShadowLights
 					// The engine's own first test (TestParabolicCulling) fails it: left to the engine, uncounted as CBRO's
 					// (v1.53 ran its own test first, on every object of the scene graph, and counted these as its drops).
 					++t_region.outsideReach;
+				} else if (t_region.cached && !Occlusion::IsActorPart(a_object)) {
+					++t_region.keptCached;  // (Renderer Replacer keeps this lamp's faces: left to the engine)
 				} else {
 					++t_region.tests;
 					bool       volumeRan = false;
@@ -1192,6 +1302,8 @@ namespace CBRO::Core::ShadowLights
 			if (!emptied && ownCull && g_spotTrim && accumulator && (path == SpotPath::kGroup || path == SpotPath::kOwnList)) {
 				if (MakeSpotRegion(a_light, g_spotRegion)) {
 					g_spotRegion.active = true;
+					g_spotRegion.cached = LampCached(g_spotRegion.lamp);
+					g_spotCasterStats.cachedLights += g_spotRegion.cached;
 					trimming = true;
 					++g_spotCasterStats.lights;
 					Hooks::CullGroups::SetFilteredAccumulator(accumulator, &SpotCasterFilter);
@@ -1437,6 +1549,7 @@ namespace CBRO::Core::ShadowLights
 		g_confirmFrames = Settings::Get().confirmFrames;
 		g_casterCulling = Settings::Get().lampShadowCulling;
 		g_volumes = Settings::Get().lampShadowVolumes;
+		g_keepCached = Settings::Get().lampKeepCached;
 		const auto vtable = CBRO::Engine::OG(kParabolicVtableID).address();
 		g_original = Util::WriteVFuncSwitchable(g_cameraHook, vtable, kProcessCameraSlot, Util::FnAddr(&ProcessCamera), "shadowlights:BSParabolicCullingProcess::Process(cam)");
 		if (!g_original) {
@@ -1448,6 +1561,15 @@ namespace CBRO::Core::ShadowLights
 		if (!g_originalObject) {
 			logger::error("shadow lights: object hook failed; point-light casters are left to the engine");
 			g_casterCulling = false;
+		}
+		if (Settings::Get().lampFaceRouting) {
+			const bool direct = WrapFaceSite(kDoParabolicCullingID, kFaceTestSiteDo, g_faceTestDo, Util::FnAddr(&FaceTestThunk<&g_faceTestDo>), "shadowlights:parabolic face test");
+			const bool compound = WrapFaceSite(kProcessObjectID, kFaceTestSiteCompound, g_faceTestCompound, Util::FnAddr(&FaceTestThunk<&g_faceTestCompound>), "shadowlights:parabolic face test (compound frustum)");
+			g_faceRouting = direct || compound;
+			logger::info("shadow lights: casters wholly behind a two-face lamp's face-0 plane go into face 1 only: {}{}", g_faceRouting ? "on" : "unavailable",
+				direct && compound ? "" : direct ? " (not on the compound-frustum branch)" : compound ? " (compound-frustum branch only)" : " (no site wrapped)");
+		} else {
+			logger::info("shadow lights: face routing off (bLampFaceRouting=0): two-face lamps file casters as the engine does");
 		}
 		// Spot lights are recorded from BSShadowFrustumLight's Update(camera) (integer arguments and a bool return, so a
 		// C++ thunk is safe; the lamp diagnostic uses the same hook). Without it the lamp list stays incomplete and the
@@ -1577,9 +1699,9 @@ namespace CBRO::Core::ShadowLights
 			auto&      c = g_spotCasterStats;
 			const auto per = [frames](std::uint64_t a_value) { return static_cast<double>(a_value) / frames; };
 			logger::info(
-				"spot-light casters per frame (kept lights' shadow maps{}): lights judged {:.1f}, left whole {:.1f} (no view cone, or the shadow camera off the light) | offered {:.0f} | left out: outside the pushed view cone {:.0f}, shadow volume can't reach a visible surface {:.0f} | kept untested: always-draw {:.0f}, unreadable {:.0f} | volume misses still confirming {:.0f}",
+				"spot-light casters per frame (kept lights' shadow maps{}): lights judged {:.1f}, left whole {:.1f} (no view cone, or the shadow camera off the light) | offered {:.0f} | left out: outside the pushed view cone {:.0f}, shadow volume can't reach a visible surface {:.0f} | kept untested: always-draw {:.0f}, unreadable {:.0f}, Renderer Replacer keeps the light's map {:.0f} (of {:.1f} lights) | volume misses still confirming {:.0f}",
 				g_spotTrim ? "" : ", bSpotCasterTrim=0: not judged", per(c.lights), per(c.noRegion), per(c.offered), per(c.outsideCone), per(c.volume), per(c.alwaysDraw),
-				per(c.unreadable), per(c.volumeConfirming));
+				per(c.unreadable), per(c.keptCached), per(c.cachedLights), per(c.volumeConfirming));
 			c = {};
 		}
 		const auto regions = take(g_regionLights);
@@ -1599,10 +1721,17 @@ namespace CBRO::Core::ShadowLights
 		const auto limitedMs = cullMs(0, limitedCulls), emptiedMs = cullMs(1, emptiedCulls), otherMs = cullMs(2, otherCulls);
 		const auto each = [](double a_ms, double a_count) { return a_count > 0.0 ? a_ms * 1000.0 / a_count : 0.0; };
 		logger::info(
-			"shadow light casters per frame: lights limited to the view {:.1f} (inside it {:.1f}; by cull mode: 0 {:.1f}, 3 {:.1f}, 4 {:.1f}, other {:.1f}) | objects seen {:.0f}: outside the light's reach (the engine's own test) {:.0f}, tested {:.0f}, not tested as by the engine (all-pass/all-fail mode {:.0f}, always-draw {:.0f}, pre-processed {:.0f}) | left out: outside the pushed view cone {:.0f}, shadow volume can't reach a visible surface {:.0f} (with their subtrees) | point-light culls CPU per frame: limited {:.3f} ms ({:.1f} us each), emptied {:.3f} ms ({:.1f} us each), left whole {:.3f} ms ({:.1f} us each)",
+			"shadow light casters per frame: lights limited to the view {:.1f} (inside it {:.1f}; by cull mode: 0 {:.1f}, 3 {:.1f}, 4 {:.1f}, other {:.1f}) | objects seen {:.0f}: outside the light's reach (the engine's own test) {:.0f}, tested {:.0f}, not tested as by the engine (all-pass/all-fail mode {:.0f}, always-draw {:.0f}, pre-processed {:.0f}), kept untested as Renderer Replacer keeps the lamp's maps {:.0f} (of {:.1f} lights) | left out: outside the pushed view cone {:.0f}, shadow volume can't reach a visible surface {:.0f} (with their subtrees) | point-light culls CPU per frame: limited {:.3f} ms ({:.1f} us each), emptied {:.3f} ms ({:.1f} us each), left whole {:.3f} ms ({:.1f} us each)",
 			regions / frames, inside / frames, mode0, mode3, mode4, modeOther, seen / frames, take(g_casterOutsideReach) / frames, tests / frames, take(g_casterSkippedMode) / frames,
-			take(g_casterSkippedAlwaysDraw) / frames, take(g_casterSkippedPreProcessed) / frames, culled / frames, volume / frames,
+			take(g_casterSkippedAlwaysDraw) / frames, take(g_casterSkippedPreProcessed) / frames, take(g_casterKeptCached) / frames, take(g_cachedLights) / frames,
+			culled / frames, volume / frames,
 			limitedMs / frames, each(limitedMs, limitedCulls), emptiedMs / frames, each(emptiedMs, emptiedCulls), otherMs / frames, each(otherMs, otherCulls));
+		if (g_faceRouting) {
+			const auto both = take(g_faceBoth);
+			const auto backOnly = take(g_faceBackOnly);
+			logger::info("two-face lamp casters per frame: filed by the engine into both faces {:.0f}, of them wholly behind face 0's plane and filed into face 1 only {:.0f} ({:.0f}%)",
+				both / frames, backOnly / frames, both > 0.0 ? 100.0 * backOnly / both : 0.0);
+		}
 		const auto point = take(g_lampsPoint);
 		const auto spot = take(g_lampsSpot);
 		logger::info("shadow lamps recorded per frame (for group 0 with the sun off): point {:.1f} | spot {:.1f} | list overflow {}", point / frames, spot / frames, Lamps().overflow);

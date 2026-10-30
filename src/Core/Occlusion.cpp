@@ -7574,6 +7574,11 @@ namespace CBRO::Core::Occlusion
 		return context && PlayerPart(*context, a_object, a_bound);
 	}
 
+	bool IsActorPart(const RE::NiAVObject* a_object) noexcept
+	{
+		return a_object && InsideActor(a_object);
+	}
+
 	void CountLampVerdict(LampVerdict a_verdict) noexcept
 	{
 		switch (a_verdict) {

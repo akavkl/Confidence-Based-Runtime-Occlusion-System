@@ -32,6 +32,8 @@ namespace CBRO
 		bool          farCascadeTrim{ true };      // ... and leave a needed shadow out of the sun's last cascade when nothing visible lies in its slab (v1.80)
 		bool          lampShadowCulling{ true };   // leave casters out of point-light shadow maps where they can't shadow the view
 		bool          lampShadowVolumes{ true };   // ... also when their shadow volume misses every visible surface (nearest/farthest depth test)
+		bool          lampFaceRouting{ true };     // two-face lamps: a caster wholly behind face 0's plane goes into face 1 only
+		bool          lampKeepCached{ true };      // lamps whose shadow faces Renderer Replacer keeps across frames: their casters stay (actors still judged)
 		bool          spotShadowCulling{ true };   // spot lights: the shadow map draws nothing while the lit volume (shadow frustum) is hidden
 		bool          spotCullWindow{ true };      // CBRO frames: previs suspended around a spot light's group-0 cull, so its frustum test runs (else stale results)
 		bool          spotCasterTrim{ true };      // kept spot lights: casters that can't shadow a visible pixel are left out of the shadow map (as point lights' are)
